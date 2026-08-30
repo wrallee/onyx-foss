@@ -35,10 +35,12 @@ passes the golden score suite. Reranker readiness does not block ingestion.
 
 ## Run
 
-Create the local environment file and set a unique credential key:
+Download the pinned Granite artifact, then create the local environment file and set a unique credential key:
 
 ```bash
 cd _kotlin
+python3 scripts/download_models.py
+# Add --with-rerankers to also download GTE and BGE.
 cp .env.example .env
 openssl rand -base64 32
 # Paste the result into ONYX_CREDENTIAL_ENCRYPTION_KEY in .env.
