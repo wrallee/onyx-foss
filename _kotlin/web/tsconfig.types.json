@@ -1,0 +1,34 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2017",
+    "moduleResolution": "bundler",
+    "incremental": false,
+    "paths": {
+      "@/*": ["./src/*"],
+      "@tests/*": ["./tests/*"],
+      "@public/*": ["./public/*"],
+      "@opal/*": ["./lib/opal/src/*"]
+    }
+  },
+  "include": [
+    "next-env.d.ts",
+    "src/app/layout.tsx",
+    "src/app/page.tsx",
+    "src/app/api/[...path]/route.ts",
+    "src/app/admin/layout.tsx",
+    "src/app/admin/add-connector/**/*.ts",
+    "src/app/admin/add-connector/**/*.tsx",
+    "src/app/admin/connectors/[connector]/**/*.ts",
+    "src/app/admin/connectors/[connector]/**/*.tsx",
+    "src/app/admin/connector/[ccPairId]/**/*.ts",
+    "src/app/admin/connector/[ccPairId]/**/*.tsx",
+    "src/app/admin/documents/sets/**/*.ts",
+    "src/app/admin/documents/sets/**/*.tsx",
+    "src/app/admin/indexing/status/**/*.ts",
+    "src/app/admin/indexing/status/**/*.tsx",
+    ".next/types/**/*.ts",
+    "types/**/*.d.ts"
+  ],
+  "exclude": ["node_modules", "lib/opal", "lib/shared", "tests"]
+}

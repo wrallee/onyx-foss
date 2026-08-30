@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "model_name": "ibm-granite/granite-embedding-311m-multilingual-r2",
+  "artifact_format": "openvino",
+  "onnx_model_path": "../models/granite-embedding-311m-multilingual-r2-int8-openvino/openvino/openvino_model_qint8_quantized.xml",
+  "model_binary_path": "../models/granite-embedding-311m-multilingual-r2-int8-openvino/openvino/openvino_model_qint8_quantized.bin",
+  "tokenizer_path": "../models/granite-embedding-311m-multilingual-r2-int8-openvino/tokenizer.json",
+  "pooling": "cls",
+  "embedding_dimension": 768,
+  "max_context_length": 32768,
+  "model_sha256": "9dc67b11a2f629359329ccef6c8a572477ee316375dcbf664fad1b8c90d812f3",
+  "model_binary_sha256": "19cd99b8657e8f86529ce05384194b1bf3dbde94fd48a571a832344c119c27bc",
+  "tokenizer_sha256": "0087c868b33bad550a78a08d19798cfd7f713cde4f020803b8f51f405503e15f",
+  "source_commit": "44399559930365213510b1ee2eb15ded83374f0e",
+  "license": "Apache-2.0"
+}

@@ -1,0 +1,72 @@
+{
+  "compilerOptions": {
+    "target": "es5",
+    "lib": [
+      "dom",
+      "dom.iterable",
+      "esnext"
+    ],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "forceConsistentCasingInFileNames": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "noUncheckedIndexedAccess": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": [
+        "./src/*"
+      ],
+      "@tests/*": [
+        "./tests/*"
+      ],
+      "@public/*": [
+        "./public/*"
+      ],
+      "@opal/*": [
+        "./lib/opal/src/*"
+      ],
+      "@opal/types/*": [
+        "./lib/opal/src/types/*"
+      ]
+    }
+  },
+  "include": [
+    "next-env.d.ts",
+    "src/app/layout.tsx",
+    "src/app/page.tsx",
+    "src/app/app/page.tsx",
+    "src/app/api/[...path]/route.ts",
+    "src/app/admin/layout.tsx",
+    "src/app/admin/add-connector/**/*.ts",
+    "src/app/admin/add-connector/**/*.tsx",
+    "src/app/admin/connectors/[connector]/**/*.ts",
+    "src/app/admin/connectors/[connector]/**/*.tsx",
+    "src/app/admin/connector/[ccPairId]/**/*.ts",
+    "src/app/admin/connector/[ccPairId]/**/*.tsx",
+    "src/app/admin/documents/sets/**/*.ts",
+    "src/app/admin/documents/sets/**/*.tsx",
+    "src/app/admin/indexing/status/**/*.ts",
+    "src/app/admin/indexing/status/**/*.tsx",
+    ".next/types/**/*.ts",
+    "types/**/*.d.ts",
+    ".next/dev/types/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "lib/opal",
+    "lib/shared",
+    "tools"
+  ]
+}

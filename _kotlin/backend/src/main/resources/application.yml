@@ -1,0 +1,43 @@
+spring:
+  application:
+    name: onyx-foss-kotlin-backend
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+  datasource:
+    url: ${POSTGRES_URL:jdbc:postgresql://postgres:5432/onyx}
+    username: ${POSTGRES_USER:onyx}
+    password: ${POSTGRES_PASSWORD:onyx}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+  servlet:
+    multipart:
+      max-file-size: ${ONYX_MAX_UPLOAD_SIZE:100MB}
+      max-request-size: ${ONYX_MAX_UPLOAD_SIZE:100MB}
+
+server:
+  port: ${SERVER_PORT:8080}
+
+onyx:
+  crypto:
+    key: ${ONYX_CREDENTIAL_ENCRYPTION_KEY:}
+  storage:
+    root: ${ONYX_FILE_STORAGE_ROOT:/var/lib/onyx/files}
+  model-server:
+    base-url: ${MODEL_SERVER_URL:http://model-server:9000}
+    model-name: ${ONYX_EMBEDDING_MODEL_NAME:}
+    max-context-length: ${ONYX_EMBEDDING_MAX_CONTEXT_LENGTH:512}
+    normalize-embeddings: ${ONYX_EMBEDDING_NORMALIZE:true}
+  opensearch:
+    base-url: ${OPENSEARCH_URL:http://opensearch:9200}
+    index: ${OPENSEARCH_INDEX:onyx-kotlin-chunks}
+  worker:
+    enabled: ${ONYX_WORKER_ENABLED:false}
+    poll-delay-ms: ${ONYX_WORKER_POLL_DELAY_MS:1000}

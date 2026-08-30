@@ -1,0 +1,81 @@
+"use client";
+
+import { useState } from "react";
+import { useTranslations } from "next-intl";
+import FileTile from "@/refresh-components/tiles/FileTile";
+import ButtonTile from "@/refresh-components/tiles/ButtonTile";
+import { SvgAddLines, SvgFilter, SvgMenu, SvgPlusCircle } from "@opal/icons";
+import MemoriesModal from "@/refresh-components/modals/MemoriesModal";
+import LineItem from "@/refresh-components/buttons/LineItem";
+import { Button } from "@opal/components";
+import { useCreateModal } from "@opal/components";
+import { MemoryItem } from "@/lib/types";
+
+interface MemoriesProps {
+  memories: MemoryItem[];
+  onSaveMemories: (memories: MemoryItem[]) => Promise<boolean>;
+}
+
+export default function Memories({ memories, onSaveMemories }: MemoriesProps) {
+  const t = useTranslations("settings.memory");
+  const memoriesModal = useCreateModal();
+  const [targetMemoryId, setTargetMemoryId] = useState<number | null>(null);
+
+  return (
+    <>
+      {memories.length === 0 ? (
+        <LineItem
+          skeleton
+          description={t("empty.description")}
+          onClick={() => {
+            setTargetMemoryId(null);
+            memoriesModal.toggle(true);
+          }}
+          rightChildren={
+            <Button
+              prominence="internal"
+              icon={SvgPlusCircle}
+              onClick={() => {
+                setTargetMemoryId(null);
+                memoriesModal.toggle(true);
+              }}
+            />
+          }
+        />
+      ) : (
+        <div className="self-stretch flex flex-row items-center justify-between gap-2">
+          <div className="flex flex-row items-center gap-2">
+            {memories.slice(0, 2).map((memory, index) => (
+              <FileTile
+                key={memory.id ?? index}
+                description={memory.content}
+                onOpen={() => {
+                  setTargetMemoryId(memory.id);
+                  memoriesModal.toggle(true);
+                }}
+              />
+            ))}
+          </div>
+          <ButtonTile
+            title={t("viewAll.title")}
+            description={t("viewAll.description")}
+            icon={SvgAddLines}
+            onClick={() => {
+              setTargetMemoryId(null);
+              memoriesModal.toggle(true);
+            }}
+          />
+        </div>
+      )}
+
+      <memoriesModal.Provider>
+        <MemoriesModal
+          memories={memories}
+          onSaveMemories={onSaveMemories}
+          initialTargetMemoryId={targetMemoryId}
+          focusNewLine={targetMemoryId === null}
+        />
+      </memoriesModal.Provider>
+    </>
+  );
+}

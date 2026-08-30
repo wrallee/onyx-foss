@@ -1,0 +1,121 @@
+name: onyx-foss-kotlin
+
+x-backend-environment: &backend-environment
+  POSTGRES_URL: jdbc:postgresql://postgres:5432/onyx
+  POSTGRES_USER: onyx
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-onyx}
+  ONYX_CREDENTIAL_ENCRYPTION_KEY: ${ONYX_CREDENTIAL_ENCRYPTION_KEY:?Set a base64-encoded 32-byte key}
+  ONYX_FILE_STORAGE_ROOT: /var/lib/onyx/files
+  MODEL_SERVER_URL: http://model-server:9000
+  ONYX_EMBEDDING_MODEL_NAME: ${ONYX_EMBEDDING_MODEL_NAME:-ibm-granite/granite-embedding-311m-multilingual-r2}
+  OPENSEARCH_URL: http://opensearch:9200
+  OPENSEARCH_INDEX: ${OPENSEARCH_INDEX:-onyx-kotlin-chunks}
+
+services:
+  web:
+    build:
+      context: ./web
+    environment:
+      API_BASE_URL: http://api:8080
+      INTERNAL_URL: http://api:8080
+      PORT: 3000
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./backend
+    environment:
+      <<: *backend-environment
+      ONYX_WORKER_ENABLED: "false"
+    volumes:
+      - connector_files:/var/lib/onyx/files
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    profiles: ["ingestion"]
+    build:
+      context: ./backend
+    environment:
+      <<: *backend-environment
+      SPRING_PROFILES_ACTIVE: worker
+      ONYX_WORKER_ENABLED: "true"
+    volumes:
+      - connector_files:/var/lib/onyx/files
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      model-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+  model-server:
+    profiles: ["ingestion"]
+    build:
+      context: ./model-server
+    environment:
+      MODEL_SERVER_PORT: 9000
+      MODEL_ARTIFACT_MANIFEST: /config/granite-openvino-int8.manifest.json
+      RERANKER_MODEL: ${RERANKER_MODEL:-Alibaba-NLP/gte-multilingual-reranker-base}
+    volumes:
+      - ./model-server/granite-openvino-int8.manifest.json:/config/granite-openvino-int8.manifest.json:ro
+      - ./models:/models:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/actuator/health/readiness"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15.2-alpine
+    environment:
+      POSTGRES_DB: onyx
+      POSTGRES_USER: onyx
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-onyx}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U onyx -d onyx"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  opensearch:
+    image: opensearchproject/opensearch:3.6.0
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  connector_files:
+  postgres_data:
+  opensearch_data:
