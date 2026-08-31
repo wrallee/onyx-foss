@@ -1,6 +1,7 @@
 package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.onyx.foss.kotlin.domain.ConnectorSource
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.jupiter.api.Test
@@ -22,11 +23,11 @@ class RemoteConnectorLoadersTest {
         server.start()
         val base = server.url("/").toString().trimEnd('/')
         val docs = loaders().load(
-            "jira",
+            ConnectorSource.JIRA,
             mapper.readTree("""{"jira_base_url":"""" + base + """","project_key":"DOC"}"""),
             mapper.readTree("""{"email":"a@example.com","api_token":"token"}"""),
             null,
-        )
+        ).single().documents
 
         assertEquals(1, docs.size)
         assertEquals("DOC-1", docs.single().id)
@@ -49,11 +50,11 @@ class RemoteConnectorLoadersTest {
         server.start()
         val base = server.url("/").toString().trimEnd('/')
         val docs = loaders().load(
-            "confluence",
+            ConnectorSource.CONFLUENCE,
             mapper.readTree("""{"wiki_base":"""" + base + """","space":"ENG"}"""),
             mapper.readTree("""{"confluence_username":"a@example.com","confluence_access_token":"token"}"""),
             null,
-        )
+        ).single().documents
 
         assertEquals("42", docs.single().id)
         assertEquals("Safe content", docs.single().content)
@@ -73,13 +74,13 @@ class RemoteConnectorLoadersTest {
         server.start()
         val base = server.url("/").toString().trimEnd('/')
         val docs = loaders().load(
-            "github",
+            ConnectorSource.GITHUB,
             mapper.readTree(
                 """{"github_base_url":"""" + base + """","repo_owner":"onyx","repositories":"foss","include_prs":true,"include_issues":false,"include_files":false}""",
             ),
             mapper.readTree("""{"github_access_token":"token"}"""),
             null,
-        )
+        ).single().documents
 
         assertEquals(1, docs.size)
         assertEquals("onyx/foss/pull_request/7", docs.single().id)
@@ -108,11 +109,11 @@ class RemoteConnectorLoadersTest {
         server.start()
 
         val docs = loaders().load(
-            "confluence",
+            ConnectorSource.CONFLUENCE,
             mapper.readTree("""{"wiki_base":"${server.url("/").toString().trimEnd('/')}","space":"ENG"}"""),
             mapper.readTree("""{"confluence_access_token":"token"}"""),
             null,
-        )
+        ).single().documents
 
         assertEquals(content.length, docs.single().content.length)
     }

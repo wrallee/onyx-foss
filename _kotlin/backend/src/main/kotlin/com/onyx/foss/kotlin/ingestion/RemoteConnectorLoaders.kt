@@ -1,12 +1,11 @@
 package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
+import com.onyx.foss.kotlin.domain.ConnectorSource
 import org.springframework.http.HttpHeaders
-import org.springframework.http.MediaType
 import org.springframework.stereotype.Service
-import org.springframework.web.reactive.function.client.WebClient
 import org.springframework.web.util.UriUtils
-import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.util.Base64
@@ -15,13 +14,25 @@ import java.util.Base64
 class RemoteConnectorLoaders(
     private val http: RemoteJsonClient,
 ) {
-    fun load(source: String, config: JsonNode?, credentials: JsonNode, checkpoint: JsonNode?): List<SourceDocument> =
-        when (source) {
-            "jira" -> jira(config, credentials, checkpoint)
-            "confluence" -> confluence(config, credentials, checkpoint)
-            "github" -> github(config, credentials, checkpoint)
-            else -> error("Unsupported remote connector: " + source)
+    fun load(source: ConnectorSource, config: JsonNode?, credentials: JsonNode, checkpoint: JsonNode?): Sequence<ConnectorBatch> {
+        val documents = when (source) {
+            ConnectorSource.JIRA -> jira(config, credentials, checkpoint)
+            ConnectorSource.CONFLUENCE -> confluence(config, credentials, checkpoint)
+            ConnectorSource.GITHUB -> github(config, credentials, checkpoint)
+            else -> error("Unsupported remote connector: " + source.value)
         }
+        return sequenceOf(
+            ConnectorBatch(
+                documents = documents,
+                checkpoint = ConnectorCheckpoint(
+                    JsonNodeFactory.instance.objectNode()
+                        .put("last_success_at", Instant.now().toString())
+                        .put("documents", documents.size),
+                    hasMore = false,
+                ),
+            ),
+        )
+    }
 
     private fun jira(config: JsonNode?, credentials: JsonNode, checkpoint: JsonNode?): List<SourceDocument> {
         val base = required(config, "jira_base_url", "base_url")
@@ -244,24 +255,4 @@ class RemoteConnectorLoaders(
     }
 
     private fun stripHtml(value: String): String = value.replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
-}
-
-@Service
-class RemoteJsonClient(
-    private val clientBuilder: WebClient.Builder,
-) {
-    private companion object {
-        const val MAX_RESPONSE_BYTES = 16 * 1024 * 1024
-    }
-
-    fun get(base: String, path: String, headers: Map<String, String>): JsonNode =
-        clientBuilder.clone().codecs { codecs ->
-            codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
-        }.build().get()
-            .uri(URI.create(base.trimEnd('/') + path))
-            .accept(MediaType.APPLICATION_JSON)
-            .headers { httpHeaders -> headers.forEach { (name, value) -> httpHeaders.set(name, value) } }
-            .retrieve()
-            .bodyToMono(JsonNode::class.java)
-            .block() ?: error("Remote connector returned an empty response")
 }

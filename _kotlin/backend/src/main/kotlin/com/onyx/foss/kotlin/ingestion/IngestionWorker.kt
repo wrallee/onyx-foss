@@ -8,6 +8,7 @@ import com.onyx.foss.kotlin.domain.ConnectorCredentialPairRepository
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import com.onyx.foss.kotlin.domain.IndexedDocumentEntity
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
+import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
 import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
 import com.onyx.foss.kotlin.domain.IngestionCheckpointEntity
 import com.onyx.foss.kotlin.domain.IngestionCheckpointRepository
@@ -22,7 +23,6 @@ import com.onyx.foss.kotlin.service.FileStorageService
 import org.apache.tika.metadata.Metadata
 import org.apache.tika.parser.AutoDetectParser
 import org.apache.tika.sax.BodyContentHandler
-import org.springframework.http.HttpMethod
 import org.springframework.http.MediaType
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
@@ -78,6 +78,7 @@ class IngestionProcessor(
     private val remoteLoaders: RemoteConnectorLoaders,
     private val embedder: ModelServerClient,
     private val indexer: OpenSearchIndexer,
+    private val pruning: PruningService,
     private val mapper: ObjectMapper,
 ) {
     fun process(jobId: Long) {
@@ -91,79 +92,106 @@ class IngestionProcessor(
             pair.status = PairStatus.INITIAL_INDEXING
             pairs.save(pair)
         }
+        var refreshFreq: Long? = null
         try {
             val connector = admin.connector(pair.connectorId)
+            refreshFreq = connector.refreshFreq
             val checkpoint = if (attempt.fromBeginning) {
                 null
             } else {
                 checkpoints.findById(requireNotNull(pair.id)).orElse(null)?.checkpointJson
             }
-            val sourceDocuments = when (connector.source) {
+            val batches = when (connector.source) {
                 ConnectorSource.FILE -> fileLoader.load(connector.connectorSpecificConfig)
-                else -> remoteLoaders.load(connector.source.value, connector.connectorSpecificConfig, admin.credentialSecret(pair.credentialId), checkpoint)
-            }.distinctBy { it.id }.filter { it.title.isNotBlank() || it.content.isNotBlank() }
+                else -> remoteLoaders.load(
+                    connector.source,
+                    connector.connectorSpecificConfig,
+                    admin.credentialSecret(pair.credentialId),
+                    checkpoint,
+                )
+            }
             var newDocuments = 0
             var totalDocuments = 0
-            sourceDocuments.forEach { document ->
-                val indexableContent = document.content.ifBlank { document.title }
-                val chunks = indexableContent.chunked(1500).filter { it.isNotBlank() }
-                if (chunks.isEmpty()) return@forEach
-                val vectors = embedder.embed(chunks)
-                chunks.zip(vectors).forEachIndexed { index, item ->
-                    indexer.upsert(
-                        pairId = requireNotNull(pair.id),
+            var hasFailures = false
+            var completeEnumeration = false
+            val seenDocumentIds = mutableSetOf<String>()
+            val failedDocumentIds = mutableSetOf<String>()
+            batches.forEach { batch ->
+                batch.documents.forEach { document ->
+                    if (!seenDocumentIds.add(document.id) || (document.title.isBlank() && document.content.isBlank())) {
+                        return@forEach
+                    }
+                    val indexableContent = document.content.ifBlank { document.title }
+                    val chunks = indexableContent.chunked(1500).filter { it.isNotBlank() }
+                    if (chunks.isEmpty()) return@forEach
+                    val vectors = embedder.embed(chunks)
+                    chunks.zip(vectors).forEachIndexed { index, item ->
+                        indexer.upsert(
+                            pairId = requireNotNull(pair.id),
+                            sourceDocumentId = document.id,
+                            chunkId = index,
+                            title = document.title,
+                            content = item.first,
+                            link = document.link,
+                            metadata = document.metadata,
+                            embedding = item.second,
+                        )
+                    }
+                    val existing = documents.findByCcPairIdAndSourceDocumentId(requireNotNull(pair.id), document.id)
+                    if (existing == null) newDocuments += 1
+                    val indexedDocument = existing ?: IndexedDocumentEntity(
+                        ccPairId = requireNotNull(pair.id),
                         sourceDocumentId = document.id,
-                        chunkId = index,
-                        title = document.title,
-                        content = item.first,
-                        link = document.link,
-                        metadata = document.metadata,
-                        embedding = item.second,
                     )
+                    indexedDocument.apply {
+                        title = document.title
+                        link = document.link
+                        contentHash = hash(document.content)
+                        metadata = mapper.valueToTree(document.metadata)
+                        externalAccess = document.externalAccess?.let(mapper::valueToTree)
+                        lastSynced = Instant.now()
+                    }
+                    documents.save(indexedDocument)
+                    totalDocuments += 1
+                    attempt.newDocsIndexed = newDocuments
+                    attempt.totalDocsIndexed = totalDocuments
+                    attempts.save(attempt)
+                    val resolvedErrors = errors
+                        .findUnresolvedByCcPairIdAndSourceDocumentId(requireNotNull(pair.id), document.id)
+                        .onEach { it.isResolved = true }
+                    errors.saveAll(resolvedErrors)
                 }
-                val existing = documents.findByCcPairIdAndSourceDocumentId(requireNotNull(pair.id), document.id)
-                if (existing == null) newDocuments += 1
-                val indexedDocument = existing ?: IndexedDocumentEntity(
-                    ccPairId = requireNotNull(pair.id),
-                    sourceDocumentId = document.id,
+                if (batch.failures.isNotEmpty()) {
+                    hasFailures = true
+                    failedDocumentIds += batch.failures.mapNotNull { failure ->
+                        (failure.target as? FailureTarget.Document)?.id
+                    }
+                    errors.saveAll(batch.failures.map { failure -> failure.toEntity(requireNotNull(attempt.id)) })
+                }
+                checkpoints.save(
+                    IngestionCheckpointEntity(
+                        ccPairId = requireNotNull(pair.id),
+                        checkpointJson = batch.checkpoint.value,
+                    ),
                 )
-                indexedDocument.apply {
-                    title = document.title
-                    link = document.link
-                    contentHash = hash(document.content)
-                    metadata = mapper.valueToTree(document.metadata)
-                    externalAccess = document.externalAccess?.let(mapper::valueToTree)
-                    lastSynced = Instant.now()
-                }
-                documents.save(indexedDocument)
-                totalDocuments += 1
-                attempt.newDocsIndexed = newDocuments
-                attempt.totalDocsIndexed = totalDocuments
-                attempts.save(attempt)
+                completeEnumeration = !batch.checkpoint.hasMore
             }
-            attempt.status = AttemptStatus.SUCCESS
+            attempt.docsRemovedFromIndex = pruning.prune(
+                requireNotNull(pair.id),
+                seenDocumentIds,
+                failedDocumentIds,
+                attempt.fromBeginning,
+                completeEnumeration,
+            )
+            if (attempt.fromBeginning && completeEnumeration) pair.lastPrunedAt = Instant.now()
+            attempt.status = if (hasFailures) AttemptStatus.COMPLETED_WITH_ERRORS else AttemptStatus.SUCCESS
             attempt.newDocsIndexed = newDocuments
-            attempt.totalDocsIndexed = sourceDocuments.size
+            attempt.totalDocsIndexed = totalDocuments
             attempt.pollRangeEnd = Instant.now()
             attempts.save(attempt)
-            checkpoints.save(
-                IngestionCheckpointEntity(
-                    ccPairId = requireNotNull(pair.id),
-                    checkpointJson = mapper.valueToTree(
-                        mapOf("last_success_at" to Instant.now().toString(), "documents" to sourceDocuments.size),
-                    ),
-                ),
-            )
             pair.inRepeatedErrorState = false
             pair.status = PairStatus.ACTIVE
             pairs.save(pair)
-            val pairAttemptIds = attempts.findAllByCcPairIdOrderByIdDesc(requireNotNull(pair.id))
-                .mapNotNull { it.id }
-            if (pairAttemptIds.isNotEmpty()) {
-                val resolvedErrors = errors.findAllByAttemptIdInOrderByIdDesc(pairAttemptIds)
-                    .onEach { it.isResolved = true }
-                errors.saveAll(resolvedErrors)
-            }
             job.state = JobState.SUCCEEDED
             jobs.save(job)
         } catch (error: Exception) {
@@ -178,7 +206,10 @@ class IngestionProcessor(
                     errorType = error::class.simpleName,
                 ),
             )
-            pair.inRepeatedErrorState = true
+            pair.inRepeatedErrorState = isRepeatedError(
+                refreshFreq,
+                attempts.findAllByCcPairIdOrderByIdDesc(requireNotNull(pair.id)),
+            )
             pairs.save(pair)
             job.state = JobState.FAILED
             job.lastError = attempt.errorMessage
@@ -191,14 +222,37 @@ class IngestionProcessor(
             .joinToString("") { "%02x".format(it) }
 }
 
+internal fun isRepeatedError(refreshFreq: Long?, recent: List<IngestionAttemptEntity>): Boolean {
+    val required = if (refreshFreq == null) 1 else 5
+    return recent.take(required).size == required && recent.take(required).all { it.status == AttemptStatus.FAILED }
+}
+
+private fun ConnectorFailure.toEntity(attemptId: Long): IngestionErrorEntity = when (val failureTarget = target) {
+    is FailureTarget.Document -> IngestionErrorEntity(
+        attemptId = attemptId,
+        sourceDocumentId = failureTarget.id,
+        documentLink = failureTarget.link,
+        failureMessage = message,
+        errorType = errorType,
+    )
+    is FailureTarget.Entity -> IngestionErrorEntity(
+        attemptId = attemptId,
+        entityId = failureTarget.id,
+        failedTimeRangeStart = failureTarget.missedStart,
+        failedTimeRangeEnd = failureTarget.missedEnd,
+        failureMessage = message,
+        errorType = errorType,
+    )
+}
+
 @Service
 class FileDocumentLoader(
     private val mapper: ObjectMapper,
     private val files: FileStorageService,
 ) {
-    fun load(config: JsonNode?): List<SourceDocument> {
-        val locations = config?.path("file_locations") ?: return emptyList()
-        return locations.map { location ->
+    fun load(config: JsonNode?): Sequence<ConnectorBatch> {
+        val locations = config?.path("file_locations") ?: mapper.createArrayNode()
+        val documents = locations.map { location ->
             val assetId = location.asText()
             val path = files.filePath(assetId)
             val handler = BodyContentHandler(-1)
@@ -212,6 +266,15 @@ class FileDocumentLoader(
                 metadata = mapOf("source" to "file", "file_id" to assetId),
             )
         }
+        return sequenceOf(
+            ConnectorBatch(
+                documents = documents,
+                checkpoint = ConnectorCheckpoint(
+                    mapper.valueToTree(mapOf("last_success_at" to Instant.now().toString(), "documents" to documents.size)),
+                    hasMore = false,
+                ),
+            ),
+        )
     }
 }
 
@@ -257,6 +320,24 @@ class OpenSearchIndexer(
     private val mapper: ObjectMapper,
 ) {
     fun deletePair(pairId: Long) {
+        deleteByQuery(mapOf("term" to mapOf("cc_pair_id" to pairId)), "pair deletion")
+    }
+
+    fun deleteDocuments(pairId: Long, sourceDocumentIds: Set<String>) {
+        deleteByQuery(
+            mapOf(
+                "bool" to mapOf(
+                    "filter" to listOf(
+                        mapOf("term" to mapOf("cc_pair_id" to pairId)),
+                        mapOf("terms" to mapOf("source_document_id" to sourceDocumentIds)),
+                    ),
+                ),
+            ),
+            "document deletion",
+        )
+    }
+
+    private fun deleteByQuery(query: Map<String, Any>, operation: String) {
         val response = clientBuilder.build()
             .post()
             .uri(
@@ -264,15 +345,15 @@ class OpenSearchIndexer(
                     "/_delete_by_query?refresh=true",
             )
             .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue(mapOf("query" to mapOf("term" to mapOf("cc_pair_id" to pairId))))
+            .bodyValue(mapOf("query" to query))
             .exchangeToMono { result ->
                 if (result.statusCode().is2xxSuccessful) result.releaseBody().thenReturn(true)
                 else result.bodyToMono(String::class.java).flatMap {
-                    Mono.error(IllegalStateException("OpenSearch pair deletion failed: $it"))
+                    Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
                 }
             }
             .block()
-        check(response == true) { "OpenSearch did not confirm pair deletion" }
+        check(response == true) { "OpenSearch did not confirm $operation" }
     }
 
     fun upsert(

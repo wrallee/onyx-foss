@@ -15,6 +15,38 @@ interface ConnectorCredentialPairRepository : JpaRepository<ConnectorCredentialP
     fun findAllByConnectorId(connectorId: Long): List<ConnectorCredentialPairEntity>
     fun findAllByCredentialId(credentialId: Long): List<ConnectorCredentialPairEntity>
     fun findByConnectorIdAndCredentialId(connectorId: Long, credentialId: Long): ConnectorCredentialPairEntity?
+
+    @Query(
+        value = """
+            SELECT pair.id AS "pairId",
+                   connector.refresh_freq AS "refreshFreq",
+                   connector.prune_freq AS "pruneFreq",
+                   pair.last_pruned_at AS "lastPrunedAt",
+                   MAX(attempt.time_updated) AS "lastAttemptAt"
+            FROM connector_credential_pairs pair
+            JOIN connectors connector ON connector.id = pair.connector_id
+            LEFT JOIN ingestion_attempts attempt ON attempt.cc_pair_id = pair.id
+            WHERE pair.status IN ('SCHEDULED', 'INITIAL_INDEXING', 'ACTIVE')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM ingestion_attempts active_attempt
+                  JOIN ingestion_jobs active_job ON active_job.attempt_id = active_attempt.id
+                  WHERE active_attempt.cc_pair_id = pair.id
+                    AND active_job.state IN ('QUEUED', 'RUNNING')
+              )
+            GROUP BY pair.id, connector.refresh_freq, connector.prune_freq, pair.last_pruned_at
+        """,
+        nativeQuery = true,
+    )
+    fun findSchedulable(): List<IngestionScheduleCandidate>
+}
+
+interface IngestionScheduleCandidate {
+    val pairId: Long
+    val refreshFreq: Long?
+    val pruneFreq: Long?
+    val lastPrunedAt: Instant?
+    val lastAttemptAt: Instant?
 }
 
 interface DocumentSetRepository : JpaRepository<DocumentSetEntity, Long> {
@@ -47,13 +79,30 @@ interface IngestionJobRepository : JpaRepository<IngestionJobEntity, Long> {
 
 interface IndexedDocumentRepository : JpaRepository<IndexedDocumentEntity, Long> {
     fun findByCcPairIdAndSourceDocumentId(ccPairId: Long, sourceDocumentId: String): IndexedDocumentEntity?
+    @Query("SELECT document.sourceDocumentId FROM IndexedDocumentEntity document WHERE document.ccPairId = :ccPairId")
+    fun findSourceIdsByCcPairId(@Param("ccPairId") ccPairId: Long): List<String>
     fun countByCcPairId(ccPairId: Long): Long
     fun deleteAllByCcPairId(ccPairId: Long)
+    fun deleteByCcPairIdAndSourceDocumentIdIn(ccPairId: Long, sourceDocumentIds: Collection<String>): Long
 }
 
 interface IngestionErrorRepository : JpaRepository<IngestionErrorEntity, Long> {
     fun findAllByAttemptIdOrderByIdDesc(attemptId: Long): List<IngestionErrorEntity>
     fun findAllByAttemptIdInOrderByIdDesc(attemptIds: Collection<Long>): List<IngestionErrorEntity>
+    @Query(
+        """
+            SELECT error FROM IngestionErrorEntity error, IngestionAttemptEntity attempt
+            WHERE error.attemptId = attempt.id
+              AND attempt.ccPairId = :ccPairId
+              AND error.sourceDocumentId = :sourceDocumentId
+              AND error.isResolved = false
+            ORDER BY error.id DESC
+        """,
+    )
+    fun findUnresolvedByCcPairIdAndSourceDocumentId(
+        @Param("ccPairId") ccPairId: Long,
+        @Param("sourceDocumentId") sourceDocumentId: String,
+    ): List<IngestionErrorEntity>
 }
 
 interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptEntity, Long>
