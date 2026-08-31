@@ -58,9 +58,6 @@ class ConfluenceConnectorLoader(
 ) {
     internal var sleepMillis: (Long) -> Unit = Thread::sleep
 
-    private val usernameEmailCache = Collections.synchronizedMap(mutableMapOf<String, String?>())
-    private val userKeyEmailCache = Collections.synchronizedMap(mutableMapOf<String, String?>())
-    private val displayNameCache = Collections.synchronizedMap(mutableMapOf<String, String?>())
     private val serverVersionCache = Collections.synchronizedMap(mutableMapOf<String, Pair<Int, Int>?>())
 
     fun load(
@@ -284,7 +281,9 @@ class ConfluenceConnectorLoader(
         val output = mutableListOf<JsonNode>()
         var path: String? = initialPath
         var currentLimit = limit
+        val visited = mutableSetOf<URI>()
         while (path != null) {
+            require(visited.add(approvedRequestUri(context, path))) { "Confluence pagination cycle detected" }
             val page = fetchPage(
                 context,
                 path,
@@ -318,7 +317,7 @@ class ConfluenceConnectorLoader(
                 if (status == 429 || error.responseBodyAsString.contains(RATE_LIMIT_MESSAGE, ignoreCase = true)) {
                     rateLimitAttempts += 1
                     if (rateLimitAttempts >= MAX_SOURCE_RETRIES) throw error
-                    sleepMillis(retryAfterMillis(error))
+                    sleepMillis(retryAfterMillis(error, rateLimitAttempts - 1))
                     continue
                 }
                 if (path.contains(PROBLEMATIC_BODY_EXPAND)) {
@@ -494,10 +493,17 @@ class ConfluenceConnectorLoader(
         val failures = mutableListOf<ConnectorFailure>()
         var path: String? = buildCqlPath(constructAttachmentCql(context.config, pageId, start, end), ATTACHMENT_EXPAND)
         var limit = DEFAULT_PAGE_SIZE
+        var resultCount = 0
+        val visited = mutableSetOf<URI>()
         try {
             while (path != null) {
+                require(visited.add(approvedRequestUri(context, path))) { "Confluence attachment pagination cycle detected" }
                 val result = fetchPage(context, path, limit, allowAllFailedRecovery = false)
                 limit = result.effectiveLimit
+                resultCount += result.results.size
+                require(resultCount <= MAX_PAGINATED_RESULTS) {
+                    "Confluence attachment pagination exceeded $MAX_PAGINATED_RESULTS results"
+                }
                 result.results.forEach { attachment ->
                     if (!includeAttachment(context.config, attachment)) return@forEach
                     val converted = convertAttachment(context, page, pageUrl, attachment, inheritedAccess)
@@ -754,54 +760,33 @@ class ConfluenceConnectorLoader(
         }
     }
 
-    internal fun resolveUsernameEmail(config: JsonNode?, credentials: JsonNode, username: String): String? {
-        val context = context(config, credentials)
-        return resolveUsernameEmail(context, username)
-    }
-
     private fun resolveUsernameEmail(context: Context, username: String): String? {
-        val key = cacheKey(context, username)
-        synchronized(usernameEmailCache) {
-            if (usernameEmailCache.containsKey(key)) return usernameEmailCache[key]
-        }
+        val cache = context.userCaches.usernameEmails
+        if (cache.containsKey(username)) return cache[username]
         val email = try {
             get(context, "/rest/api/user?username=${query(username)}").path("email").asText().takeIf(String::isNotBlank)
         } catch (_: Exception) {
             null
         }
-        usernameEmailCache[key] = email
+        cache[username] = email
         return email
     }
 
-    internal fun resolveUserKeyEmail(config: JsonNode?, credentials: JsonNode, userKey: String): String? {
-        val context = context(config, credentials)
-        return resolveUserKeyEmail(context, userKey)
-    }
-
     private fun resolveUserKeyEmail(context: Context, userKey: String): String? {
-        val key = cacheKey(context, userKey)
-        synchronized(userKeyEmailCache) {
-            if (userKeyEmailCache.containsKey(key)) return userKeyEmailCache[key]
-        }
+        val cache = context.userCaches.userKeyEmails
+        if (cache.containsKey(userKey)) return cache[userKey]
         val email = try {
             get(context, "/rest/api/user?key=${query(userKey)}").path("email").asText().takeIf(String::isNotBlank)
         } catch (_: Exception) {
             null
         }
-        userKeyEmailCache[key] = email
+        cache[userKey] = email
         return email
     }
 
-    internal fun resolveDisplayName(config: JsonNode?, credentials: JsonNode, userId: String): String {
-        val context = context(config, credentials)
-        return resolveDisplayName(context, userId)
-    }
-
     private fun resolveDisplayName(context: Context, userId: String): String {
-        val key = cacheKey(context, userId)
-        synchronized(displayNameCache) {
-            if (displayNameCache.containsKey(key)) return displayNameCache[key] ?: UNKNOWN_USER
-        }
+        val cache = context.userCaches.displayNames
+        if (cache.containsKey(userId)) return cache[userId] ?: UNKNOWN_USER
         val displayName = listOf("key", "accountId").firstNotNullOfOrNull { field ->
             try {
                 get(context, "/rest/api/user?$field=${query(userId)}").path("displayName").asText().takeIf(String::isNotBlank)
@@ -809,7 +794,7 @@ class ConfluenceConnectorLoader(
                 null
             }
         }
-        displayNameCache[key] = displayName
+        cache[userId] = displayName
         return displayName ?: UNKNOWN_USER
     }
 
@@ -860,13 +845,16 @@ class ConfluenceConnectorLoader(
             restrictionPayload.path("restrictions").isObject -> restrictionPayload.path("restrictions")
             else -> restrictionPayload
         }
-        val users = restrictions.path("user").path("results").mapNotNull(emailResolver).toSet()
-        val groups = restrictions.path("group").path("results").mapNotNull { group ->
+        val userRestrictions = restrictions.path("user").path("results").toList()
+        val groupRestrictions = restrictions.path("group").path("results").toList()
+        if (userRestrictions.isEmpty() && groupRestrictions.isEmpty()) return null
+        val resolvedUsers = userRestrictions.map(emailResolver)
+        val resolvedGroups = groupRestrictions.map { group ->
             group.path("name").asText().ifBlank { group.path("id").asText() }.takeIf(String::isNotBlank)
                 ?.let { groupPrefix + it }
-        }.toSet()
-        if (users.isEmpty() && groups.isEmpty()) return null
-        return ExternalAccess(users, groups, isPublic = false)
+        }
+        if (resolvedUsers.any { it == null } || resolvedGroups.any { it == null }) return PRIVATE_ACCESS
+        return ExternalAccess(resolvedUsers.filterNotNull().toSet(), resolvedGroups.filterNotNull().toSet(), isPublic = false)
     }
 
     private fun resolveRestrictionEmail(context: Context, user: JsonNode): String? {
@@ -1043,28 +1031,6 @@ class ConfluenceConnectorLoader(
         return ExternalAccess(emails, groups, isPublic)
     }
 
-    internal fun getWithSourceRetry(config: JsonNode?, credentials: JsonNode, path: String): JsonNode {
-        val context = context(config, credentials)
-        var lastError: WebClientResponseException? = null
-        repeat(MAX_SOURCE_RETRIES) { attempt ->
-            try {
-                return get(context, path)
-            } catch (error: WebClientResponseException) {
-                lastError = error
-                if (error.statusCode.value() < 500 && error.statusCode.value() != 429) throw error
-                if (attempt < MAX_SOURCE_RETRIES - 1) {
-                    val delay = if (error.statusCode.value() == 429) {
-                        retryAfterMillis(error)
-                    } else {
-                        minOf(5L shl attempt, 60L) * 1_000
-                    }
-                    sleepMillis(delay)
-                }
-            }
-        }
-        throw requireNotNull(lastError)
-    }
-
     private fun context(config: JsonNode?, credentials: JsonNode): Context {
         val wikiBase = config?.firstText("wiki_base", "confluence_base_url", "base_url")
             ?: error("Connector configuration is missing wiki_base")
@@ -1091,18 +1057,27 @@ class ConfluenceConnectorLoader(
     }
 
     private fun get(context: Context, path: String): JsonNode =
-        if (path.startsWith("http://") || path.startsWith("https://")) {
-            http.get("", path, context.headers)
-        } else {
-            http.get(context.apiBase, path.withLeadingSlash(), context.headers)
-        }
+        http.get("", approvedRequestUri(context, path).toASCIIString(), context.headers)
 
     private fun getBytes(context: Context, path: String): ByteArray =
-        if (path.startsWith("http://") || path.startsWith("https://")) {
-            http.getBytes("", path, context.headers)
-        } else {
-            http.getBytes(context.apiBase, path.withLeadingSlash(), context.headers)
+        http.getBytes("", approvedRequestUri(context, path).toASCIIString(), context.headers)
+
+    private fun approvedRequestUri(context: Context, path: String): URI {
+        val apiBase = URI.create(context.apiBase)
+        val supplied = URI.create(path)
+        val resolved = when {
+            path.startsWith("//") -> URI.create("${apiBase.scheme}:$path")
+            supplied.isAbsolute -> supplied
+            else -> URI.create("${context.apiBase.trimEnd('/')}/${path.trimStart('/')}")
         }
+        require(resolved.userInfo == null) { "Confluence response URL must not contain user information" }
+        val requestedOrigin = resolved.origin()
+        val allowedOrigins = setOf(URI.create(context.wikiBase).origin(), apiBase.origin())
+        require(requestedOrigin in allowedOrigins) {
+            "Confluence response URL origin $requestedOrigin is not an approved configured/API origin"
+        }
+        return resolved
+    }
 
     private fun parsePageHtml(context: Context, html: String, fetchedTitles: MutableSet<String>): String {
         var text = parseHtml(html)
@@ -1169,13 +1144,18 @@ class ConfluenceConnectorLoader(
         ConnectorCheckpoint(mapper.valueToTree(ConfluenceCheckpoint(hasMore = false)), hasMore = false),
     )
 
-    private fun retryAfterMillis(error: WebClientResponseException): Long {
-        val raw = error.headers.getFirst("Retry-After") ?: return 0
-        raw.toLongOrNull()?.let { return it.coerceAtLeast(0) * 1_000 }
-        return runCatching {
-            val target = ZonedDateTime.parse(raw, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant()
-            (target.toEpochMilli() - Instant.now().toEpochMilli()).coerceAtLeast(0)
-        }.getOrDefault(0)
+    private fun retryAfterMillis(error: WebClientResponseException, attempt: Int): Long {
+        val raw = error.headers.getFirst("Retry-After")
+        val parsedSeconds = raw?.trim()?.toDoubleOrNull()?.takeIf(Double::isFinite)?.coerceAtLeast(0.0)
+            ?: raw?.let { value ->
+                runCatching {
+                    val target = ZonedDateTime.parse(value, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant()
+                    ((target.toEpochMilli() - Instant.now().toEpochMilli()) / 1_000.0).coerceAtLeast(0.0)
+                }.getOrNull()
+            }
+        val delaySeconds = parsedSeconds?.coerceIn(MINIMUM_RETRY_SECONDS, MAXIMUM_RETRY_SECONDS)
+            ?: minOf(STARTING_RETRY_SECONDS * (1L shl attempt), MAXIMUM_RETRY_SECONDS.toLong()).toDouble()
+        return (delaySeconds * 1_000).toLong()
     }
 
     private fun isDateError(error: WebClientResponseException): Boolean =
@@ -1218,8 +1198,13 @@ class ConfluenceConnectorLoader(
     private fun queryValue(value: String): String = URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20")
     private fun segment(value: String): String = UriUtils.encodePathSegment(value, StandardCharsets.UTF_8)
     private fun pathSegment(value: String): String = UriUtils.encodePathSegment(value, StandardCharsets.UTF_8)
-    private fun String.withLeadingSlash(): String = if (startsWith('/')) this else "/$this"
-    private fun cacheKey(context: Context, identifier: String): String = "${context.wikiBase}\u0000$identifier"
+    private fun URI.origin(): Origin {
+        val normalizedScheme = scheme?.lowercase()
+        require(normalizedScheme in setOf("http", "https")) { "Confluence response URL must use HTTP or HTTPS" }
+        val normalizedHost = requireNotNull(host?.lowercase()) { "Confluence response URL has no host" }
+        val normalizedPort = if (port >= 0) port else if (normalizedScheme == "https") 443 else 80
+        return Origin(requireNotNull(normalizedScheme), normalizedHost, normalizedPort)
+    }
     private fun parseInstant(value: String): Instant = runCatching { Instant.parse(value) }
         .getOrElse { OffsetDateTime.parse(value).toInstant() }
     private fun String.parseVersion(): Pair<Int, Int>? {
@@ -1238,7 +1223,16 @@ class ConfluenceConnectorLoader(
         val apiBase: String,
         val isCloud: Boolean,
         val headers: Map<String, String>,
+        val userCaches: UserCaches = UserCaches(),
     )
+
+    private data class Origin(val scheme: String, val host: String, val port: Int)
+
+    private class UserCaches {
+        val usernameEmails = mutableMapOf<String, String?>()
+        val userKeyEmails = mutableMapOf<String, String?>()
+        val displayNames = mutableMapOf<String, String?>()
+    }
 
     private data class PageFetch(val results: List<JsonNode>, val nextPath: String?, val effectiveLimit: Int)
     private data class ProcessResult(
@@ -1331,6 +1325,9 @@ class ConfluenceConnectorLoader(
         const val SLIM_ATTACHMENT_ATTEMPTS = 3
         const val MINIMUM_PAGE_SIZE = 5
         const val MAX_SOURCE_RETRIES = 5
+        const val MINIMUM_RETRY_SECONDS = 2.0
+        const val MAXIMUM_RETRY_SECONDS = 60.0
+        const val STARTING_RETRY_SECONDS = 5L
         const val MAX_PAGINATED_RESULTS = 100_000
         const val DEFAULT_ATTACHMENT_SIZE_LIMIT = 10 * 1024 * 1024
         const val DEFAULT_ATTACHMENT_CHAR_LIMIT = 200_000

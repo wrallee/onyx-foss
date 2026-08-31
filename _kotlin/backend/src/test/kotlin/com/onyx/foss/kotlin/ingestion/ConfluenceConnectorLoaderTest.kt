@@ -1,6 +1,7 @@
 package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -13,6 +14,10 @@ import org.springframework.web.reactive.function.client.WebClient
 import org.springframework.web.reactive.function.client.WebClientResponseException
 import java.net.URI
 import java.time.Instant
+import java.time.ZoneOffset
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.util.Base64
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -164,6 +169,41 @@ class ConfluenceConnectorLoaderTest {
     }
 
     @Test
+    fun unresolvedPageRestrictionDoesNotInheritPublicSpace() = MockWebServer().use { server ->
+        val restrictedPage = mapper.readTree(page("111")).deepCopy<ObjectNode>().also { page ->
+            page.set<JsonNode>(
+                "restrictions",
+                mapper.readTree(
+                    """{"read":{"restrictions":{"user":{"results":[{"username":"missing"}]},"group":{"results":[]}}}}""",
+                ),
+            )
+        }
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
+                "/rest/api/space" -> json("""{"results":[{"key":"ENG"}]}""")
+                "/rest/api/server-information" -> json("""{"version":"10.2.10"}""")
+                "/rest/api/space/ENG/permissions" -> json(
+                    """[{"operation":{"operationKey":"read"},"subject":{"type":"anonymous"}}]""",
+                )
+                "/rest/api/user" -> MockResponse().setResponseCode(404)
+                else -> json(mapper.writeValueAsString(mapOf("results" to listOf(restrictedPage))))
+            }
+        }
+
+        val access = loader().load(
+            config(
+                server,
+                "\"include_permissions\":true,\"include_comments\":false,\"include_attachments\":false",
+            ),
+            credentials(),
+            null,
+        ).single().documents.single().externalAccess
+
+        assertFalse(assertNotNull(access).isPublic)
+        assertEquals(0, access.numEntries)
+    }
+
+    @Test
     fun reindexSinglePage() = MockWebServer().use { server ->
         server.dispatcher = reindexDispatcher(setOf("111"), server)
         val url = server.url("spaces/ENG/pages/111/Runbook").toString()
@@ -262,6 +302,92 @@ class ConfluenceConnectorLoaderTest {
         val request = server.takeRequest()
         assertEquals("/rest/api/search/user", request.requestUrl!!.encodedPath)
         assertEquals("type=user", request.requestUrl!!.queryParameter("cql"))
+    }
+
+    @Test
+    fun paginationRejectsCrossOriginNextWithoutSendingAuthorization() = MockWebServer().use { trusted ->
+        MockWebServer().use { malicious ->
+            malicious.enqueue(json("""{"results":[]}"""))
+            trusted.enqueue(
+                json(
+                    mapper.writeValueAsString(
+                        mapOf(
+                            "results" to listOf(mapper.readTree(page("111"))),
+                            "_links" to mapOf("next" to malicious.url("steal").toString()),
+                        ),
+                    ),
+                ),
+            )
+
+            val error = assertFailsWith<IllegalArgumentException> {
+                loader().load(
+                    config(trusted, "\"include_comments\":false,\"include_attachments\":false"),
+                    credentials(),
+                    null,
+                ).toList()
+            }
+
+            assertContains(error.message.orEmpty(), "origin")
+            assertEquals(0, malicious.requestCount)
+        }
+    }
+
+    @Test
+    fun paginationAcceptsConfiguredOriginAbsoluteNext() = MockWebServer().use { server ->
+        server.enqueue(
+            json(
+                mapper.writeValueAsString(
+                    mapOf(
+                        "results" to listOf(mapper.readTree(page("111"))),
+                        "_links" to mapOf(
+                            "next" to server.url("rest/api/content/search?cql=type%3Dpage&start=1&limit=50").toString(),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        server.enqueue(json("""{"results":[]}"""))
+
+        val batches = loader().load(
+            config(server, "\"is_cloud\":true,\"include_comments\":false,\"include_attachments\":false"),
+            credentials(),
+            null,
+        ).toList()
+
+        assertEquals(2, batches.size)
+        assertEquals("Basic ${Base64.getEncoder().encodeToString("user@example.com:token".toByteArray())}", server.takeRequest().getHeader("Authorization"))
+        assertEquals("1", server.takeRequest().requestUrl!!.queryParameter("start"))
+    }
+
+    @Test
+    fun attachmentDownloadRejectsCrossOriginUrlWithoutSendingAuthorization() = MockWebServer().use { trusted ->
+        MockWebServer().use { malicious ->
+            malicious.enqueue(MockResponse().setBody("stolen"))
+            val attachment = pdfAttachment().toMutableMap().also { value ->
+                value["_links"] = mapOf(
+                    "download" to malicious.url("steal").toString(),
+                    "webui" to "/pages/viewpageattachments.action?pageId=222&preview=att-222",
+                )
+            }
+            trusted.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse =
+                    if (request.path!!.contains("type%3Dattachment")) {
+                        json(mapper.writeValueAsString(mapOf("results" to listOf(attachment))))
+                    } else {
+                        json(pageResponse())
+                    }
+            }
+
+            val batch = loader().load(
+                config(trusted, "\"include_comments\":false"),
+                credentials(),
+                null,
+            ).single()
+
+            assertEquals(0, malicious.requestCount)
+            assertEquals("confluence_attachment_processing", batch.failures.single().errorType)
+            assertFalse(batch.documents.any { it.title == "spec.pdf" })
+        }
     }
 
     @Test
@@ -411,6 +537,59 @@ class ConfluenceConnectorLoaderTest {
     }
 
     @Test
+    fun attachmentPaginationRejectsRepeatedNextLink() = MockWebServer().use { server ->
+        var repeatedCalls = 0
+        val repeatedPath = "/rest/api/content/search?cql=type%3Dattachment&start=1&limit=50"
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when {
+                request.path!!.contains("type%3Dattachment") && !request.path!!.contains("start=1") -> json(
+                    """{"results":[{"title":"ignored.bin"}],"_links":{"next":"$repeatedPath"}}""",
+                )
+                request.path!!.contains("type%3Dattachment") && repeatedCalls++ < 2 -> json(
+                    """{"results":[{"title":"ignored.bin"}],"_links":{"next":"$repeatedPath"}}""",
+                )
+                request.path!!.contains("type%3Dattachment") -> MockResponse().setResponseCode(418)
+                else -> json(pageResponse())
+            }
+        }
+
+        val error = assertFailsWith<IllegalArgumentException> {
+            loader().load(
+                config(server, "\"is_cloud\":true,\"include_comments\":false"),
+                credentials(),
+                null,
+            ).toList()
+        }
+
+        assertContains(error.message.orEmpty(), "cycle")
+        assertTrue(repeatedCalls <= 1)
+    }
+
+    @Test
+    fun attachmentPaginationRejectsMoreThanOneHundredThousandResults() = MockWebServer().use { server ->
+        val attachments = buildString {
+            append("{\"results\":[")
+            repeat(100_001) { index ->
+                if (index > 0) append(',')
+                append("{\"title\":\"ignored.bin\"}")
+            }
+            append("]}")
+        }
+        server.enqueue(json(pageResponse()))
+        server.enqueue(json(attachments))
+
+        val error = assertFailsWith<IllegalArgumentException> {
+            loader().load(
+                config(server, "\"include_comments\":false"),
+                credentials(),
+                null,
+            ).toList()
+        }
+
+        assertContains(error.message.orEmpty(), "100000")
+    }
+
+    @Test
     fun isConfcloud77618ResponseMatchesCanonicalBody() {
         assertTrue(loader().isConfcloud77618(404, CONFCLOUD_77618_BODY))
     }
@@ -459,7 +638,7 @@ class ConfluenceConnectorLoaderTest {
     }
 
     @Test
-    fun paginateUrlDoesNotRaise77618WithoutAncestorExpand() = MockWebServer().use { server ->
+    fun paginateUrlDoesNotRaise77618WithoutAncestorExpand(): Unit = MockWebServer().use { server ->
         server.enqueue(MockResponse().setResponseCode(404).setBody(CONFCLOUD_77618_BODY))
 
         assertFailsWith<WebClientResponseException.NotFound> {
@@ -818,52 +997,106 @@ class ConfluenceConnectorLoaderTest {
     }
 
     @Test
-    fun usernameEmailCacheIsInstanceIsolated() {
-        val loader = loader()
-        MockWebServer().use { first ->
-            MockWebServer().use { second ->
-                first.enqueue(json("""{"email":"a@example.com"}"""))
-                second.enqueue(json("""{"email":"b@example.com"}"""))
-                val firstConfig = config(first)
-                val secondConfig = config(second)
+    fun completedCheckpointRestartsForNewPollWindow() = MockWebServer().use { server ->
+        server.enqueue(json(pageResponse()))
+        val completed = mapper.valueToTree<JsonNode>(
+            ConfluenceCheckpoint(hasMore = false, nextPageUrl = "/must-not-resume?start=99"),
+        )
 
-                assertEquals("a@example.com", loader.resolveUsernameEmail(firstConfig, credentials(), "jsmith"))
-                assertEquals("a@example.com", loader.resolveUsernameEmail(firstConfig, credentials(), "jsmith"))
-                assertEquals("b@example.com", loader.resolveUsernameEmail(secondConfig, credentials(), "jsmith"))
-                assertEquals(1, first.requestCount)
-                assertEquals(1, second.requestCount)
-            }
-        }
+        loader().load(
+            config(server, "\"include_comments\":false,\"include_attachments\":false"),
+            credentials(),
+            completed,
+            start = Instant.parse("2026-01-01T00:00:00Z"),
+            end = Instant.parse("2026-01-02T00:00:00Z"),
+        ).single()
+
+        val request = server.takeRequest()
+        assertEquals("/rest/api/content/search", request.requestUrl!!.encodedPath)
+        val cql = request.requestUrl!!.queryParameter("cql").orEmpty()
+        assertContains(cql, "lastmodified >= '2026-01-01 00:00'")
+        assertContains(cql, "lastmodified <= '2026-01-02 00:00'")
+        assertFalse(request.path!!.contains("must-not-resume"))
     }
 
     @Test
-    fun userkeyEmailCacheIsInstanceIsolated() {
-        val loader = loader()
-        MockWebServer().use { first ->
-            MockWebServer().use { second ->
-                first.enqueue(json("""{"email":"a@example.com"}"""))
-                second.enqueue(json("""{"email":"b@example.com"}"""))
+    fun inProgressCheckpointResumesNextPageUrl() = MockWebServer().use { server ->
+        server.enqueue(json(pageResponse()))
+        val active = mapper.valueToTree<JsonNode>(
+            ConfluenceCheckpoint(
+                hasMore = true,
+                nextPageUrl = "/rest/api/content/search?cql=type%3Dpage&start=7&limit=2",
+            ),
+        )
 
-                assertEquals("a@example.com", loader.resolveUserKeyEmail(config(first), credentials(), "key"))
-                assertEquals("b@example.com", loader.resolveUserKeyEmail(config(second), credentials(), "key"))
-                assertEquals(1, first.requestCount)
-                assertEquals(1, second.requestCount)
-            }
-        }
+        loader().load(
+            config(server, "\"include_comments\":false,\"include_attachments\":false"),
+            credentials(),
+            active,
+            start = Instant.parse("2026-01-01T00:00:00Z"),
+            end = Instant.parse("2026-01-02T00:00:00Z"),
+        ).single()
+
+        val request = server.takeRequest()
+        assertEquals("7", request.requestUrl!!.queryParameter("start"))
+        assertEquals("type=page", request.requestUrl!!.queryParameter("cql"))
     }
 
     @Test
-    fun displayNameCacheIsInstanceIsolated() {
+    fun usernameEmailCacheIsInstanceIsolated() = MockWebServer().use { server ->
         val loader = loader()
-        MockWebServer().use { first ->
-            MockWebServer().use { second ->
-                first.enqueue(json("""{"displayName":"Alice A"}"""))
-                second.enqueue(json("""{"displayName":"Bob B"}"""))
-
-                assertEquals("Alice A", loader.resolveDisplayName(config(first), credentials(), "user-1"))
-                assertEquals("Bob B", loader.resolveDisplayName(config(second), credentials(), "user-1"))
-            }
+        val calls = mutableMapOf<String, Int>()
+        server.dispatcher = userResolutionDispatcher(restrictedPages("username", "jsmith")) { request ->
+            val authorization = request.getHeader("Authorization").orEmpty()
+            calls[authorization] = calls.getOrDefault(authorization, 0) + 1
+            json("""{"email":"${if (authorization.endsWith("token-a")) "a" else "b"}@example.com"}""")
         }
+
+        val first = loadRestricted(loader, server, "token-a")
+        val second = loadRestricted(loader, server, "token-b")
+
+        assertTrue(first.all { it.externalAccess?.externalUserEmails == setOf("a@example.com") })
+        assertTrue(second.all { it.externalAccess?.externalUserEmails == setOf("b@example.com") })
+        assertEquals(mapOf("Bearer token-a" to 1, "Bearer token-b" to 1), calls)
+    }
+
+    @Test
+    fun userkeyEmailCacheIsInstanceIsolated() = MockWebServer().use { server ->
+        val loader = loader()
+        val calls = mutableMapOf<String, Int>()
+        server.dispatcher = userResolutionDispatcher(restrictedPages("userKey", "key")) { request ->
+            val authorization = request.getHeader("Authorization").orEmpty()
+            calls[authorization] = calls.getOrDefault(authorization, 0) + 1
+            json("""{"email":"${if (authorization.endsWith("token-a")) "a" else "b"}@example.com"}""")
+        }
+
+        val first = loadRestricted(loader, server, "token-a")
+        val second = loadRestricted(loader, server, "token-b")
+
+        assertTrue(first.all { it.externalAccess?.externalUserEmails == setOf("a@example.com") })
+        assertTrue(second.all { it.externalAccess?.externalUserEmails == setOf("b@example.com") })
+        assertEquals(mapOf("Bearer token-a" to 1, "Bearer token-b" to 1), calls)
+    }
+
+    @Test
+    fun displayNameCacheIsInstanceIsolated() = MockWebServer().use { server ->
+        val loader = loader()
+        val taggedPages = listOf("1", "2").map { id ->
+            mapper.readTree(page(id, """<p><ri:user ri:userkey="user-1"/></p>"""))
+        }
+        val calls = mutableMapOf<String, Int>()
+        server.dispatcher = userResolutionDispatcher(taggedPages) { request ->
+            val authorization = request.getHeader("Authorization").orEmpty()
+            calls[authorization] = calls.getOrDefault(authorization, 0) + 1
+            json("""{"displayName":"${if (authorization.endsWith("token-a")) "Alice A" else "Bob B"}"}""")
+        }
+
+        val first = loadWithoutExtras(loader, server, "token-a")
+        val second = loadWithoutExtras(loader, server, "token-b")
+
+        assertTrue(first.all { it.content == "@Alice A" })
+        assertTrue(second.all { it.content == "@Bob B" })
+        assertEquals(mapOf("Bearer token-a" to 1, "Bearer token-b" to 1), calls)
     }
 
     @Test
@@ -1069,24 +1302,39 @@ class ConfluenceConnectorLoaderTest {
 
     @Test
     fun getUserEmailFromUserkeyCachesLookups() = MockWebServer().use { server ->
-        server.enqueue(json("""{"email":"alice@example.com"}"""))
         val loader = loader()
-        val config = config(server)
+        var calls = 0
+        server.dispatcher = userResolutionDispatcher(restrictedPages("userKey", "alice")) {
+            calls += 1
+            json("""{"email":"alice@example.com"}""")
+        }
 
-        assertEquals("alice@example.com", loader.resolveUserKeyEmail(config, credentials(), "alice"))
-        assertEquals("alice@example.com", loader.resolveUserKeyEmail(config, credentials(), "alice"))
-        assertEquals(1, server.requestCount)
+        val documents = loadRestricted(loader, server, "token-a")
+
+        assertTrue(documents.all { it.externalAccess?.externalUserEmails == setOf("alice@example.com") })
+        assertEquals(1, calls)
     }
 
     @Test
     fun getUserEmailFromUserkeyCachesNegativeResult() = MockWebServer().use { server ->
-        server.enqueue(MockResponse().setResponseCode(404))
         val loader = loader()
-        val config = config(server)
+        val calls = mutableMapOf<String, Int>()
+        server.dispatcher = userResolutionDispatcher(restrictedPages("userKey", "missing")) { request ->
+            val authorization = request.getHeader("Authorization").orEmpty()
+            calls[authorization] = calls.getOrDefault(authorization, 0) + 1
+            if (authorization.endsWith("token-a")) {
+                MockResponse().setResponseCode(404)
+            } else {
+                json("""{"email":"recovered@example.com"}""")
+            }
+        }
 
-        assertNull(loader.resolveUserKeyEmail(config, credentials(), "missing"))
-        assertNull(loader.resolveUserKeyEmail(config, credentials(), "missing"))
-        assertEquals(1, server.requestCount)
+        val first = loadRestricted(loader, server, "token-a")
+        val second = loadRestricted(loader, server, "token-b")
+
+        assertTrue(first.all { it.externalAccess?.numEntries == 0 })
+        assertTrue(second.all { it.externalAccess?.externalUserEmails == setOf("recovered@example.com") })
+        assertEquals(mapOf("Bearer token-a" to 1, "Bearer token-b" to 1), calls)
     }
 
     @Test
@@ -1251,25 +1499,42 @@ class ConfluenceConnectorLoaderTest {
     }
 
     @Test
-    fun nonRateLimitError() = MockWebServer().use { server ->
-        repeat(5) { server.enqueue(MockResponse().setResponseCode(500)) }
-        val loader = loader()
+    fun nonRateLimitError(): Unit = MockWebServer().use { server ->
+        server.enqueue(MockResponse().setResponseCode(418).setBody("not rate limited"))
+        val checkpoint = mapper.valueToTree<JsonNode>(
+            ConfluenceCheckpoint(
+                hasMore = true,
+                nextPageUrl = "/rest/api/content/search?cql=type%3Dpage&start=2&limit=50",
+            ),
+        )
 
         assertFailsWith<WebClientResponseException> {
-            loader.getWithSourceRetry(config(server), credentials(), "/rest/api/test")
+            loader().load(config(server), credentials(), checkpoint).toList()
         }
-        assertEquals(5, server.requestCount)
+        assertEquals(1, server.requestCount)
     }
 
     @Test
-    fun rateLimitHonorsRetryAfter() = MockWebServer().use { server ->
-        server.enqueue(MockResponse().setResponseCode(429).setHeader("Retry-After", "0"))
-        server.enqueue(json("""{"results":[{"id":1}]}"""))
+    fun rateLimitHonorsRetryAfter() {
+        val farFuture = DateTimeFormatter.RFC_1123_DATE_TIME.format(ZonedDateTime.now(ZoneOffset.UTC).plusYears(1))
+        listOf(
+            "0" to 2_000L,
+            "5" to 5_000L,
+            "999" to 60_000L,
+            farFuture to 60_000L,
+        ).forEach { (retryAfter, expectedDelay) ->
+            MockWebServer().use { server ->
+                server.enqueue(MockResponse().setResponseCode(429).setHeader("Retry-After", retryAfter))
+                server.enqueue(json("""{"results":[{"id":1}]}"""))
+                val delays = mutableListOf<Long>()
+                val loader = loader().also { it.sleepMillis = delays::add }
 
-        val result = loader().paginate(config(server), credentials(), "/rest/api/content/search", 50)
+                val result = loader.paginate(config(server), credentials(), "/rest/api/content/search", 50)
 
-        assertEquals(1, result.single().path("id").asInt())
-        assertEquals(2, server.requestCount)
+                assertEquals(1, result.single().path("id").asInt())
+                assertEquals(listOf(expectedDelay), delays)
+            }
+        }
     }
 
     @Test
@@ -1310,8 +1575,8 @@ class ConfluenceConnectorLoaderTest {
         """{"wiki_base":"$base"${if (extra.isBlank()) "" else ",$extra"}}""",
     )
 
-    private fun credentials(): JsonNode = mapper.readTree(
-        """{"confluence_username":"user@example.com","confluence_access_token":"token"}""",
+    private fun credentials(token: String = "token"): JsonNode = mapper.readTree(
+        """{"confluence_username":"user@example.com","confluence_access_token":"$token"}""",
     )
 
     private fun failure(url: String) = ConnectorFailure(FailureTarget.Document(url, url), "retry")
@@ -1372,6 +1637,51 @@ class ConfluenceConnectorLoaderTest {
             ),
         ),
     )
+
+    private fun restrictedPages(field: String, value: String): List<JsonNode> = listOf("1", "2").map { id ->
+        mapper.readTree(page(id)).deepCopy<ObjectNode>().also { page ->
+            page.set<JsonNode>(
+                "restrictions",
+                mapper.readTree(
+                    """{"read":{"restrictions":{"user":{"results":[{"$field":"$value"}]},"group":{"results":[]}}}}""",
+                ),
+            )
+        }
+    }
+
+    private fun userResolutionDispatcher(
+        pages: List<JsonNode>,
+        resolveUser: (RecordedRequest) -> MockResponse,
+    ): Dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
+            "/rest/api/space" -> json("""{"results":[]}""")
+            "/rest/api/user" -> resolveUser(request)
+            else -> json(mapper.writeValueAsString(mapOf("results" to pages)))
+        }
+    }
+
+    private fun loadRestricted(
+        loader: ConfluenceConnectorLoader,
+        server: MockWebServer,
+        token: String,
+    ): List<SourceDocument> = loader.load(
+        config(
+            server,
+            "\"include_permissions\":true,\"include_comments\":false,\"include_attachments\":false",
+        ),
+        credentials(token),
+        null,
+    ).single().documents
+
+    private fun loadWithoutExtras(
+        loader: ConfluenceConnectorLoader,
+        server: MockWebServer,
+        token: String,
+    ): List<SourceDocument> = loader.load(
+        config(server, "\"include_comments\":false,\"include_attachments\":false"),
+        credentials(token),
+        null,
+    ).single().documents
 
     private fun attachmentDispatcher(
         pages: String,
