@@ -55,24 +55,35 @@ class RemoteConnectorLoadersTest {
     fun collectsConfluencePagesWithPaginationFields() = MockWebServer().use { server ->
         server.enqueue(
             MockResponse().setHeader("Content-Type", "application/json").setBody(
-                """{"totalSize":1,"results":[{"id":"42","title":"Runbook","body":{"storage":{"value":"<p>Safe <b>content</b></p>"}},"_links":{"webui":"/pages/42"},"space":{"key":"ENG"},"version":{"when":"2026-01-01"}}]}""",
+                """{"results":[{"key":"ENG"}]}""",
+            ),
+        )
+        server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("""{"key":"ENG"}"""))
+        server.enqueue(
+            MockResponse().setHeader("Content-Type", "application/json").setBody(
+                """{"totalSize":1,"results":[{"id":"42","title":"Runbook","body":{"storage":{"value":"<p>Safe <b>content</b></p>"}},"_links":{"webui":"/pages/42"},"space":{"key":"ENG"},"version":{"when":"2026-01-01T00:00:00Z"}}]}""",
             ),
         )
         server.start()
         val base = server.url("/").toString().trimEnd('/')
         val docs = loaders().load(
             ConnectorSource.CONFLUENCE,
-            mapper.readTree("""{"wiki_base":"""" + base + """","space":"ENG"}"""),
+            mapper.readTree("""{"wiki_base":"""" + base + """","space":"ENG","include_comments":false,"include_attachments":false}"""),
             mapper.readTree("""{"confluence_username":"a@example.com","confluence_access_token":"token"}"""),
             null,
         ).single().documents
 
-        assertEquals("42", docs.single().id)
+        assertEquals(base + "/pages/42", docs.single().id)
         assertEquals("Safe content", docs.single().content)
+        val validation = server.takeRequest()
+        assertEquals("/rest/api/space", validation.requestUrl!!.encodedPath)
+        assertEquals("Bearer token", validation.getHeader("Authorization"))
         val request = server.takeRequest()
-        assertEquals("/rest/api/content/search", request.requestUrl!!.encodedPath)
-        assertEquals("type=page and space='ENG'", request.requestUrl!!.queryParameter("cql"))
-        assertEquals("Bearer token", request.getHeader("Authorization"))
+        assertEquals("/rest/api/space/ENG", request.requestUrl!!.encodedPath)
+        val search = server.takeRequest()
+        assertEquals("/rest/api/content/search", search.requestUrl!!.encodedPath)
+        assertTrue(search.requestUrl!!.queryParameter("cql")!!.startsWith("type=page and space='ENG'"))
+        assertEquals("Bearer token", search.getHeader("Authorization"))
     }
 
     @Test
@@ -103,6 +114,12 @@ class RemoteConnectorLoadersTest {
         val content = "a".repeat(300_000)
         server.enqueue(
             MockResponse().setHeader("Content-Type", "application/json").setBody(
+                """{"results":[{"key":"ENG"}]}""",
+            ),
+        )
+        server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody("""{"key":"ENG"}"""))
+        server.enqueue(
+            MockResponse().setHeader("Content-Type", "application/json").setBody(
                 mapper.writeValueAsString(
                     mapOf(
                         "totalSize" to 1,
@@ -111,6 +128,8 @@ class RemoteConnectorLoadersTest {
                                 "id" to "42",
                                 "title" to "Large page",
                                 "body" to mapOf("storage" to mapOf("value" to content)),
+                                "_links" to mapOf("webui" to "/pages/42"),
+                                "version" to mapOf("when" to "2026-01-01T00:00:00Z"),
                             ),
                         ),
                     ),
@@ -121,7 +140,9 @@ class RemoteConnectorLoadersTest {
 
         val docs = loaders().load(
             ConnectorSource.CONFLUENCE,
-            mapper.readTree("""{"wiki_base":"${server.url("/").toString().trimEnd('/')}","space":"ENG"}"""),
+            mapper.readTree(
+                """{"wiki_base":"${server.url("/").toString().trimEnd('/')}","space":"ENG","include_comments":false,"include_attachments":false}""",
+            ),
             mapper.readTree("""{"confluence_access_token":"token"}"""),
             null,
         ).single().documents
@@ -131,6 +152,10 @@ class RemoteConnectorLoadersTest {
 
     private fun loaders(): RemoteConnectorLoaders =
         RemoteJsonClient(WebClient.builder()).let { http ->
-            RemoteConnectorLoaders(http, JiraConnectorLoader(http, mapper))
+            RemoteConnectorLoaders(
+                http,
+                JiraConnectorLoader(http, mapper),
+                ConfluenceConnectorLoader(http, mapper).also { it.sleepMillis = {} },
+            )
         }
 }

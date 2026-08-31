@@ -14,6 +14,7 @@ import java.util.Base64
 class RemoteConnectorLoaders(
     private val http: RemoteJsonClient,
     private val jira: JiraConnectorLoader,
+    private val confluence: ConfluenceConnectorLoader,
 ) {
     fun load(
         source: ConnectorSource,
@@ -27,8 +28,11 @@ class RemoteConnectorLoaders(
             jira.validate(config, credentials)
             return jira.load(config, credentials, checkpoint, start = start, end = end)
         }
+        if (source == ConnectorSource.CONFLUENCE) {
+            confluence.validate(config, credentials)
+            return confluence.load(config, credentials, checkpoint, start = start, end = end)
+        }
         val documents = when (source) {
-            ConnectorSource.CONFLUENCE -> confluence(config, credentials, checkpoint)
             ConnectorSource.GITHUB -> github(config, credentials, checkpoint)
             else -> error("Unsupported remote connector: " + source.value)
         }
@@ -43,42 +47,6 @@ class RemoteConnectorLoaders(
                 ),
             ),
         )
-    }
-
-    private fun confluence(config: JsonNode?, credentials: JsonNode, checkpoint: JsonNode?): List<SourceDocument> {
-        val base = required(config, "wiki_base", "confluence_base_url", "base_url")
-        val requested = config?.text("cql_query")
-        val space = config?.text("space")
-        val cql = requested ?: if (space.isNullOrBlank()) "type=page" else "type=page and space='" + space + "'"
-        val headers = auth(credentials, basic = config?.path("is_cloud")?.asBoolean(false) == true)
-        val result = mutableListOf<SourceDocument>()
-        var start = 0
-        while (true) {
-            val path = "/rest/api/content/search?cql=" + query(cql) +
-                "&expand=body.storage,version,space,_links&limit=50&start=" + start
-            val response = http.get(base, path, headers)
-            val pages = response.path("results")
-            pages.forEach { page ->
-                val pageId = page.path("id").asText()
-                val webPath = page.path("_links").path("webui").asText()
-                result += SourceDocument(
-                    id = pageId,
-                    title = page.path("title").asText(pageId),
-                    content = stripHtml(page.path("body").path("storage").path("value").asText()),
-                    link = if (webPath.isBlank()) null else base.trimEnd('/') + webPath,
-                    metadata = mapOf(
-                        "source" to "confluence",
-                        "space" to page.path("space").path("key").asText(),
-                        "updated" to page.path("version").path("when").asText(),
-                    ),
-                )
-            }
-            val pageSize = pages.size()
-            val total = response.path("totalSize").asInt(start + pageSize)
-            start += pageSize
-            if (pageSize == 0 || start >= total) break
-        }
-        return afterCheckpoint(result, checkpoint)
     }
 
     private fun github(config: JsonNode?, credentials: JsonNode, checkpoint: JsonNode?): List<SourceDocument> {
@@ -228,5 +196,4 @@ class RemoteConnectorLoaders(
 
     private fun segment(value: String): String = UriUtils.encodePathSegment(value, StandardCharsets.UTF_8)
 
-    private fun stripHtml(value: String): String = value.replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
 }
