@@ -2,7 +2,7 @@ import "./globals.css";
 
 import type { Metadata } from "next";
 import { MODAL_ROOT_ID } from "@/lib/constants";
-import { DM_Mono, Hanken_Grotesk } from "next/font/google";
+import localFont from "next/font/local";
 import { ThemeProvider } from "next-themes";
 import { TooltipProvider } from "@radix-ui/react-tooltip";
 import SWRConfigProvider from "@/providers/SWRConfigProvider";
@@ -10,15 +10,18 @@ import KotlinAdminProvider from "@/providers/KotlinAdminProvider";
 import { NextIntlClientProvider } from "next-intl";
 import { getLocale, getMessages } from "next-intl/server";
 
-const hankenGrotesk = Hanken_Grotesk({
-  subsets: ["latin"],
+const hankenGrotesk = localFont({
+  src: "./fonts/hanken-grotesk-latin.woff2",
+  weight: "100 900",
+  style: "normal",
   display: "swap",
   fallback: ["-apple-system", "BlinkMacSystemFont", "Segoe UI", "Roboto"],
 });
 
-const dmMono = DM_Mono({
+const dmMono = localFont({
+  src: "./fonts/dm-mono-latin-400.woff2",
   weight: "400",
-  subsets: ["latin"],
+  style: "normal",
   display: "swap",
   fallback: [
     "SF Mono",
