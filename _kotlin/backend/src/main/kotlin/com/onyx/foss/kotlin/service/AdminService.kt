@@ -1,6 +1,8 @@
 package com.onyx.foss.kotlin.service
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.onyx.foss.kotlin.api.ApiException
 import com.onyx.foss.kotlin.api.CCPropertyUpdateRequest
 import com.onyx.foss.kotlin.api.ConnectorRequest
@@ -86,7 +88,7 @@ class AdminService(
     fun updateCredential(credentialId: Long, request: CredentialUpdateRequest): Map<String, Any?> {
         val value = credential(credentialId)
         value.name = request.name.trim()
-        value.secretJson = cipher.encrypt(request.credentialJson)
+        value.secretJson = cipher.encrypt(mergeMaskedCredential(cipher.decrypt(value.secretJson), request.credentialJson))
         return credentialSnapshot(credentials.save(value))
     }
 
@@ -336,6 +338,9 @@ class AdminService(
     @Transactional
     fun createSet(request: DocumentSetRequest): Long {
         validatePairs(request.ccPairIds)
+        if (sets.existsByName(request.name.trim())) {
+            throw ApiException(HttpStatus.CONFLICT, "Document set name already exists")
+        }
         val set = sets.save(DocumentSetEntity(name = request.name.trim(), description = request.description, isPublic = true))
         replaceSetPairs(id(set), request.ccPairIds)
         return id(set)
@@ -408,6 +413,15 @@ class AdminService(
 
     private fun validatePairs(pairIds: List<Long>) {
         if (pairIds.any { !pairs.existsById(it) }) throw ApiException(HttpStatus.BAD_REQUEST, "Document set references a missing connector")
+    }
+
+    private fun mergeMaskedCredential(current: JsonNode, update: JsonNode): JsonNode {
+        if (!current.isObject || !update.isObject) return update
+        val merged = update.deepCopy<ObjectNode>()
+        update.fields().forEach { (name, value) ->
+            if (value.isTextual && value.asText() == "********") merged.set<JsonNode>(name, current.path(name))
+        }
+        return merged
     }
 
     fun connector(connectorId: Long): ConnectorEntity =

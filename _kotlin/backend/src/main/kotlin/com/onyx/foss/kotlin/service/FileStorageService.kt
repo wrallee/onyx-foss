@@ -72,16 +72,14 @@ class FileStorageService(
             throw ApiException(HttpStatus.BAD_REQUEST, "This endpoint only works with file connectors")
         }
         val config = ((connector.connectorSpecificConfig ?: mapper.createObjectNode()).deepCopy<ObjectNode>())
-        val currentLocations = config.withArray("file_locations")
-            .map { it.asText() }
-            .filterNot(idsToRemove::contains)
-            .toMutableList()
-        val currentNames = config.withArray("file_names").map { it.asText() }.toMutableList()
+        val currentNames = config.withArray("file_names")
+        val currentFiles = config.withArray("file_locations").mapIndexed { index, location ->
+            location.asText() to (currentNames.get(index)?.asText() ?: location.asText())
+        }.filterNot { (id) -> id in idsToRemove }.toMutableList()
         val added = newFiles.filter { !it.isEmpty }.map(::store)
-        currentLocations += added.map { it.id }
-        currentNames += added.map { it.originalName }
-        config.set<ArrayNode>("file_locations", mapper.valueToTree(currentLocations))
-        config.set<ArrayNode>("file_names", mapper.valueToTree(currentNames))
+        currentFiles += added.map { it.id to it.originalName }
+        config.set<ArrayNode>("file_locations", mapper.valueToTree(currentFiles.map { it.first }))
+        config.set<ArrayNode>("file_names", mapper.valueToTree(currentFiles.map { it.second }))
         connector.connectorSpecificConfig = config
         admin.updateConnector(
             connectorId,

@@ -17,7 +17,9 @@ interface ConnectorCredentialPairRepository : JpaRepository<ConnectorCredentialP
     fun findByConnectorIdAndCredentialId(connectorId: Long, credentialId: Long): ConnectorCredentialPairEntity?
 }
 
-interface DocumentSetRepository : JpaRepository<DocumentSetEntity, Long>
+interface DocumentSetRepository : JpaRepository<DocumentSetEntity, Long> {
+    fun existsByName(name: String): Boolean
+}
 
 interface FileAssetRepository : JpaRepository<FileAssetEntity, String>
 

@@ -10,6 +10,7 @@ class IngestionQueryService(
     private val errors: IngestionErrorRepository,
 ) {
     fun attempts(pairId: Long, page: Int, pageSize: Int): Map<String, Any?> {
+        validatePage(page, pageSize)
         val all = attempts.findAllByCcPairIdOrderByIdDesc(pairId)
         val slice = all.drop(page * pageSize).take(pageSize)
         return mapOf(
@@ -35,6 +36,7 @@ class IngestionQueryService(
     }
 
     fun errors(pairId: Long, page: Int, pageSize: Int): Map<String, Any?> {
+        validatePage(page, pageSize)
         val ids = attempts.findAllByCcPairIdOrderByIdDesc(pairId).mapNotNull { it.id }
         val all = if (ids.isEmpty()) {
             emptyList()
@@ -60,5 +62,10 @@ class IngestionQueryService(
             },
             "total_items" to all.size,
         )
+    }
+
+    private fun validatePage(page: Int, pageSize: Int) {
+        require(page >= 0) { "page_num must be non-negative" }
+        require(pageSize > 0) { "page_size must be positive" }
     }
 }
