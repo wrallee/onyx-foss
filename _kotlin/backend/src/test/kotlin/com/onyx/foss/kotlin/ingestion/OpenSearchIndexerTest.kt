@@ -39,7 +39,10 @@ class OpenSearchIndexerTest {
     @Test
     fun updatesAclFieldsForOnlyTheSelectedDocuments() {
         MockWebServer().use { server ->
-            server.enqueue(MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody("{}"))
+            server.enqueue(
+                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
+                    .setBody(successfulUpdateResponse()),
+            )
             server.start()
             val properties = OnyxProperties(
                 opensearch = OnyxProperties.OpenSearch(
@@ -65,4 +68,38 @@ class OpenSearchIndexerTest {
             assertThat(storedAccess.path("is_public").asBoolean()).isFalse()
         }
     }
+
+    @Test
+    fun rejectsTimedOutFailedAndIncompleteAclUpdates() {
+        listOf(
+            """{"timed_out":true,"total":1,"updated":1,"noops":0,"version_conflicts":0,"failures":[]}""",
+            """{"timed_out":false,"total":1,"updated":1,"noops":0,"version_conflicts":0,"failures":[{"cause":"failed"}]}""",
+            """{"timed_out":false,"total":0,"updated":0,"noops":0,"version_conflicts":0,"failures":[]}""",
+            """{"timed_out":false,"total":1,"updated":0,"noops":0,"version_conflicts":0,"failures":[]}""",
+        ).forEach { response ->
+            MockWebServer().use { server ->
+                server.enqueue(
+                    MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(response),
+                )
+                server.start()
+                val indexer = OpenSearchIndexer(
+                    OnyxProperties(
+                        opensearch = OnyxProperties.OpenSearch(
+                            baseUrl = server.url("/").toString().trimEnd('/'),
+                            index = "documents",
+                        ),
+                    ),
+                    WebClient.builder(),
+                    mapper,
+                )
+
+                org.junit.jupiter.api.assertThrows<IllegalStateException> {
+                    indexer.updateAccess(7, mapOf("one" to ExternalAccess(isPublic = false)))
+                }
+            }
+        }
+    }
+
+    private fun successfulUpdateResponse(): String =
+        """{"timed_out":false,"total":1,"updated":1,"noops":0,"version_conflicts":0,"failures":[]}"""
 }

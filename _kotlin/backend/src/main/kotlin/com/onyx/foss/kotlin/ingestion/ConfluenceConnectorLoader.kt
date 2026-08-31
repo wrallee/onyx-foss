@@ -624,7 +624,12 @@ class ConfluenceConnectorLoader(
             perPageRestrictions -> PER_PAGE_RESTRICTIONS_EXPAND
             else -> RESTRICTIONS_EXPAND
         }
-        val spaceAccess = if (includePermissions) allSpacePermissions(context, prefixGroups = false) else emptyMap()
+        val unresolvedSpaces = mutableSetOf<String>()
+        val spaceAccess = if (includePermissions) {
+            allSpacePermissions(context, prefixGroups = false, unresolvedSpaces = unresolvedSpaces)
+        } else {
+            emptyMap()
+        }
         val ancestorCache = mutableMapOf<String, JsonNode?>()
         var path: String? = buildCqlPath(constructPageCql(context.config, start, end), expand)
         var limit = SLIM_PAGE_SIZE
@@ -632,28 +637,27 @@ class ConfluenceConnectorLoader(
             val result = fetchPage(context, path, limit)
             limit = result.effectiveLimit
             val documents = mutableListOf<SourceDocument>()
+            val failures = mutableListOf<ConnectorFailure>()
             result.results.forEach { rawPage ->
                 val page = rawPage.deepCopy<JsonNode>().also { expandNested(context, it, limit) }
                 val pageId = page.path("id").asText()
                 val pageUrl = buildContentUrl(context, page.path("_links").path("webui").asText())
                 val spaceKey = page.path("space").path("key").asText()
-                val access = if (includePermissions) {
-                    runCatching {
-                        if (perPageRestrictions) {
-                            resolveRestrictions(
-                                page.path("restrictions"),
-                                page.path("ancestors").toList(),
-                                ancestorCache,
-                                fetch = { ancestorId -> fetchContentReadRestrictions(context, ancestorId) },
-                                emailResolver = { user -> resolveRestrictionEmail(context, user) },
-                            )
-                        } else {
-                            resolveInlineRestrictions(context, page)
-                        } ?: spaceAccess[spaceKey] ?: PRIVATE_ACCESS
-                    }.getOrDefault(PRIVATE_ACCESS)
+                val permission = if (includePermissions) {
+                    resolveSlimPermission(
+                        context,
+                        page,
+                        pageUrl,
+                        spaceKey,
+                        spaceAccess,
+                        unresolvedSpaces,
+                        ancestorCache,
+                        perPageRestrictions,
+                    )
                 } else {
-                    null
+                    PermissionResolution(null)
                 }
+                if (permission.failure != null) failures += permission.failure
                 documents += SourceDocument(
                     id = pageUrl,
                     title = page.path("title").asText(pageId),
@@ -668,7 +672,7 @@ class ConfluenceConnectorLoader(
                                 ?.takeIf(String::isNotBlank) ?: spaceKey.takeIf(String::isNotBlank)
                             ),
                     ),
-                    externalAccess = access,
+                    externalAccess = permission.access,
                     source = ConnectorSource.CONFLUENCE,
                 )
                 if (context.config.boolean("include_attachments", true)) {
@@ -688,17 +692,66 @@ class ConfluenceConnectorLoader(
                                     "parent_hierarchy_raw_node_id" to pageUrl,
                                     "mime_type" to attachment.path("metadata").path("mediaType").asText(),
                                 ),
-                                externalAccess = access,
+                                externalAccess = permission.access,
                                 source = ConnectorSource.CONFLUENCE,
                             )
                         }
                 }
             }
             val checkpoint = ConfluenceCheckpoint(result.nextPath != null, result.nextPath)
-            yield(ConnectorBatch(documents, checkpoint = ConnectorCheckpoint(mapper.valueToTree(checkpoint), checkpoint.hasMore)))
+            yield(
+                ConnectorBatch(
+                    documents,
+                    failures,
+                    ConnectorCheckpoint(mapper.valueToTree(checkpoint), checkpoint.hasMore),
+                ),
+            )
             path = result.nextPath
         }
     }
+
+    private fun resolveSlimPermission(
+        context: Context,
+        page: JsonNode,
+        pageUrl: String,
+        spaceKey: String,
+        spaceAccess: Map<String, ExternalAccess>,
+        unresolvedSpaces: Set<String>,
+        ancestorCache: MutableMap<String, JsonNode?>,
+        perPageRestrictions: Boolean,
+    ): PermissionResolution = try {
+        val pageAccess = if (perPageRestrictions) {
+            resolveRestrictions(
+                page.path("restrictions"),
+                page.path("ancestors").toList(),
+                ancestorCache,
+                fetch = { ancestorId -> fetchContentReadRestrictions(context, ancestorId) },
+                emailResolver = { user -> resolveRestrictionEmail(context, user) },
+            )
+        } else {
+            resolveInlineRestrictions(context, page)
+        }
+        val access = pageAccess ?: spaceAccess[spaceKey]
+        if (access == null || spaceKey in unresolvedSpaces || pageAccess == PRIVATE_ACCESS) {
+            unresolvedPermission(pageUrl, "Confluence could not determine document permissions")
+        } else {
+            PermissionResolution(access)
+        }
+    } catch (error: Exception) {
+        unresolvedPermission(
+            pageUrl,
+            "Confluence could not determine document permissions: ${error.message ?: error::class.simpleName}",
+        )
+    }
+
+    private fun unresolvedPermission(pageUrl: String, message: String): PermissionResolution = PermissionResolution(
+        PRIVATE_ACCESS,
+        ConnectorFailure(
+            FailureTarget.Document(pageUrl, pageUrl),
+            message,
+            "confluence_permission_unresolved",
+        ),
+    )
 
     private fun retrieveSlimAttachments(context: Context, pageId: String, start: Instant?, end: Instant?): List<JsonNode> {
         val path = buildCqlPath(constructAttachmentCql(context.config, pageId, start, end), PRUNING_EXPAND)
@@ -979,10 +1032,14 @@ class ConfluenceConnectorLoader(
         return payload.path("result").takeIf(JsonNode::isArray)?.toList().orEmpty()
     }
 
-    private fun allSpacePermissions(context: Context, prefixGroups: Boolean): Map<String, ExternalAccess> =
+    private fun allSpacePermissions(
+        context: Context,
+        prefixGroups: Boolean,
+        unresolvedSpaces: MutableSet<String>? = null,
+    ): Map<String, ExternalAccess> =
         retrieveSpaces(context, SPACE_PAGE_SIZE).associate { space ->
             val key = space.path("key").asText().ifBlank { space.path("id").asText() }
-            val access = runCatching {
+            val access = try {
                 val rows = if (context.isCloud) {
                     val response = get(context, "/rest/api/space/${segment(key)}?expand=permissions")
                     response.path("permissions").let { permissions ->
@@ -998,7 +1055,10 @@ class ConfluenceConnectorLoader(
                     getAllSpacePermissionsServerJsonRpc(context, key)
                 }
                 parseSpacePermissions(context, rows, if (prefixGroups) CONFLUENCE_GROUP_PREFIX else "")
-            }.getOrDefault(PRIVATE_ACCESS)
+            } catch (_: Exception) {
+                unresolvedSpaces?.add(key)
+                PRIVATE_ACCESS
+            }
             key to access
         }
 
@@ -1238,6 +1298,10 @@ class ConfluenceConnectorLoader(
     private data class ProcessResult(
         val documents: List<SourceDocument> = emptyList(),
         val failures: List<ConnectorFailure> = emptyList(),
+    )
+    private data class PermissionResolution(
+        val access: ExternalAccess?,
+        val failure: ConnectorFailure? = null,
     )
     private data class AttachmentResult(val document: SourceDocument? = null, val failure: ConnectorFailure? = null)
 

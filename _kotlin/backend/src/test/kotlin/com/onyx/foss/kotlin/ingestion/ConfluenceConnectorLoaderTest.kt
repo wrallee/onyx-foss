@@ -952,6 +952,32 @@ class ConfluenceConnectorLoaderTest {
     }
 
     @Test
+    fun missingSlimPermissionEmitsPrivateDocumentFailure() = MockWebServer().use { server ->
+        val unresolved = mapper.readTree(page("111")).deepCopy<ObjectNode>().also {
+            (it.path("space") as ObjectNode).put("key", "MISSING")
+        }
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
+                "/rest/api/space" -> json("""{"results":[{"key":"ENG"}]}""")
+                "/rest/api/server-information" -> json("""{"version":"10.2.10"}""")
+                "/rest/api/space/ENG/permissions" -> json("[]")
+                else -> json(mapper.writeValueAsString(mapOf("results" to listOf(unresolved))))
+            }
+        }
+
+        val batch = loader().retrieveAllSlimDocuments(
+            config(server, "\"include_attachments\":false"),
+            credentials(),
+            includePermissions = true,
+        ).single()
+
+        val document = batch.documents.single()
+        assertEquals(ExternalAccess(isPublic = false), document.externalAccess)
+        assertEquals(document.id, (batch.failures.single().target as FailureTarget.Document).id)
+        assertEquals("confluence_permission_unresolved", batch.failures.single().errorType)
+    }
+
+    @Test
     fun validateConnectorSettingsErrors() {
         listOf(401 to "expired", 403 to "permissions", 404 to "Unexpected Confluence error").forEach { (status, message) ->
             MockWebServer().use { server ->

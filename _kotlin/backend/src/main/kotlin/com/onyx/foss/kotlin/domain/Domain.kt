@@ -294,6 +294,12 @@ class PermissionSyncAttemptEntity(
     var status: AttemptStatus = AttemptStatus.NOT_STARTED,
     @Column(name = "error_msg")
     var errorMessage: String? = null,
+    @Column(name = "full_exception_trace")
+    var fullExceptionTrace: String? = null,
+    @Column(name = "total_docs_synced", nullable = false)
+    var totalDocsSynced: Int = 0,
+    @Column(name = "docs_with_permission_errors", nullable = false)
+    var docsWithPermissionErrors: Int = 0,
     @Column(name = "time_started")
     var timeStarted: Instant? = null,
     @Column(name = "time_finished")

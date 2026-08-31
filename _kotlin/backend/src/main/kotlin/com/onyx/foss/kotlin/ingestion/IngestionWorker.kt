@@ -400,9 +400,15 @@ class OpenSearchIndexer(
                 }
             }
             .block()
-        check(response != null && response.path("failures").size() == 0 && response.path("version_conflicts").asInt(0) == 0) {
-            "OpenSearch did not confirm the ACL update"
-        }
+        val total = response?.path("total")?.asInt(-1) ?: -1
+        val updated = response?.path("updated")?.asInt(-1) ?: -1
+        val noops = response?.path("noops")?.asInt(-1) ?: -1
+        check(
+            response != null && !response.path("timed_out").asBoolean(true) &&
+                response.path("failures").isArray && response.path("failures").isEmpty &&
+                response.path("version_conflicts").asInt(-1) == 0 &&
+                total >= accessByDocument.size && updated + noops == total,
+        ) { "OpenSearch did not fully apply the ACL update" }
     }
 
     private fun deleteByQuery(query: Map<String, Any>, operation: String) {

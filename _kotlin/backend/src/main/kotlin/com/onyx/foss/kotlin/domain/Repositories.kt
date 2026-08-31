@@ -1,10 +1,15 @@
 package com.onyx.foss.kotlin.domain
 
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectMapper
 import org.springframework.data.jpa.repository.JpaRepository
 import org.springframework.data.jpa.repository.Modifying
 import org.springframework.data.jpa.repository.Query
 import org.springframework.data.repository.query.Param
+import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.stereotype.Repository
 import org.springframework.transaction.annotation.Transactional
+import java.sql.Types
 import java.time.Instant
 
 interface CredentialRepository : JpaRepository<CredentialEntity, Long> {
@@ -86,6 +91,25 @@ interface IngestionJobRepository : JpaRepository<IngestionJobEntity, Long> {
 interface IndexedDocumentRepository : JpaRepository<IndexedDocumentEntity, Long> {
     fun findByCcPairIdAndSourceDocumentId(ccPairId: Long, sourceDocumentId: String): IndexedDocumentEntity?
     fun findAllByCcPairId(ccPairId: Long): List<IndexedDocumentEntity>
+    fun findAllByCcPairIdAndSourceDocumentIdIn(
+        ccPairId: Long,
+        sourceDocumentIds: Collection<String>,
+    ): List<IndexedDocumentEntity>
+    @Query(
+        value = """
+            SELECT * FROM indexed_documents
+            WHERE cc_pair_id = :ccPairId
+              AND source_document_id > :afterSourceDocumentId
+            ORDER BY source_document_id
+            LIMIT :limit
+        """,
+        nativeQuery = true,
+    )
+    fun findPageByCcPairId(
+        @Param("ccPairId") ccPairId: Long,
+        @Param("afterSourceDocumentId") afterSourceDocumentId: String,
+        @Param("limit") limit: Int,
+    ): List<IndexedDocumentEntity>
     @Query("SELECT document.sourceDocumentId FROM IndexedDocumentEntity document WHERE document.ccPairId = :ccPairId")
     fun findSourceIdsByCcPairId(@Param("ccPairId") ccPairId: Long): List<String>
     fun countByCcPairId(ccPairId: Long): Long
@@ -129,6 +153,29 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
     fun findFirstByCcPairIdOrderByIdDesc(ccPairId: Long): PermissionSyncAttemptEntity?
 
     @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(
+        value = """
+            UPDATE permission_sync_attempts
+            SET status = 'FAILED',
+                error_msg = :message,
+                full_exception_trace = :trace,
+                time_finished = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE cc_pair_id = :ccPairId
+              AND status IN ('NOT_STARTED', 'IN_PROGRESS')
+              AND COALESCE(time_started, created_at) < :cutoff
+        """,
+        nativeQuery = true,
+    )
+    fun failStaleActive(
+        @Param("ccPairId") ccPairId: Long,
+        @Param("cutoff") cutoff: Instant,
+        @Param("message") message: String,
+        @Param("trace") trace: String,
+    ): Int
+
+    @Transactional
     @Modifying
     @Query(
         value = """
@@ -139,4 +186,93 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
         nativeQuery = true,
     )
     fun createIfNoActive(@Param("ccPairId") ccPairId: Long): Int
+}
+
+data class PermissionSyncStageRow(
+    val sourceDocumentId: String,
+    val externalAccess: JsonNode,
+    val hasError: Boolean,
+)
+
+@Repository
+class PermissionSyncStageRepository(
+    private val jdbc: JdbcTemplate,
+    private val mapper: ObjectMapper,
+) {
+    @Transactional
+    fun upsert(attemptId: Long, rows: Collection<PermissionSyncStageRow>) {
+        if (rows.isEmpty()) return
+        jdbc.batchUpdate(
+            """
+                INSERT INTO permission_sync_staging
+                    (attempt_id, source_document_id, external_access, has_error)
+                VALUES (?, ?, ?::jsonb, ?)
+                ON CONFLICT (attempt_id, source_document_id) DO UPDATE
+                SET external_access = CASE
+                        WHEN permission_sync_staging.has_error THEN permission_sync_staging.external_access
+                        ELSE EXCLUDED.external_access
+                    END,
+                    has_error = permission_sync_staging.has_error OR EXCLUDED.has_error
+            """.trimIndent(),
+            rows,
+            rows.size,
+        ) { statement, row ->
+            statement.setLong(1, attemptId)
+            statement.setString(2, row.sourceDocumentId)
+            statement.setObject(3, mapper.writeValueAsString(row.externalAccess), Types.OTHER)
+            statement.setBoolean(4, row.hasError)
+        }
+    }
+
+    fun findPage(attemptId: Long, afterSourceDocumentId: String, limit: Int): List<PermissionSyncStageRow> =
+        jdbc.query(
+            """
+                SELECT source_document_id, external_access, has_error
+                FROM permission_sync_staging
+                WHERE attempt_id = ? AND source_document_id > ?
+                ORDER BY source_document_id
+                LIMIT ?
+            """.trimIndent(),
+            { result, _ ->
+                PermissionSyncStageRow(
+                    sourceDocumentId = result.getString("source_document_id"),
+                    externalAccess = mapper.readTree(result.getString("external_access")),
+                    hasError = result.getBoolean("has_error"),
+                )
+            },
+            attemptId,
+            afterSourceDocumentId,
+            limit,
+        )
+
+    fun countForAttempt(attemptId: Long): Long = jdbc.queryForObject(
+        "SELECT COUNT(*) FROM permission_sync_staging WHERE attempt_id = ?",
+        Long::class.java,
+        attemptId,
+    ) ?: 0
+
+    fun countErrorsForAttempt(attemptId: Long): Long = jdbc.queryForObject(
+        "SELECT COUNT(*) FROM permission_sync_staging WHERE attempt_id = ? AND has_error = TRUE",
+        Long::class.java,
+        attemptId,
+    ) ?: 0
+
+    @Transactional
+    fun deleteAllForAttempt(attemptId: Long) {
+        jdbc.update("DELETE FROM permission_sync_staging WHERE attempt_id = ?", attemptId)
+    }
+
+    @Transactional
+    fun deleteTerminalForPair(pairId: Long) {
+        jdbc.update(
+            """
+                DELETE FROM permission_sync_staging staging
+                USING permission_sync_attempts attempt
+                WHERE staging.attempt_id = attempt.id
+                  AND attempt.cc_pair_id = ?
+                  AND attempt.status IN ('SUCCESS', 'FAILED', 'COMPLETED_WITH_ERRORS')
+            """.trimIndent(),
+            pairId,
+        )
+    }
 }
