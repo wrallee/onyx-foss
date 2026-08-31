@@ -15,8 +15,18 @@ class RemoteConnectorLoaders(
     private val http: RemoteJsonClient,
     private val jira: JiraConnectorLoader,
 ) {
-    fun load(source: ConnectorSource, config: JsonNode?, credentials: JsonNode, checkpoint: JsonNode?): Sequence<ConnectorBatch> {
-        if (source == ConnectorSource.JIRA) return jira.load(config, credentials, checkpoint)
+    fun load(
+        source: ConnectorSource,
+        config: JsonNode?,
+        credentials: JsonNode,
+        checkpoint: JsonNode?,
+        start: Instant? = null,
+        end: Instant? = null,
+    ): Sequence<ConnectorBatch> {
+        if (source == ConnectorSource.JIRA) {
+            jira.validate(config, credentials)
+            return jira.load(config, credentials, checkpoint, start = start, end = end)
+        }
         val documents = when (source) {
             ConnectorSource.CONFLUENCE -> confluence(config, credentials, checkpoint)
             ConnectorSource.GITHUB -> github(config, credentials, checkpoint)

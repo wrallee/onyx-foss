@@ -1,17 +1,21 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.onyx.foss.kotlin.domain.ConnectorSource
+import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import org.junit.jupiter.api.Test
 import org.springframework.web.reactive.function.client.ClientRequest
 import org.springframework.web.reactive.function.client.ExchangeFilterFunction
 import org.springframework.web.reactive.function.client.WebClient
+import org.springframework.web.reactive.function.client.WebClientResponseException
 import java.net.URI
+import java.time.Instant
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
@@ -36,9 +40,18 @@ class JiraConnectorLoaderTest {
     fun projectJqlUsesQuotedProject() = MockWebServer().use { server ->
         server.json("""{"total":0,"issues":[]}""")
 
-        loader().load(config(server, "\"project_key\":\"ORDER\""), tokenCredentials(), null).single()
+        loader().load(
+            config(server, "\"project_key\":\"ORDER\""),
+            tokenCredentials(),
+            null,
+            start = Instant.ofEpochSecond(1),
+            end = Instant.ofEpochSecond(2),
+        ).single()
 
-        assertEquals("project = \"ORDER\"", server.takeRequest().requestUrl!!.queryParameter("jql"))
+        assertEquals(
+            "project = \"ORDER\" AND updated >= 1000 AND updated <= 2000",
+            server.takeRequest().requestUrl!!.queryParameter("jql"),
+        )
     }
 
     @Test
@@ -49,9 +62,32 @@ class JiraConnectorLoaderTest {
             config(server, "\"project_key\":\"ENG\",\"jql_query\":\"labels = customer\""),
             tokenCredentials(),
             null,
+            start = Instant.ofEpochSecond(1),
+            end = Instant.ofEpochSecond(2),
         ).single()
 
-        assertEquals("labels = customer", server.takeRequest().requestUrl!!.queryParameter("jql"))
+        assertEquals(
+            "(labels = customer) AND updated >= 1000 AND updated <= 2000",
+            server.takeRequest().requestUrl!!.queryParameter("jql"),
+        )
+    }
+
+    @Test
+    fun jqlWithoutProjectUsesOnlyPollWindow() = MockWebServer().use { server ->
+        server.json("""{"total":0,"issues":[]}""")
+
+        loader().load(
+            config(server, "\"batch_size\":50"),
+            tokenCredentials(),
+            null,
+            start = Instant.ofEpochSecond(3),
+            end = Instant.ofEpochSecond(4),
+        ).single()
+
+        assertEquals(
+            "updated >= 3000 AND updated <= 4000",
+            server.takeRequest().requestUrl!!.queryParameter("jql"),
+        )
     }
 
     @Test
@@ -96,6 +132,24 @@ class JiraConnectorLoaderTest {
     }
 
     @Test
+    fun completedCloudCheckpointStartsANewPollWindow() = MockWebServer().use { server ->
+        server.json("""{"issues":[{"id":"10004"}]}""")
+        server.json(bulkPage(issue("ENG-4", id = "10004")))
+        val completed = JiraCheckpoint(hasMore = false, idsDone = true, seenHierarchyNodeIds = setOf("ENG"))
+
+        val batches = loader().load(
+            config(server, "\"project_key\":\"ENG\""),
+            cloudCredentials(),
+            mapper.valueToTree(completed),
+            start = Instant.ofEpochSecond(5),
+            end = Instant.ofEpochSecond(6),
+        ).toList()
+
+        assertEquals(listOf("ENG-4"), batches.flatMap { it.documents }.map { it.metadata["key"] })
+        assertTrue(server.takeRequest().requestUrl!!.queryParameter("jql")!!.contains("updated >= 5000"))
+    }
+
+    @Test
     fun scopedTokenUsesTenantCloudIdAndKeepsIssueLinksOnTheTenant() = MockWebServer().use { server ->
         server.json("""{"cloudId":"cloud-123"}""")
         server.json("""{"issues":[{"id":"10001"}]}""")
@@ -120,10 +174,11 @@ class JiraConnectorLoaderTest {
         val good = issue(
             "ENG-1",
             description = "Issue body",
+            labels = listOf("public"),
             extraFields = ""","comment":{"comments":[
                 {"body":"Visible","author":{"emailAddress":"person@example.com"}},
                 {"body":"Hidden","author":{"emailAddress":"bot@example.com"}}
-            ]}""",
+            ]},"parent":{"key":"ENG-EPIC","fields":{"issuetype":{"name":"Epic"}}}""",
         )
         val skipped = issue("ENG-2", labels = listOf("secret"))
         server.json(serverPage(total = 2, good, skipped))
@@ -137,10 +192,38 @@ class JiraConnectorLoaderTest {
             null,
         ).single()
 
-        assertEquals(listOf("ENG-1"), batch.documents.map { it.metadata["key"] })
-        assertTrue(batch.documents.single().content.contains("Issue body"))
-        assertTrue(batch.documents.single().content.contains("Comment: Visible"))
-        assertFalse(batch.documents.single().content.contains("Hidden"))
+        val document = batch.documents.single()
+        assertEquals("ENG-1 Summary ENG-1", document.title)
+        assertEquals(Instant.parse("2026-01-01T00:00:00Z"), document.updatedAt)
+        assertEquals(ConnectorSource.JIRA, document.source)
+        assertEquals(listOf("Reporter", "Assignee"), document.primaryOwners)
+        assertTrue(document.content.contains("Issue body"))
+        assertTrue(document.content.contains("Comment: Visible"))
+        assertFalse(document.content.contains("Hidden"))
+        assertEquals(
+            mapOf(
+                "source" to "jira",
+                "key" to "ENG-1",
+                "updated" to "2026-01-01T00:00:00.000+0000",
+                "labels" to listOf("public"),
+                "created" to "2026-01-01T00:00:00.000+0000",
+                "priority" to "High",
+                "status" to "In Progress",
+                "resolution" to "Fixed",
+                "issuetype" to "Story",
+                "project" to "ENG",
+                "project_name" to "Engineering",
+                "parent" to "ENG-EPIC",
+                "parent_hierarchy_raw_node_id" to "ENG-EPIC",
+                "reporter" to "Reporter",
+                "reporter_email" to "reporter@example.com",
+                "assignee" to "Assignee",
+                "assignee_email" to "assignee@example.com",
+            ),
+            document.metadata,
+        )
+        val checkpoint = mapper.treeToValue(batch.checkpoint.value, JiraCheckpoint::class.java)
+        assertEquals(setOf("ENG", "ENG-EPIC"), checkpoint.seenHierarchyNodeIds)
     }
 
     @Test
@@ -158,6 +241,59 @@ class JiraConnectorLoaderTest {
         val payloads = (1..3).map { mapper.readTree(server.takeRequest().body.readUtf8()) }
         assertEquals(listOf(4, 2, 2), payloads.map { it.path("issueIdsOrKeys").size() })
         assertTrue(payloads.all { payload -> payload.path("fields").any { it.asText() == "summary" } })
+    }
+
+    @Test
+    fun cloudBulkFetchRecursiveSplitRaisesForTheBadIssue() = MockWebServer().use { server ->
+        server.dispatcher = badBulkIssueDispatcher(setOf("1", "BAD", "2"))
+
+        assertFailsWith<RuntimeException> {
+            loader().load(config(server, "\"project_key\":\"ENG\""), cloudCredentials(), null).toList()
+        }
+    }
+
+    @Test
+    fun cloudBulkFetchNeverExceedsTheApiLimit() = MockWebServer().use { server ->
+        val ids = (1..101).map(Int::toString)
+        val requestSizes = mutableListOf<Int>()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.requestUrl!!.encodedPath.endsWith("/search/jql")) {
+                    return jsonResponse(mapper.writeValueAsString(mapOf("issues" to ids.map { mapOf("id" to it) })))
+                }
+                val requested = mapper.readTree(request.body.readUtf8()).path("issueIdsOrKeys").map(JsonNode::asText)
+                requestSizes += requested.size
+                return jsonResponse(bulkPage(*requested.map { issue("ENG-$it", id = it) }.toTypedArray()))
+            }
+        }
+
+        val documents = loader().load(
+            config(server, "\"project_key\":\"ENG\",\"batch_size\":1000"),
+            cloudCredentials(),
+            null,
+        ).flatMap { it.documents.asSequence() }.toList()
+
+        assertEquals(101, documents.size)
+        assertEquals(listOf(100, 1), requestSizes)
+    }
+
+    @Test
+    fun cloudBulkFetchRaisesForOneUnfetchableIssue() = MockWebServer().use { server ->
+        server.dispatcher = badBulkIssueDispatcher(setOf("BAD"))
+
+        assertFailsWith<RuntimeException> {
+            loader().load(config(server, "\"project_key\":\"ENG\""), cloudCredentials(), null).toList()
+        }
+    }
+
+    @Test
+    fun cloudBulkFetchPropagatesNonJsonHttpErrors() = MockWebServer().use { server ->
+        server.json("""{"issues":[{"id":"1"}]}""")
+        server.enqueue(MockResponse().setResponseCode(500).setBody("upstream failed"))
+
+        assertFailsWith<WebClientResponseException.InternalServerError> {
+            loader().load(config(server, "\"project_key\":\"ENG\""), cloudCredentials(), null).toList()
+        }
     }
 
     @Test
@@ -244,6 +380,106 @@ class JiraConnectorLoaderTest {
     }
 
     @Test
+    fun validationSucceedsWithProject() = MockWebServer().use { server ->
+        server.json("""{"key":"ENG"}""")
+
+        loader().validate(config(server, "\"project_key\":\"ENG\""), tokenCredentials())
+
+        assertEquals("/rest/api/2/project/ENG", server.takeRequest().requestUrl!!.encodedPath)
+    }
+
+    @Test
+    fun validationSucceedsWithoutProject() = MockWebServer().use { server ->
+        server.json("[]")
+
+        loader().validate(config(server, "\"batch_size\":50"), tokenCredentials())
+
+        val request = server.takeRequest()
+        assertEquals("/rest/api/2/project", request.requestUrl!!.encodedPath)
+        assertEquals("1", request.requestUrl!!.queryParameter("maxResults"))
+    }
+
+    @Test
+    fun scopedValidationUsesCloudIdAndAtlassianApiBase() = MockWebServer().use { server ->
+        server.json("""{"cloudId":"cloud-123"}""")
+        server.json("""{"key":"ENG"}""")
+        val client = RemoteJsonClient(WebClient.builder().filter(rewriteAtlassianRequestsTo(server)))
+
+        JiraConnectorLoader(client, mapper).validate(
+            config(server, "\"project_key\":\"ENG\",\"scoped_token\":true"),
+            cloudCredentials(),
+        )
+
+        assertEquals("/_edge/tenant_info", server.takeRequest().requestUrl!!.encodedPath)
+        assertEquals("/ex/jira/cloud-123/rest/api/3/project/ENG", server.takeRequest().requestUrl!!.encodedPath)
+    }
+
+    @Test
+    fun customCloudJqlValidationUsesEnhancedSearch() = MockWebServer().use { server ->
+        server.json("""{"issues":[]}""")
+
+        loader().validate(
+            config(server, "\"jql_query\":\"labels = customer\""),
+            cloudCredentials(),
+        )
+
+        val request = server.takeRequest()
+        assertEquals("/rest/api/3/search/jql", request.requestUrl!!.encodedPath)
+        assertEquals("labels = customer", request.requestUrl!!.queryParameter("jql"))
+    }
+
+    @Test
+    fun indexingMaps403ToPermissionError() = assertIndexingError(
+        credentials = tokenCredentials(),
+        status = 403,
+        body = "{}",
+        expected = "Insufficient permissions",
+    )
+
+    @Test
+    fun cloudIndexingMapsMissingProjectToValidationError() = assertIndexingError(
+        credentials = cloudCredentials(),
+        status = 400,
+        body = missingProjectError(),
+        expected = "does not exist",
+    )
+
+    @Test
+    fun serverIndexingMapsMissingProjectToValidationError() = assertIndexingError(
+        credentials = tokenCredentials(),
+        status = 400,
+        body = missingProjectError(),
+        expected = "does not exist",
+    )
+
+    @Test
+    fun indexingMapsInvalidJqlToValidationError() = assertIndexingError(
+        credentials = tokenCredentials(),
+        status = 400,
+        body = """{"errorMessages":["Error in the JQL Query"]}""",
+        expected = "Invalid JQL",
+    )
+
+    @Test
+    fun slimRetrievalSkipsPermissionResolution() = MockWebServer().use { server ->
+        server.json(serverPage(total = 1, issue("ENG-1", description = "large", labels = listOf("secret"))))
+
+        val document = loader().retrieveAllSlimDocuments(
+            config(
+                server,
+                "\"project_key\":\"ENG\",\"include_permissions\":true," +
+                    "\"labels_to_skip\":[\"secret\"],\"max_ticket_size_bytes\":1",
+            ),
+            tokenCredentials(),
+        ).single().documents.single()
+
+        assertEquals(server.url("/").toString().trimEnd('/') + "/browse/ENG-1", document.id)
+        assertEquals("", document.content)
+        assertEquals(null, document.externalAccess)
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test
     fun validationMaps401ToStableCredentialError() = assertValidationError(401, "expired or invalid")
 
     @Test
@@ -273,6 +509,18 @@ class JiraConnectorLoaderTest {
 
         assertTrue(error.message.orEmpty().contains("expired or invalid"))
     }
+
+    private fun assertIndexingError(credentials: JsonNode, status: Int, body: String, expected: String) =
+        MockWebServer().use { server ->
+            server.start()
+            server.enqueue(MockResponse().setResponseCode(status).setHeader("Content-Type", "application/json").setBody(body))
+
+            val error = assertFailsWith<IllegalArgumentException> {
+                loader().load(config(server, "\"project_key\":\"MISSING\""), credentials, null).toList()
+            }
+
+            assertTrue(error.message.orEmpty().contains(expected))
+        }
 
     private fun assertValidationError(status: Int, expected: String) = MockWebServer().use { server ->
         server.start()
@@ -314,7 +562,12 @@ class JiraConnectorLoaderTest {
             "created":"2026-01-01T00:00:00.000+0000",
             "labels":${mapper.writeValueAsString(labels)},
             "project":{"key":"ENG","name":"Engineering"},
-            "issuetype":{"name":"Story"}
+            "issuetype":{"name":"Story"},
+            "priority":{"name":"High"},
+            "status":{"name":"In Progress"},
+            "resolution":{"name":"Fixed"},
+            "reporter":{"displayName":"Reporter","emailAddress":"reporter@example.com"},
+            "assignee":{"displayName":"Assignee","emailAddress":"assignee@example.com"}
             $extraFields
         }
     }"""
@@ -324,6 +577,23 @@ class JiraConnectorLoaderTest {
 
     private fun bulkPage(vararg issues: String): String =
         """{"issues":[${issues.joinToString(",")}]}"""
+
+    private fun missingProjectError(): String =
+        """{"errorMessages":["The value 'MISSING' does not exist for the field 'project'."]}"""
+
+    private fun badBulkIssueDispatcher(ids: Set<String>): Dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse {
+            if (request.requestUrl!!.encodedPath.endsWith("/search/jql")) {
+                return jsonResponse(mapper.writeValueAsString(mapOf("issues" to ids.map { mapOf("id" to it) })))
+            }
+            val requested = mapper.readTree(request.body.readUtf8()).path("issueIdsOrKeys").map(JsonNode::asText)
+            if ("BAD" in requested) return jsonResponse("{")
+            return jsonResponse(bulkPage(*requested.map { issue("ENG-$it", id = it) }.toTypedArray()))
+        }
+    }
+
+    private fun jsonResponse(body: String): MockResponse =
+        MockResponse().setHeader("Content-Type", "application/json").setBody(body)
 
     private fun MockWebServer.json(body: String) {
         startAndBase()

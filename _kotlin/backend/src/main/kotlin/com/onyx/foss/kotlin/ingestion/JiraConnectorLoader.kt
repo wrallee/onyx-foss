@@ -3,6 +3,7 @@ package com.onyx.foss.kotlin.ingestion
 import com.fasterxml.jackson.core.JsonProcessingException
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import org.springframework.core.codec.DecodingException
 import org.springframework.http.HttpHeaders
@@ -34,6 +35,7 @@ class JiraConnectorLoader(
         const val DEFAULT_MAX_TICKET_BYTES = 100 * 1024
         const val ISSUE_FIELDS =
             "summary,description,comment,updated,created,labels,reporter,assignee,priority,status,resolution,resolutiondate,duedate,issuetype,parent,project"
+        const val SLIM_ISSUE_FIELDS = "key,created,issuetype,parent,project"
     }
 
     fun load(
@@ -41,51 +43,83 @@ class JiraConnectorLoader(
         credentials: JsonNode,
         checkpointNode: JsonNode?,
         permissionSync: Boolean = false,
+        start: Instant? = null,
+        end: Instant? = null,
+    ): Sequence<ConnectorBatch> = loadInternal(
+        config,
+        credentials,
+        checkpointNode,
+        permissionSync,
+        start,
+        end,
+        slim = false,
+    )
+
+    private fun loadInternal(
+        config: JsonNode?,
+        credentials: JsonNode,
+        checkpointNode: JsonNode?,
+        permissionSync: Boolean,
+        start: Instant?,
+        end: Instant?,
+        slim: Boolean,
     ): Sequence<ConnectorBatch> {
-        val jiraBase = required(config, "jira_base_url", "base_url").trimEnd('/')
-        val headers = auth(credentials)
-        val cloud = credentials.firstText("jira_user_email", "jira_email", "email") != null ||
-            config?.path("scoped_token")?.asBoolean(false) == true || config?.path("is_cloud")?.asBoolean(false) == true
-        val apiBase = if (config?.path("scoped_token")?.asBoolean(false) == true) {
-            val cloudId = http.get(jiraBase, "/_edge/tenant_info", headers).path("cloudId").asText()
-            require(cloudId.isNotBlank()) { "Jira scoped token discovery did not return a cloudId" }
-            "https://api.atlassian.com/ex/jira/" + segment(cloudId)
-        } else {
-            jiraBase
+        val connection = connection(config, credentials)
+        val savedCheckpoint = checkpointNode?.let { mapper.treeToValue(it, JiraCheckpoint::class.java) } ?: JiraCheckpoint()
+        val checkpoint = if (savedCheckpoint.hasMore) savedCheckpoint else {
+            JiraCheckpoint(seenHierarchyNodeIds = savedCheckpoint.seenHierarchyNodeIds)
         }
-        val checkpoint = checkpointNode?.let { mapper.treeToValue(it, JiraCheckpoint::class.java) } ?: JiraCheckpoint()
         val context = Context(
             config = config,
-            jiraBase = jiraBase,
-            apiBase = apiBase,
-            apiVersion = if (cloud) 3 else 2,
-            headers = headers,
-            jql = jql(config),
+            jiraBase = connection.jiraBase,
+            apiBase = connection.apiBase,
+            apiVersion = connection.apiVersion,
+            headers = connection.headers,
+            jql = jql(config, start, end),
             pageSize = config?.path("batch_size")?.asInt(DEFAULT_PAGE_SIZE)?.coerceIn(1, 100) ?: DEFAULT_PAGE_SIZE,
             permissionSync = permissionSync,
+            slim = slim,
         )
-        return if (cloud) loadCloud(context, checkpoint) else loadServer(context, checkpoint)
+        return if (connection.apiVersion == 3) loadCloud(context, checkpoint) else loadServer(context, checkpoint)
     }
 
     fun validate(config: JsonNode?, credentials: JsonNode) {
-        val jiraBase = required(config, "jira_base_url", "base_url").trimEnd('/')
-        val headers = auth(credentials)
-        val cloud = credentials.firstText("jira_user_email", "jira_email", "email") != null ||
-            config?.path("is_cloud")?.asBoolean(false) == true
-        val version = if (cloud) 3 else 2
+        val connection = connection(config, credentials)
         val project = config?.text("project_key")
         val customJql = config?.text("jql_query")
         val path = when {
-            customJql != null -> "/rest/api/$version/search" +
+            customJql != null && connection.apiVersion == 3 ->
+                "/rest/api/3/search/jql?jql=${query(customJql)}&maxResults=1&fields=id"
+            customJql != null -> "/rest/api/2/search" +
                 "?jql=${query(customJql)}&startAt=0&maxResults=1&fields=key"
-            project != null -> "/rest/api/$version/project/${segment(project)}"
-            else -> "/rest/api/$version/project?maxResults=1"
+            project != null -> "/rest/api/${connection.apiVersion}/project/${segment(project)}"
+            else -> "/rest/api/${connection.apiVersion}/project?maxResults=1"
         }
         try {
-            http.get(jiraBase, path, headers)
+            http.get(connection.apiBase, path, connection.headers)
         } catch (error: WebClientResponseException) {
             throw validationError(error)
         }
+    }
+
+    fun retrieveAllSlimDocuments(
+        config: JsonNode?,
+        credentials: JsonNode,
+        start: Instant? = null,
+        end: Instant? = null,
+        includePermissions: Boolean = false,
+    ): Sequence<ConnectorBatch> {
+        val effectiveConfig = (config?.deepCopy<ObjectNode>() ?: mapper.createObjectNode())
+            .put("include_permissions", includePermissions)
+        return loadInternal(
+            effectiveConfig,
+            credentials,
+            checkpointNode = null,
+            permissionSync = includePermissions,
+            start = start,
+            end = end,
+            slim = true,
+        )
     }
 
     private fun loadServer(context: Context, initial: JiraCheckpoint): Sequence<ConnectorBatch> = sequence {
@@ -95,7 +129,7 @@ class JiraConnectorLoader(
             val response = getSearch(
                 context,
                 "/rest/api/2/search?jql=${query(context.jql)}&startAt=$offset" +
-                    "&maxResults=${context.pageSize}&fields=${query(ISSUE_FIELDS)}",
+                    "&maxResults=${context.pageSize}&fields=${query(context.issueFields)}",
             )
             val issues = response.path("issues").toList()
             val result = processIssues(context, issues, seenHierarchyNodeIds)
@@ -163,7 +197,7 @@ class JiraConnectorLoader(
             context.apiBase,
             "/rest/api/3/issue/bulkfetch",
             context.headers,
-            mapOf("issueIdsOrKeys" to issueIds, "fields" to ISSUE_FIELDS.split(',')),
+            mapOf("issueIdsOrKeys" to issueIds, "fields" to context.issueFields.split(',')),
         ).path("issues").toList()
     } catch (error: WebClientResponseException) {
         throw searchError(error, context.jql)
@@ -178,6 +212,7 @@ class JiraConnectorLoader(
         issues: List<JsonNode>,
         seenHierarchyNodeIds: MutableSet<String>,
     ): ProcessResult {
+        if (context.slim) return processSlimIssues(context, issues, seenHierarchyNodeIds)
         val documents = mutableListOf<SourceDocument>()
         val failures = mutableListOf<ConnectorFailure>()
         val permissionCache = mutableMapOf<String, ExternalAccess>()
@@ -192,6 +227,57 @@ class JiraConnectorLoader(
                     null
                 }
                 documents += document.copy(externalAccess = access)
+            } catch (error: Exception) {
+                failures += ConnectorFailure(
+                    target = FailureTarget.Document(key, context.jiraBase + "/browse/" + segment(key)),
+                    message = "Failed to process Jira issue: ${error.message ?: error::class.simpleName}",
+                    errorType = "jira_issue_processing",
+                )
+            }
+        }
+        return ProcessResult(documents, failures)
+    }
+
+    private fun processSlimIssues(
+        context: Context,
+        issues: List<JsonNode>,
+        seenHierarchyNodeIds: MutableSet<String>,
+    ): ProcessResult {
+        val documents = mutableListOf<SourceDocument>()
+        val failures = mutableListOf<ConnectorFailure>()
+        val permissionCache = mutableMapOf<String, ExternalAccess>()
+        issues.forEach { issue ->
+            val key = issue.path("key").asText().ifBlank { issue.path("id").asText().ifBlank { "unknown" } }
+            try {
+                require(key != "unknown") { "Jira issue key is missing" }
+                val fields = issue.path("fields")
+                require(fields.isObject) { "Jira issue $key has no fields" }
+                val projectKey = fields.path("project").path("key").asText()
+                val parent = fields.path("parent")
+                val parentKey = parent.path("key").asText().takeIf(String::isNotBlank)
+                val parentIsEpic = parent.path("fields").path("issuetype").path("name").asText().equals("epic", true)
+                if (projectKey.isNotBlank()) seenHierarchyNodeIds += projectKey
+                if (parentIsEpic && parentKey != null) seenHierarchyNodeIds += parentKey
+                if (fields.path("issuetype").path("name").asText().equals("epic", true)) seenHierarchyNodeIds += key
+                val link = context.jiraBase + "/browse/" + segment(key)
+                val access = if (context.config?.path("include_permissions")?.asBoolean(false) == true && projectKey.isNotBlank()) {
+                    permissionCache.getOrPut(projectKey) { projectAccess(context, projectKey) }
+                } else {
+                    null
+                }
+                documents += SourceDocument(
+                    id = link,
+                    title = link,
+                    content = "",
+                    link = link,
+                    metadata = mapOf(
+                        "source" to "jira",
+                        "project" to projectKey,
+                        "parent_hierarchy_raw_node_id" to if (parentIsEpic) parentKey else projectKey,
+                    ),
+                    externalAccess = access,
+                    source = ConnectorSource.JIRA,
+                )
             } catch (error: Exception) {
                 failures += ConnectorFailure(
                     target = FailureTarget.Document(key, context.jiraBase + "/browse/" + segment(key)),
@@ -329,7 +415,7 @@ class JiraConnectorLoader(
         throw searchError(error, context.jql)
     }
 
-    private fun searchError(error: WebClientResponseException, jql: String): IllegalArgumentException {
+    private fun searchError(error: WebClientResponseException, jql: String): RuntimeException {
         val detail = error.responseBodyAsString
         return when (error.statusCode.value()) {
             400 -> if (detail.contains("does not exist for the field 'project'")) {
@@ -340,7 +426,7 @@ class JiraConnectorLoader(
             401 -> IllegalArgumentException("Jira credentials are expired or invalid (HTTP 401).")
             403 -> IllegalArgumentException("Insufficient permissions to execute JQL query. JQL: $jql")
             429 -> IllegalArgumentException("Jira rate-limits were exceeded. Please try again later.")
-            else -> IllegalArgumentException("Unexpected Jira error during indexing (HTTP ${error.statusCode.value()}): $detail")
+            else -> error
         }
     }
 
@@ -352,9 +438,37 @@ class JiraConnectorLoader(
         else -> IllegalArgumentException("Validation failed due to Jira error: ${error.responseBodyAsString}")
     }
 
-    private fun jql(config: JsonNode?): String = config?.text("jql_query")
-        ?: config?.text("project_key")?.let { "project = \"$it\"" }
-        ?: "order by updated asc"
+    private fun jql(config: JsonNode?, start: Instant?, end: Instant?): String {
+        val timeJql = listOfNotNull(
+            start?.let { "updated >= ${it.toEpochMilli()}" },
+            end?.let { "updated <= ${it.toEpochMilli()}" },
+        ).joinToString(" AND ")
+        val customJql = config?.text("jql_query")
+        val projectJql = config?.text("project_key")?.let { "project = \"$it\"" }
+        return when {
+            customJql != null && timeJql.isNotEmpty() -> "($customJql) AND $timeJql"
+            customJql != null -> customJql
+            projectJql != null && timeJql.isNotEmpty() -> "$projectJql AND $timeJql"
+            projectJql != null -> projectJql
+            timeJql.isNotEmpty() -> timeJql
+            else -> "order by updated asc"
+        }
+    }
+
+    private fun connection(config: JsonNode?, credentials: JsonNode): JiraConnection {
+        val jiraBase = required(config, "jira_base_url", "base_url").trimEnd('/')
+        val headers = auth(credentials)
+        val cloud = credentials.firstText("jira_user_email", "jira_email", "email") != null ||
+            config?.path("scoped_token")?.asBoolean(false) == true || config?.path("is_cloud")?.asBoolean(false) == true
+        val apiBase = if (config?.path("scoped_token")?.asBoolean(false) == true) {
+            val cloudId = http.get(jiraBase, "/_edge/tenant_info", headers).path("cloudId").asText()
+            require(cloudId.isNotBlank()) { "Jira scoped token discovery did not return a cloudId" }
+            "https://api.atlassian.com/ex/jira/" + segment(cloudId)
+        } else {
+            jiraBase
+        }
+        return JiraConnection(jiraBase, apiBase, if (cloud) 3 else 2, headers)
+    }
 
     private fun auth(credentials: JsonNode): Map<String, String> {
         val token = credentials.firstText("jira_api_token", "api_token", "access_token", "token")
@@ -371,6 +485,8 @@ class JiraConnectorLoader(
     private val Context.labelsToSkip: Set<String> get() = config.stringSet("labels_to_skip")
 
     private val Context.commentEmailBlacklist: Set<String> get() = config.stringSet("comment_email_blacklist")
+
+    private val Context.issueFields: String get() = if (slim) SLIM_ISSUE_FIELDS else ISSUE_FIELDS
 
     private fun JsonNode?.stringSet(name: String): Set<String> {
         val value = this?.path(name) ?: return emptySet()
@@ -426,6 +542,14 @@ class JiraConnectorLoader(
         val jql: String,
         val pageSize: Int,
         val permissionSync: Boolean,
+        val slim: Boolean,
+    )
+
+    private data class JiraConnection(
+        val jiraBase: String,
+        val apiBase: String,
+        val apiVersion: Int,
+        val headers: Map<String, String>,
     )
 
     private data class ProcessResult(

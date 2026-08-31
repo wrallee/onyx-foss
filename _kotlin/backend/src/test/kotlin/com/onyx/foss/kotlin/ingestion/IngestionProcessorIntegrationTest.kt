@@ -91,6 +91,35 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun passesAttemptPollWindowToRemoteLoader() {
+        val start = Instant.parse("2026-08-31T00:00:00Z")
+        val end = Instant.parse("2026-09-01T00:00:00Z")
+        val run = createRun(source = ConnectorSource.JIRA, pollRangeStart = start, pollRangeEnd = end)
+        var observedStart: Instant? = null
+        var observedEnd: Instant? = null
+        doAnswer { invocation ->
+            observedStart = invocation.getArgument(4)
+            observedEnd = invocation.getArgument(5)
+            sequenceOf(batch(1, false))
+        }.`when`(remoteLoaders).load(
+            ConnectorSource.JIRA,
+            mapper.createObjectNode(),
+            mapper.createObjectNode(),
+            null,
+            start,
+            end,
+        )
+
+        processor.process(run.jobId)
+
+        assertThat(observedStart).isEqualTo(start)
+        assertThat(observedEnd).isEqualTo(end)
+        val savedAttempt = attempts.findById(run.attemptId).orElseThrow()
+        assertThat(savedAttempt.pollRangeStart).isEqualTo(start)
+        assertThat(savedAttempt.pollRangeEnd).isEqualTo(end)
+    }
+
+    @Test
     fun doesNotSaveFailedBatchCheckpoint() {
         val run = createRun()
         load(
@@ -380,10 +409,18 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         refreshFreq: Long? = null,
         fromBeginning: Boolean = false,
         inRepeatedErrorState: Boolean = false,
+        source: ConnectorSource = ConnectorSource.FILE,
+        pollRangeStart: Instant? = null,
+        pollRangeEnd: Instant? = null,
     ): Run {
-        val pairId = createPair(refreshFreq = refreshFreq, inRepeatedErrorState = inRepeatedErrorState)
+        val pairId = createPair(refreshFreq = refreshFreq, inRepeatedErrorState = inRepeatedErrorState, source = source)
         val attempt = attempts.save(
-            IngestionAttemptEntity(ccPairId = pairId, fromBeginning = fromBeginning),
+            IngestionAttemptEntity(
+                ccPairId = pairId,
+                fromBeginning = fromBeginning,
+                pollRangeStart = pollRangeStart,
+                pollRangeEnd = pollRangeEnd,
+            ),
         )
         val job = jobs.save(IngestionJobEntity(attemptId = requireNotNull(attempt.id)))
         return Run(pairId, requireNotNull(attempt.id), requireNotNull(job.id))
@@ -395,11 +432,12 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         status: PairStatus = PairStatus.SCHEDULED,
         lastPrunedAt: Instant? = null,
         inRepeatedErrorState: Boolean = false,
+        source: ConnectorSource = ConnectorSource.FILE,
     ): Long {
         val connector = connectors.save(
             ConnectorEntity(
-                name = "file",
-                source = ConnectorSource.FILE,
+                name = source.value,
+                source = source,
                 connectorSpecificConfig = mapper.createObjectNode(),
                 refreshFreq = refreshFreq,
                 pruneFreq = pruneFreq,
@@ -407,7 +445,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         )
         val credential = credentials.save(
             CredentialEntity(
-                source = ConnectorSource.FILE,
+                source = source,
                 secretJson = cipher.encrypt(mapper.createObjectNode()),
             ),
         )
@@ -415,7 +453,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
             ConnectorCredentialPairEntity(
                 connectorId = requireNotNull(connector.id),
                 credentialId = requireNotNull(credential.id),
-                name = "file pair",
+                name = "${source.value} pair",
                 status = status,
                 inRepeatedErrorState = inRepeatedErrorState,
                 lastPrunedAt = lastPrunedAt,

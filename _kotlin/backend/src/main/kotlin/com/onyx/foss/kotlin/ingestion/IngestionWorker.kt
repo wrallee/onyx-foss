@@ -91,6 +91,8 @@ class IngestionProcessor(
         try {
             val connector = admin.connector(pair.connectorId)
             refreshFreq = connector.refreshFreq
+            setPollRange(attempt, connector.indexingStart)
+            attempts.save(attempt)
             val checkpoint = if (attempt.fromBeginning) {
                 null
             } else {
@@ -103,6 +105,8 @@ class IngestionProcessor(
                     connector.connectorSpecificConfig,
                     admin.credentialSecret(pair.credentialId),
                     checkpoint,
+                    attempt.pollRangeStart,
+                    attempt.pollRangeEnd,
                 )
             }
             var newDocuments = 0
@@ -190,7 +194,6 @@ class IngestionProcessor(
             attempt.status = if (hasFailures) AttemptStatus.COMPLETED_WITH_ERRORS else AttemptStatus.SUCCESS
             attempt.newDocsIndexed = newDocuments
             attempt.totalDocsIndexed = totalDocuments
-            attempt.pollRangeEnd = Instant.now()
             attempts.save(attempt)
             pair.inRepeatedErrorState = false
             pair.status = PairStatus.ACTIVE
@@ -223,6 +226,28 @@ class IngestionProcessor(
     private fun hash(value: String): String =
         MessageDigest.getInstance("SHA-256").digest(value.toByteArray(StandardCharsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
+
+    private fun setPollRange(attempt: IngestionAttemptEntity, indexingStart: Instant?) {
+        if (attempt.pollRangeStart != null && attempt.pollRangeEnd != null) return
+        val priorAttempts = attempts.findAllByCcPairIdOrderByIdDesc(attempt.ccPairId)
+            .filterNot { it.id == attempt.id }
+        val resumable = priorAttempts.firstOrNull()?.takeIf { it.status == AttemptStatus.FAILED }
+        if (resumable?.pollRangeStart != null && resumable.pollRangeEnd != null) {
+            attempt.pollRangeStart = resumable.pollRangeStart
+            attempt.pollRangeEnd = resumable.pollRangeEnd
+            return
+        }
+        val previousEnd = priorAttempts.firstOrNull {
+            it.status in setOf(AttemptStatus.SUCCESS, AttemptStatus.COMPLETED_WITH_ERRORS) && it.pollRangeEnd != null
+        }?.pollRangeEnd
+        val earliest = indexingStart ?: Instant.EPOCH
+        attempt.pollRangeStart = if (attempt.fromBeginning || previousEnd == null) {
+            earliest
+        } else {
+            previousEnd.minusSeconds(30 * 60).coerceAtLeast(Instant.EPOCH)
+        }
+        attempt.pollRangeEnd = Instant.now()
+    }
 }
 
 internal fun isRepeatedError(refreshFreq: Long?, recent: List<IngestionAttemptEntity>): Boolean {

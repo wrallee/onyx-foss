@@ -37,7 +37,6 @@ import org.springframework.http.HttpStatus
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
-import java.time.Instant
 
 @Service
 class AdminService(
@@ -287,7 +286,6 @@ class AdminService(
             IngestionAttemptEntity(
                 ccPairId = pairId,
                 fromBeginning = fromBeginning,
-                pollRangeStart = if (fromBeginning) null else Instant.now(),
             ),
         )
         return id(jobs.save(IngestionJobEntity(attemptId = id(attempt), state = JobState.QUEUED)))
