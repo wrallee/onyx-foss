@@ -1054,7 +1054,13 @@ class ConfluenceConnectorLoader(
                 } else {
                     getAllSpacePermissionsServerJsonRpc(context, key)
                 }
-                parseSpacePermissions(context, rows, if (prefixGroups) CONFLUENCE_GROUP_PREFIX else "")
+                val resolution = parseSpacePermissions(
+                    context,
+                    rows,
+                    if (prefixGroups) CONFLUENCE_GROUP_PREFIX else "",
+                )
+                if (resolution.hasUnresolvedSubjects) unresolvedSpaces?.add(key)
+                resolution.access
             } catch (_: Exception) {
                 unresolvedSpaces?.add(key)
                 PRIVATE_ACCESS
@@ -1062,10 +1068,15 @@ class ConfluenceConnectorLoader(
             key to access
         }
 
-    private fun parseSpacePermissions(context: Context, rows: List<JsonNode>, groupPrefix: String): ExternalAccess {
+    private fun parseSpacePermissions(
+        context: Context,
+        rows: List<JsonNode>,
+        groupPrefix: String,
+    ): SpacePermissionResolution {
         val emails = mutableSetOf<String>()
         val groups = mutableSetOf<String>()
         var isPublic = false
+        var hasUnresolvedSubjects = false
         rows.forEach { row ->
             val operation = row.path("operation")
             val key = operation.path("operationKey").asText().ifBlank { operation.path("operation").asText() }
@@ -1073,22 +1084,35 @@ class ConfluenceConnectorLoader(
             val subject = row.path("subject")
             when (subject.path("type").asText().lowercase()) {
                 "anonymous", "anyone" -> isPublic = true
-                "group" -> subject.path("name").asText().ifBlank { subject.path("id").asText() }
-                    .takeIf(String::isNotBlank)?.let { groups += groupPrefix + it }
+                "group" -> {
+                    val group = subject.path("name").asText().ifBlank { subject.path("id").asText() }
+                        .takeIf(String::isNotBlank)
+                    if (group == null) hasUnresolvedSubjects = true else groups += groupPrefix + group
+                }
                 "user" -> {
-                    subject.path("email").asText().takeIf(String::isNotBlank)?.let(emails::add)
+                    val email = subject.path("email").asText().ifBlank { subject.path("emailAddress").asText() }
+                        .takeIf(String::isNotBlank)
                         ?: subject.path("userKey").asText().takeIf(String::isNotBlank)
-                            ?.let { resolveUserKeyEmail(context, it) }?.let(emails::add)
+                            ?.let { resolveUserKeyEmail(context, it) }
+                    if (email == null) hasUnresolvedSubjects = true else emails += email
                 }
             }
             row.path("subjects").path("group").path("results").forEach { group ->
-                group.path("name").asText().takeIf(String::isNotBlank)?.let { groups += groupPrefix + it }
+                val name = group.path("name").asText().ifBlank { group.path("id").asText() }
+                    .takeIf(String::isNotBlank)
+                if (name == null) hasUnresolvedSubjects = true else groups += groupPrefix + name
             }
-            row.path("subjects").path("user").path("results").mapNotNull { resolveRestrictionEmail(context, it) }
-                .forEach(emails::add)
+            row.path("subjects").path("user").path("results").forEach { user ->
+                val email = resolveRestrictionEmail(context, user)
+                if (email == null) hasUnresolvedSubjects = true else emails += email
+            }
             if (row.path("anonymousAccess").asBoolean(false)) isPublic = true
         }
-        return ExternalAccess(emails, groups, isPublic)
+        return if (hasUnresolvedSubjects) {
+            SpacePermissionResolution(PRIVATE_ACCESS, hasUnresolvedSubjects = true)
+        } else {
+            SpacePermissionResolution(ExternalAccess(emails, groups, isPublic))
+        }
     }
 
     private fun context(config: JsonNode?, credentials: JsonNode): Context {
@@ -1302,6 +1326,10 @@ class ConfluenceConnectorLoader(
     private data class PermissionResolution(
         val access: ExternalAccess?,
         val failure: ConnectorFailure? = null,
+    )
+    private data class SpacePermissionResolution(
+        val access: ExternalAccess,
+        val hasUnresolvedSubjects: Boolean = false,
     )
     private data class AttachmentResult(val document: SourceDocument? = null, val failure: ConnectorFailure? = null)
 

@@ -51,51 +51,73 @@ class ConfluencePermissionSyncIntegrationTest : PostgresIntegrationTest() {
         MockWebServer().use { server ->
             server.dispatcher = unresolvedPermissionDispatcher()
             server.start()
-            val base = server.url("/").toString().trimEnd('/')
-            val connector = connectors.save(
-                ConnectorEntity(
-                    name = "confluence",
-                    source = ConnectorSource.CONFLUENCE,
-                    connectorSpecificConfig = mapper.readTree(
-                        """{"wiki_base":"$base","include_attachments":false}""",
-                    ),
-                ),
-            )
-            val credential = credentials.save(
-                CredentialEntity(
-                    source = ConnectorSource.CONFLUENCE,
-                    secretJson = cipher.encrypt(mapper.readTree("""{"confluence_access_token":"token"}""")),
-                ),
-            )
-            val pair = pairs.save(
-                ConnectorCredentialPairEntity(
-                    connectorId = requireNotNull(connector.id),
-                    credentialId = requireNotNull(credential.id),
-                    name = "confluence",
-                    accessType = "sync",
-                ),
-            )
-            val pairId = requireNotNull(pair.id)
-            val documentId = "$base/spaces/MISSING/pages/111/Runbook"
-            documents.save(
-                IndexedDocumentEntity(
-                    ccPairId = pairId,
-                    sourceDocumentId = documentId,
-                    title = "Runbook",
-                    contentHash = "hash",
-                    metadata = mapper.createObjectNode(),
-                ),
-            )
-
-            worker.process(pairId)
-
-            val stored = documents.findByCcPairIdAndSourceDocumentId(pairId, documentId)?.externalAccess
-            assertThat(mapper.treeToValue(stored, ExternalAccess::class.java)).isEqualTo(ExternalAccess(isPublic = false))
-            val attempt = attempts.findAllByCcPairIdOrderByIdDesc(pairId).single()
-            assertThat(attempt.status).isEqualTo(AttemptStatus.COMPLETED_WITH_ERRORS)
-            assertThat(attempt.totalDocsSynced).isEqualTo(1)
-            assertThat(attempt.docsWithPermissionErrors).isEqualTo(1)
+            assertPartialSync(server, "MISSING")
         }
+    }
+
+    @Test
+    fun unresolvedDirectSpaceUserStoresPrivateAclAndPartialAttempt() = assertUnresolvedSpaceSubject(
+        """{"operation":{"operationKey":"read"},"subject":{"type":"user","userKey":"missing"}}""",
+    )
+
+    @Test
+    fun unresolvedNestedSpaceUserStoresPrivateAclAndPartialAttempt() = assertUnresolvedSpaceSubject(
+        """{"operation":{"operationKey":"read"},"subjects":{"user":{"results":[{"userKey":"missing"}]}}}""",
+    )
+
+    private fun assertUnresolvedSpaceSubject(permission: String) {
+        MockWebServer().use { server ->
+            server.dispatcher = unresolvedSpaceSubjectDispatcher(permission)
+            server.start()
+            assertPartialSync(server, "ENG")
+        }
+    }
+
+    private fun assertPartialSync(server: MockWebServer, spaceKey: String) {
+        val base = server.url("/").toString().trimEnd('/')
+        val connector = connectors.save(
+            ConnectorEntity(
+                name = "confluence",
+                source = ConnectorSource.CONFLUENCE,
+                connectorSpecificConfig = mapper.readTree(
+                    """{"wiki_base":"$base","include_attachments":false}""",
+                ),
+            ),
+        )
+        val credential = credentials.save(
+            CredentialEntity(
+                source = ConnectorSource.CONFLUENCE,
+                secretJson = cipher.encrypt(mapper.readTree("""{"confluence_access_token":"token"}""")),
+            ),
+        )
+        val pair = pairs.save(
+            ConnectorCredentialPairEntity(
+                connectorId = requireNotNull(connector.id),
+                credentialId = requireNotNull(credential.id),
+                name = "confluence",
+                accessType = "sync",
+            ),
+        )
+        val pairId = requireNotNull(pair.id)
+        val documentId = "$base/spaces/$spaceKey/pages/111/Runbook"
+        documents.save(
+            IndexedDocumentEntity(
+                ccPairId = pairId,
+                sourceDocumentId = documentId,
+                title = "Runbook",
+                contentHash = "hash",
+                metadata = mapper.createObjectNode(),
+            ),
+        )
+
+        worker.process(pairId)
+
+        val stored = documents.findByCcPairIdAndSourceDocumentId(pairId, documentId)?.externalAccess
+        assertThat(mapper.treeToValue(stored, ExternalAccess::class.java)).isEqualTo(ExternalAccess(isPublic = false))
+        val attempt = attempts.findAllByCcPairIdOrderByIdDesc(pairId).single()
+        assertThat(attempt.status).isEqualTo(AttemptStatus.COMPLETED_WITH_ERRORS)
+        assertThat(attempt.totalDocsSynced).isEqualTo(1)
+        assertThat(attempt.docsWithPermissionErrors).isEqualTo(1)
     }
 
     private fun unresolvedPermissionDispatcher(): Dispatcher = object : Dispatcher() {
@@ -108,6 +130,22 @@ class ConfluencePermissionSyncIntegrationTest : PostgresIntegrationTest() {
                     "id":"111","title":"Runbook","space":{"key":"MISSING"},
                     "ancestors":[],"restrictions":{},
                     "_links":{"webui":"/spaces/MISSING/pages/111/Runbook"}
+                }]}""".trimIndent(),
+            )
+        }
+    }
+
+    private fun unresolvedSpaceSubjectDispatcher(permission: String): Dispatcher = object : Dispatcher() {
+        override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
+            "/rest/api/space" -> json("""{"results":[{"key":"ENG"}]}""")
+            "/rest/api/server-information" -> json("""{"version":"10.2.10"}""")
+            "/rest/api/space/ENG/permissions" -> json("[$permission]")
+            "/rest/api/user" -> MockResponse().setResponseCode(404)
+            else -> json(
+                """{"results":[{
+                    "id":"111","title":"Runbook","space":{"key":"ENG"},
+                    "ancestors":[],"restrictions":{},
+                    "_links":{"webui":"/spaces/ENG/pages/111/Runbook"}
                 }]}""".trimIndent(),
             )
         }

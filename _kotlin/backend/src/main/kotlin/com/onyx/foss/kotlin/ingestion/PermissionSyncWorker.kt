@@ -161,20 +161,25 @@ class PermissionSyncWorker(
             )
         }
         val privateFence = targetAccess.keys.associateWith { PRIVATE_ACCESS }
+        indexer.updateAccess(pairId, privateFence)
+        storedDocuments.forEach { document ->
+            document.externalAccess = requireNotNull(rowsById[document.sourceDocumentId]).externalAccess
+        }
         try {
-            indexer.updateAccess(pairId, privateFence)
-            storedDocuments.forEach { document ->
-                document.externalAccess = requireNotNull(rowsById[document.sourceDocumentId]).externalAccess
-            }
             documents.saveAllAndFlush(storedDocuments)
+        } catch (error: Exception) {
+            restoreAfterDatabaseFailure(pairId, storedDocuments, previousJson, previousAccess, privateFence)
+            throw error
+        }
+        try {
             indexer.updateAccess(pairId, targetAccess)
         } catch (error: Exception) {
-            restoreOrFence(pairId, storedDocuments, previousJson, previousAccess, privateFence)
+            runCatching { indexer.updateAccess(pairId, privateFence) }
             throw error
         }
     }
 
-    private fun restoreOrFence(
+    private fun restoreAfterDatabaseFailure(
         pairId: Long,
         storedDocuments: List<IndexedDocumentEntity>,
         previousJson: Map<String, JsonNode?>,

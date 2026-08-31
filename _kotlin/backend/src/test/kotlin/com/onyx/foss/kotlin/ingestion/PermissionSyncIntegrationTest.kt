@@ -26,7 +26,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.doReturn
-import org.mockito.Mockito.doThrow
 import org.mockito.Mockito.inOrder
 import org.mockito.Mockito.mockingDetails
 import org.mockito.Mockito.times
@@ -243,12 +242,12 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
-    fun finalOpenSearchFailureRestoresPreviousAclWithoutOverexposure() = MockWebServer().use { server ->
+    fun failedFinalPublicationKeepsCommittedTargetWhenRecoveryFenceFails() = MockWebServer().use { server ->
         server.start()
         val pairId = createPair()
-        val previous = ExternalAccess(setOf("previous@example.com"), isPublic = false)
         val replacement = ExternalAccess(isPublic = true)
-        saveDocument(pairId, "one", previous)
+        saveDocument(pairId, "one")
+        assertThat(documents.findByCcPairIdAndSourceDocumentId(pairId, "one")?.externalAccess).isNull()
         permissionLoad(
             ConnectorBatch(
                 documents = listOf(permissionDocument("one", replacement)),
@@ -256,55 +255,26 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
             ),
         )
         server.enqueue(successfulOpenSearchUpdate())
-        server.enqueue(MockResponse().setResponseCode(500).setBody("OpenSearch unavailable"))
-        server.enqueue(successfulOpenSearchUpdate())
-        server.enqueue(successfulOpenSearchUpdate())
+        server.enqueue(
+            MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(
+                """{"timed_out":false,"total":1,"updated":0,"noops":0,"version_conflicts":0,"failures":[]}""",
+            ),
+        )
+        server.enqueue(MockResponse().setResponseCode(500).setBody("recovery fence unavailable"))
 
         realWorker(server).process(pairId)
 
-        assertAccess(pairId, "one", previous)
+        assertAccess(pairId, "one", replacement)
         val attempt = attempts.findAllByCcPairIdOrderByIdDesc(pairId).single()
         assertThat(attempt.status).isEqualTo(AttemptStatus.FAILED)
-        assertThat(attempt.errorMessage).contains("OpenSearch ACL update failed")
+        assertThat(attempt.errorMessage).contains("OpenSearch did not fully apply")
         val privateAccess = ExternalAccess(isPublic = false)
-        assertThat(openSearchAclBodies(server, 4)).containsExactly(
+        assertThat(openSearchAclBodies(server, 3)).containsExactly(
             aclBody(privateAccess),
             aclBody(replacement),
             aclBody(privateAccess),
-            aclBody(previous),
         )
         Unit
-    }
-
-    @Test
-    fun failedOpenSearchRestoreEndsWithPrivateFence() {
-        val pairId = createPair()
-        val previous = ExternalAccess(setOf("previous@example.com"), isPublic = false)
-        val replacement = ExternalAccess(isPublic = true)
-        val privateAccess = ExternalAccess(isPublic = false)
-        saveDocument(pairId, "one", previous)
-        permissionLoad(
-            ConnectorBatch(
-                documents = listOf(permissionDocument("one", replacement)),
-                checkpoint = checkpoint(),
-            ),
-        )
-        doThrow(IllegalStateException("publish failed"))
-            .`when`(indexer).updateAccess(pairId, mapOf("one" to replacement))
-        doThrow(IllegalStateException("restore failed"))
-            .`when`(indexer).updateAccess(pairId, mapOf("one" to previous))
-
-        worker.process(pairId)
-
-        assertAccess(pairId, "one", previous)
-        assertThat(indexUpdates(pairId)).containsExactly(
-            mapOf("one" to privateAccess),
-            mapOf("one" to replacement),
-            mapOf("one" to privateAccess),
-            mapOf("one" to previous),
-            mapOf("one" to privateAccess),
-        )
-        assertThat(attempts.findAllByCcPairIdOrderByIdDesc(pairId).single().status).isEqualTo(AttemptStatus.FAILED)
     }
 
     @Test
@@ -590,11 +560,6 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
             "is_public" to access.isPublic,
         ),
     )
-
-    @Suppress("UNCHECKED_CAST")
-    private fun indexUpdates(pairId: Long): List<Map<String, ExternalAccess>> = mockingDetails(indexer).invocations
-        .filter { it.method.name == "updateAccess" && it.arguments[0] == pairId }
-        .map { it.arguments[1] as Map<String, ExternalAccess> }
 
     private fun getJson(path: String): JsonNode {
         val response = mvc.perform(get(path)).andReturn().response

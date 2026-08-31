@@ -949,6 +949,7 @@ class ConfluenceConnectorLoaderTest {
         val document = batch.documents.single()
         assertEquals("", document.content)
         assertEquals(setOf("readers"), assertNotNull(document.externalAccess).externalUserGroupIds)
+        assertTrue(batch.failures.isEmpty())
     }
 
     @Test
