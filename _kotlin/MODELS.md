@@ -26,6 +26,7 @@ Verified files:
 - Revision: `8215cf04918ba6f7b6a62bb44238ce2953d8831c`
 - License: Apache-2.0
 - Source format: safetensors, 306M parameters
+- Runtime code: `Alibaba-NLP/new-impl` revision `40ced75c3017eb27626c9d4ea981bde21a2662f4`, Apache-2.0
 - Local directory: `models/gte-multilingual-reranker-base`
 
 Verified files:
@@ -34,6 +35,8 @@ Verified files:
 | --- | --- |
 | `model.safetensors` | `10ebaa49322dd7e01a13a91c49810939e3f91f231aceaa47fdf0cab3083954f6` |
 | `tokenizer.json` | `d6f76fe13d42f80dcee0cb86a1aeb5f14f8909bb8a8782f7a4a4ad76697ef164` |
+| `remote_code/configuration.py` | `3411088045ffb8a9a0aa9936eae275896b39983a2ee5b08f091b44e6289e4fe4` |
+| `remote_code/modeling.py` | `374670b416fcc82f081c9cd28b5fd61c2bd91bbe18eb4798fcc48a81f9c250a0` |
 
 ## BGE reranker candidate
 

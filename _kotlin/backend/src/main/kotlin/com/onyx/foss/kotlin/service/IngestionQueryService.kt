@@ -16,7 +16,7 @@ class IngestionQueryService(
             "items" to slice.map { attempt ->
                 mapOf(
                     "id" to attempt.id,
-                    "status" to attempt.status.name,
+                    "status" to attempt.status.value,
                     "from_beginning" to attempt.fromBeginning,
                     "new_docs_indexed" to attempt.newDocsIndexed,
                     "total_docs_indexed" to attempt.totalDocsIndexed,
@@ -36,7 +36,11 @@ class IngestionQueryService(
 
     fun errors(pairId: Long, page: Int, pageSize: Int): Map<String, Any?> {
         val ids = attempts.findAllByCcPairIdOrderByIdDesc(pairId).mapNotNull { it.id }
-        val all = if (ids.isEmpty()) emptyList() else errors.findAllByAttemptIdInOrderByIdDesc(ids)
+        val all = if (ids.isEmpty()) {
+            emptyList()
+        } else {
+            errors.findAllByAttemptIdInOrderByIdDesc(ids).filterNot { it.isResolved }
+        }
         return mapOf(
             "items" to all.drop(page * pageSize).take(pageSize).map {
                 mapOf(

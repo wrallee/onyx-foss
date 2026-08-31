@@ -44,6 +44,16 @@ data class PairMetadataRequest(
 
 data class PairStatusRequest(val status: PairStatus)
 
+data class CCPropertyUpdateRequest(
+    @field:NotBlank val name: String,
+    @field:NotBlank val value: String,
+)
+
+data class DeletionAttemptRequest(
+    val connectorId: Long,
+    val credentialId: Long,
+)
+
 data class RunConnectorRequest(
     val connectorId: Long,
     @JsonAlias("credentialIds") val credentialIds: List<Long>? = null,
@@ -64,6 +74,33 @@ data class DocumentSetRequest(
     val isPublic: Boolean = true,
     val users: List<String> = emptyList(),
     val groups: List<Long> = emptyList(),
+)
+
+data class RerankCandidate(
+    @field:NotBlank val id: String,
+    val title: String = "",
+    @field:NotBlank val content: String,
+    val retrievalScore: Double? = null,
+)
+
+data class RerankCandidatesRequest(
+    @field:NotBlank val query: String,
+    @field:NotEmpty val candidates: List<RerankCandidate>,
+)
+
+data class RankedCandidate(
+    val id: String,
+    val title: String,
+    val content: String,
+    val retrievalScore: Double?,
+    val rerankScore: Double?,
+    val originalIndex: Int,
+)
+
+data class RerankCandidatesResponse(
+    val reranked: Boolean,
+    val candidates: List<RankedCandidate>,
+    val warning: String? = null,
 )
 
 data class StatusResponse(val success: Boolean, val message: String, val data: Long? = null)

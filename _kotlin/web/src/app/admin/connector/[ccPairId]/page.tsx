@@ -29,7 +29,11 @@ import { IndexAttemptsTable } from "./IndexAttemptsTable";
 import InlineFileManagement from "./InlineFileManagement";
 import { SyncAttemptsTabs } from "./SyncAttemptsTabs";
 import { Section } from "@/layouts/general-layouts";
-import { buildCCPairInfoUrl, triggerIndexing } from "./lib";
+import {
+  buildCCPairInfoUrl,
+  getCCPairDisplayStatus,
+  triggerIndexing,
+} from "./lib";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
   CCPairFullInfo,
@@ -628,7 +632,10 @@ function Main({ ccPairId }: { ccPairId: number }) {
               {t("statusCard.status.label")}
             </div>
             <CCPairStatus
-              ccPairStatus={ccPair.status}
+              ccPairStatus={getCCPairDisplayStatus(
+                ccPair.status,
+                ccPair.last_index_attempt_status
+              )}
               inRepeatedErrorState={ccPair.in_repeated_error_state}
               lastIndexAttemptStatus={latestIndexAttempt?.status}
             />

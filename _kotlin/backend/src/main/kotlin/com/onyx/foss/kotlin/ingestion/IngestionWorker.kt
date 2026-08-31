@@ -16,6 +16,7 @@ import com.onyx.foss.kotlin.domain.IngestionErrorRepository
 import com.onyx.foss.kotlin.domain.IngestionJobEntity
 import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.domain.JobState
+import com.onyx.foss.kotlin.domain.PairStatus
 import com.onyx.foss.kotlin.service.AdminService
 import com.onyx.foss.kotlin.service.FileStorageService
 import org.apache.tika.metadata.Metadata
@@ -94,16 +95,26 @@ class IngestionProcessor(
         attempt.status = AttemptStatus.IN_PROGRESS
         attempt.timeStarted = Instant.now()
         attempts.save(attempt)
+        if (pair.status == PairStatus.SCHEDULED) {
+            pair.status = PairStatus.INITIAL_INDEXING
+            pairs.save(pair)
+        }
         try {
             val connector = admin.connector(pair.connectorId)
-            val checkpoint = checkpoints.findById(requireNotNull(pair.id)).orElse(null)?.checkpointJson
+            val checkpoint = if (attempt.fromBeginning) {
+                null
+            } else {
+                checkpoints.findById(requireNotNull(pair.id)).orElse(null)?.checkpointJson
+            }
             val sourceDocuments = when (connector.source) {
                 ConnectorSource.FILE -> fileLoader.load(connector.connectorSpecificConfig)
                 else -> remoteLoaders.load(connector.source.value, connector.connectorSpecificConfig, admin.credentialSecret(pair.credentialId), checkpoint)
-            }
+            }.distinctBy { it.id }.filter { it.title.isNotBlank() || it.content.isNotBlank() }
             var newDocuments = 0
+            var totalDocuments = 0
             sourceDocuments.forEach { document ->
-                val chunks = document.content.chunked(1500).filter { it.isNotBlank() }
+                val indexableContent = document.content.ifBlank { document.title }
+                val chunks = indexableContent.chunked(1500).filter { it.isNotBlank() }
                 if (chunks.isEmpty()) return@forEach
                 val vectors = embedder.embed(chunks)
                 chunks.zip(vectors).forEachIndexed { index, item ->
@@ -132,6 +143,10 @@ class IngestionProcessor(
                     lastSynced = Instant.now()
                 }
                 documents.save(indexedDocument)
+                totalDocuments += 1
+                attempt.newDocsIndexed = newDocuments
+                attempt.totalDocsIndexed = totalDocuments
+                attempts.save(attempt)
             }
             attempt.status = AttemptStatus.SUCCESS
             attempt.newDocsIndexed = newDocuments
@@ -146,6 +161,16 @@ class IngestionProcessor(
                     ),
                 ),
             )
+            pair.inRepeatedErrorState = false
+            pair.status = PairStatus.ACTIVE
+            pairs.save(pair)
+            val pairAttemptIds = attempts.findAllByCcPairIdOrderByIdDesc(requireNotNull(pair.id))
+                .mapNotNull { it.id }
+            if (pairAttemptIds.isNotEmpty()) {
+                val resolvedErrors = errors.findAllByAttemptIdInOrderByIdDesc(pairAttemptIds)
+                    .onEach { it.isResolved = true }
+                errors.saveAll(resolvedErrors)
+            }
             job.state = JobState.SUCCEEDED
             jobs.save(job)
         } catch (error: Exception) {
@@ -202,11 +227,17 @@ class ModelServerClient(
     private val properties: OnyxProperties,
     private val clientBuilder: WebClient.Builder,
 ) {
+    private companion object {
+        const val MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+    }
+
     fun embed(texts: List<String>): List<List<Double>> {
         require(properties.modelServer.modelName.isNotBlank()) {
             "ONYX_EMBEDDING_MODEL_NAME must be configured before file ingestion"
         }
-        val response = clientBuilder.build()
+        val response = clientBuilder.clone().codecs { codecs ->
+            codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
+        }.build()
             .post()
             .uri(properties.modelServer.baseUrl.trimEnd('/') + "/encoder/bi-encoder-embed")
             .contentType(MediaType.APPLICATION_JSON)
@@ -232,6 +263,25 @@ class OpenSearchIndexer(
     private val clientBuilder: WebClient.Builder,
     private val mapper: ObjectMapper,
 ) {
+    fun deletePair(pairId: Long) {
+        val response = clientBuilder.build()
+            .post()
+            .uri(
+                properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index +
+                    "/_delete_by_query?refresh=true",
+            )
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue(mapOf("query" to mapOf("term" to mapOf("cc_pair_id" to pairId))))
+            .exchangeToMono { result ->
+                if (result.statusCode().is2xxSuccessful) result.releaseBody().thenReturn(true)
+                else result.bodyToMono(String::class.java).flatMap {
+                    Mono.error(IllegalStateException("OpenSearch pair deletion failed: $it"))
+                }
+            }
+            .block()
+        check(response == true) { "OpenSearch did not confirm pair deletion" }
+    }
+
     fun upsert(
         pairId: Long,
         sourceDocumentId: String,

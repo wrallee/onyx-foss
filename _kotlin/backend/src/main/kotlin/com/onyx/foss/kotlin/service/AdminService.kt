@@ -2,9 +2,11 @@ package com.onyx.foss.kotlin.service
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.api.ApiException
+import com.onyx.foss.kotlin.api.CCPropertyUpdateRequest
 import com.onyx.foss.kotlin.api.ConnectorRequest
 import com.onyx.foss.kotlin.api.CredentialRequest
 import com.onyx.foss.kotlin.api.CredentialUpdateRequest
+import com.onyx.foss.kotlin.api.DeletionAttemptRequest
 import com.onyx.foss.kotlin.api.DocumentSetRequest
 import com.onyx.foss.kotlin.api.ObjectCreationResponse
 import com.onyx.foss.kotlin.api.PairMetadataRequest
@@ -27,6 +29,7 @@ import com.onyx.foss.kotlin.domain.IngestionJobEntity
 import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.domain.JobState
 import com.onyx.foss.kotlin.domain.PairStatus
+import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
 import com.onyx.foss.kotlin.security.CredentialCipher
 import org.springframework.http.HttpStatus
 import org.springframework.jdbc.core.JdbcTemplate
@@ -45,6 +48,7 @@ class AdminService(
     private val attempts: IngestionAttemptRepository,
     private val jobs: IngestionJobRepository,
     private val documents: IndexedDocumentRepository,
+    private val indexer: OpenSearchIndexer,
     private val jdbc: JdbcTemplate,
 ) {
     @Transactional
@@ -179,9 +183,25 @@ class AdminService(
     @Transactional
     fun deleteConnector(connectorId: Long): StatusResponse {
         val pairIds = pairs.findAllByConnectorId(connectorId).map(::id)
-        pairIds.forEach(documents::deleteAllByCcPairId)
+        pairIds.forEach { pairId ->
+            indexer.deletePair(pairId)
+            documents.deleteAllByCcPairId(pairId)
+        }
         connectors.delete(connector(connectorId))
         return StatusResponse(true, "Connector deleted successfully", connectorId)
+    }
+
+    @Transactional
+    fun deletePair(request: DeletionAttemptRequest): StatusResponse {
+        val pair = pairs.findByConnectorIdAndCredentialId(request.connectorId, request.credentialId)
+            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
+        val pairId = id(pair)
+        val hasOtherPairs = pairs.findAllByConnectorId(request.connectorId).any { id(it) != pairId }
+        indexer.deletePair(pairId)
+        documents.deleteAllByCcPairId(pairId)
+        pairs.delete(pair)
+        if (!hasOtherPairs) connectors.delete(connector(request.connectorId))
+        return StatusResponse(true, "Connector deletion completed", pairId)
     }
 
     @Transactional
@@ -191,14 +211,16 @@ class AdminService(
         if (connector.source != credential.source) {
             throw ApiException(HttpStatus.BAD_REQUEST, "Connector and credential source do not match")
         }
-        val pair = pairs.findByConnectorIdAndCredentialId(connectorId, credentialId)
-            ?: ConnectorCredentialPairEntity(connectorId = connectorId, credentialId = credentialId)
+        val existingPair = pairs.findByConnectorIdAndCredentialId(connectorId, credentialId)
+        val pair = existingPair ?: ConnectorCredentialPairEntity(connectorId = connectorId, credentialId = credentialId)
         pair.name = request.name.trim()
         pair.accessType = request.accessType
         pair.autoSyncOptions = request.autoSyncOptions
         pair.processingMode = request.processingMode
-        pair.status = PairStatus.ACTIVE
-        return StatusResponse(true, "Credential linked successfully", id(pairs.save(pair)))
+        pair.status = if (existingPair == null) PairStatus.SCHEDULED else PairStatus.ACTIVE
+        val pairId = id(pairs.save(pair))
+        if (existingPair == null) enqueuePair(pairId, fromBeginning = true)
+        return StatusResponse(true, "Credential linked successfully", pairId)
     }
 
     fun pairDetail(pairId: Long): Map<String, Any?> {
@@ -213,7 +235,7 @@ class AdminService(
             "connector" to connectorSnapshot(connector(pair.connectorId)),
             "credential" to credentialSnapshot(credential(pair.credentialId)),
             "number_of_index_attempts" to attempts.findAllByCcPairIdOrderByIdDesc(pairId).size,
-            "last_index_attempt_status" to latest?.status?.name,
+            "last_index_attempt_status" to latest?.status?.value,
             "latest_deletion_attempt" to null,
             "access_type" to pair.accessType,
             "is_editable_for_current_user" to true,
@@ -301,8 +323,8 @@ class AdminService(
             "cc_pair_status" to pair.status.name,
             "in_progress" to (latest?.status == AttemptStatus.IN_PROGRESS),
             "in_repeated_error_state" to pair.inRepeatedErrorState,
-            "last_finished_status" to latest?.status?.takeIf { it != AttemptStatus.IN_PROGRESS }?.name,
-            "last_status" to latest?.status?.name,
+            "last_finished_status" to latest?.status?.takeIf { it != AttemptStatus.IN_PROGRESS }?.value,
+            "last_status" to latest?.status?.value,
             "last_success" to latest?.takeIf { it.status == AttemptStatus.SUCCESS }?.timeUpdated,
             "is_editable" to true,
             "permissions" to mapOf("edit" to true, "delete" to true, "manage" to true),
@@ -410,6 +432,34 @@ class AdminService(
         pairs.save(value)
         return pairDetail(pairId)
     }
+
+    @Transactional
+    fun updatePairProperty(pairId: Long, request: CCPropertyUpdateRequest): StatusResponse {
+        val pair = pair(pairId)
+        val connector = connector(pair.connectorId)
+        val value = request.value.toLongOrNull()
+            ?: throw ApiException(HttpStatus.BAD_REQUEST, "Property value must be an integer")
+        val message = when (request.name) {
+            "refresh_frequency" -> {
+                if (value < 60) {
+                    throw ApiException(HttpStatus.BAD_REQUEST, "Refresh frequency must be at least 60 seconds")
+                }
+                connector.refreshFreq = value
+                "Refresh frequency updated successfully"
+            }
+            "pruning_frequency" -> {
+                if (value < 300) {
+                    throw ApiException(HttpStatus.BAD_REQUEST, "Pruning frequency must be at least 300 seconds")
+                }
+                connector.pruneFreq = value
+                "Pruning frequency updated successfully"
+            }
+            else -> throw ApiException(HttpStatus.BAD_REQUEST, "Property name ${request.name} is not valid")
+        }
+        connectors.save(connector)
+        return StatusResponse(true, message, pairId)
+    }
+
     private fun id(entity: Any): Long = when (entity) {
         is CredentialEntity -> requireNotNull(entity.id)
         is ConnectorEntity -> requireNotNull(entity.id)

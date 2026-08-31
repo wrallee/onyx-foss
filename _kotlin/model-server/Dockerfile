@@ -1,30 +1,26 @@
-# The model artifact is deliberately not downloaded or copied by this image.
-# Mount an approved artifact and manifest at runtime; see README.md.
-FROM gradle:8.14.4-jdk21 AS builder
+FROM python:3.13-slim AS runtime
 
-WORKDIR /workspace
-COPY build.gradle.kts settings.gradle.kts ./
-COPY src ./src
-RUN gradle --no-daemon bootJar
-
-FROM eclipse-temurin:21-jre
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HOME=/tmp
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl \
+    && apt-get install -y --no-install-recommends curl libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /workspace/build/libs/onyx-foss-kotlin-model-server-0.1.0.jar /app/app.jar
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch==2.9.1 \
+    && pip install --no-cache-dir -r requirements.txt
 
-ENV MODEL_SERVER_PORT=9000
-ENV MODEL_ARTIFACT_MANIFEST=
-ENV HOME=/tmp
+COPY app ./app
+
+RUN useradd --system --uid 10001 --home-dir /tmp modelserver \
+    && chown -R modelserver:modelserver /app /tmp
+USER 10001
 
 EXPOSE 9000
-
-# /models is intentionally empty in the image. Operators mount an immutable,
-# approved model package and point MODEL_ARTIFACT_MANIFEST at its manifest.
-VOLUME ["/models"]
-
-USER 10001
-ENTRYPOINT ["java", "-jar", "/app/app.jar"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "9000", "--workers", "1"]

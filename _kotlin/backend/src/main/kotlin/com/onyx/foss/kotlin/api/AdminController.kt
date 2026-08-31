@@ -7,6 +7,7 @@ import com.onyx.foss.kotlin.domain.PairStatus
 import com.onyx.foss.kotlin.service.AdminService
 import com.onyx.foss.kotlin.service.FileStorageService
 import com.onyx.foss.kotlin.service.IngestionQueryService
+import com.onyx.foss.kotlin.service.RerankingService
 import jakarta.validation.Valid
 import org.springframework.http.MediaType
 import org.springframework.web.bind.annotation.DeleteMapping
@@ -27,6 +28,7 @@ class AdminController(
     private val admin: AdminService,
     private val files: FileStorageService,
     private val ingestion: IngestionQueryService,
+    private val reranking: RerankingService,
     private val mapper: ObjectMapper,
 ) {
     @PostMapping("/credential")
@@ -83,6 +85,9 @@ class AdminController(
     @DeleteMapping("/admin/connector/{connectorId}")
     fun deleteConnector(@PathVariable connectorId: Long): StatusResponse = admin.deleteConnector(connectorId)
 
+    @PostMapping("/admin/deletion-attempt")
+    fun deletePair(@RequestBody request: DeletionAttemptRequest): StatusResponse = admin.deletePair(request)
+
     @PutMapping("/connector/{connectorId}/credential/{credentialId}")
     fun associateCredential(
         @PathVariable connectorId: Long,
@@ -132,6 +137,12 @@ class AdminController(
         @RequestParam("new_name") name: String,
     ): Map<String, Any?> = admin.renamePair(pairId, name)
 
+    @PutMapping("/admin/cc-pair/{pairId}/property")
+    fun updatePairProperty(
+        @PathVariable pairId: Long,
+        @Valid @RequestBody request: CCPropertyUpdateRequest,
+    ): StatusResponse = admin.updatePairProperty(pairId, request)
+
     @GetMapping("/admin/cc-pair/{pairId}/index-attempts")
     fun attempts(
         @PathVariable pairId: Long,
@@ -172,4 +183,9 @@ class AdminController(
 
     @GetMapping("/document-set-public")
     fun documentSetPublic(): Map<String, Boolean> = mapOf("is_public" to true)
+
+    @PostMapping("/search/rerank")
+    fun rerankCandidates(
+        @Valid @RequestBody request: RerankCandidatesRequest,
+    ): RerankCandidatesResponse = reranking.rerank(request)
 }
