@@ -207,6 +207,25 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun documentSetRenameRejectsAnExistingName() {
+        val firstId = postJson("/manage/admin/document-set", documentSet("first", emptyList())).body.asLong()
+        val secondId = postJson("/manage/admin/document-set", documentSet("second", emptyList())).body.asLong()
+
+        val response = patchJson(
+            "/manage/admin/document-set",
+            mapOf("id" to secondId, "name" to "first", "cc_pair_ids" to emptyList<Long>()),
+        )
+
+        assertThat(response.status).isEqualTo(409)
+        assertThat(response.body.path("detail").asText()).isEqualTo("Document set name already exists")
+        assertThat(sets.count()).isEqualTo(2)
+        assertThat(sets.findById(firstId).orElseThrow().name).isEqualTo("first")
+        assertThat(sets.findById(secondId).orElseThrow().name).isEqualTo("second")
+        assertThat(joinCount()).isZero()
+        assertThat(queuedJobs()).isZero()
+    }
+
+    @Test
     fun deletingPairRemovesItsDocumentSetMembership() {
         val connectorId = createConnector("github")
         val credentialId = createCredential("github", "secret-token")

@@ -19,6 +19,7 @@ interface ConnectorCredentialPairRepository : JpaRepository<ConnectorCredentialP
 
 interface DocumentSetRepository : JpaRepository<DocumentSetEntity, Long> {
     fun existsByName(name: String): Boolean
+    fun existsByNameAndIdNot(name: String, id: Long): Boolean
 }
 
 interface FileAssetRepository : JpaRepository<FileAssetEntity, String>

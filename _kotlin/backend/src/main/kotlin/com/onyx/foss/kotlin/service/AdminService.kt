@@ -351,6 +351,9 @@ class AdminService(
         val setId = request.id ?: throw ApiException(HttpStatus.BAD_REQUEST, "Document set id is required")
         val set = sets.findById(setId).orElseThrow { ApiException(HttpStatus.NOT_FOUND, "Document set not found") }
         validatePairs(request.ccPairIds)
+        if (sets.existsByNameAndIdNot(request.name.trim(), setId)) {
+            throw ApiException(HttpStatus.CONFLICT, "Document set name already exists")
+        }
         set.name = request.name.trim()
         set.description = request.description
         set.isPublic = true
