@@ -1,8 +1,10 @@
 package com.onyx.foss.kotlin.domain
 
 import org.springframework.data.jpa.repository.JpaRepository
+import org.springframework.data.jpa.repository.Modifying
 import org.springframework.data.jpa.repository.Query
 import org.springframework.data.repository.query.Param
+import org.springframework.transaction.annotation.Transactional
 import java.time.Instant
 
 interface CredentialRepository : JpaRepository<CredentialEntity, Long> {
@@ -83,6 +85,7 @@ interface IngestionJobRepository : JpaRepository<IngestionJobEntity, Long> {
 
 interface IndexedDocumentRepository : JpaRepository<IndexedDocumentEntity, Long> {
     fun findByCcPairIdAndSourceDocumentId(ccPairId: Long, sourceDocumentId: String): IndexedDocumentEntity?
+    fun findAllByCcPairId(ccPairId: Long): List<IndexedDocumentEntity>
     @Query("SELECT document.sourceDocumentId FROM IndexedDocumentEntity document WHERE document.ccPairId = :ccPairId")
     fun findSourceIdsByCcPairId(@Param("ccPairId") ccPairId: Long): List<String>
     fun countByCcPairId(ccPairId: Long): Long
@@ -121,4 +124,19 @@ interface IngestionErrorRepository : JpaRepository<IngestionErrorEntity, Long> {
     fun findUnresolvedEntityErrorsByCcPairId(@Param("ccPairId") ccPairId: Long): List<IngestionErrorEntity>
 }
 
-interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptEntity, Long>
+interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptEntity, Long> {
+    fun findAllByCcPairIdOrderByIdDesc(ccPairId: Long): List<PermissionSyncAttemptEntity>
+    fun findFirstByCcPairIdOrderByIdDesc(ccPairId: Long): PermissionSyncAttemptEntity?
+
+    @Transactional
+    @Modifying
+    @Query(
+        value = """
+            INSERT INTO permission_sync_attempts (cc_pair_id, status)
+            VALUES (:ccPairId, 'NOT_STARTED')
+            ON CONFLICT DO NOTHING
+        """,
+        nativeQuery = true,
+    )
+    fun createIfNoActive(@Param("ccPairId") ccPairId: Long): Int
+}

@@ -91,6 +91,36 @@ class JiraConnectorLoaderTest {
     }
 
     @Test
+    fun jiraDocSyncPassesIndexingStart() = MockWebServer().use { server ->
+        server.json("""{"total":0,"issues":[]}""")
+
+        loader().retrieveAllSlimDocuments(
+            config(server, "\"project_key\":\"ENG\""),
+            tokenCredentials(),
+            start = Instant.parse("2025-06-01T00:00:00Z"),
+            includePermissions = true,
+        ).single()
+
+        assertEquals(
+            "project = \"ENG\" AND updated >= 1748736000000",
+            server.takeRequest().requestUrl!!.queryParameter("jql"),
+        )
+    }
+
+    @Test
+    fun jiraDocSyncPassesNoneWhenNoIndexingStart() = MockWebServer().use { server ->
+        server.json("""{"total":0,"issues":[]}""")
+
+        loader().retrieveAllSlimDocuments(
+            config(server, "\"project_key\":\"ENG\""),
+            tokenCredentials(),
+            includePermissions = true,
+        ).single()
+
+        assertEquals("project = \"ENG\"", server.takeRequest().requestUrl!!.queryParameter("jql"))
+    }
+
+    @Test
     fun serverPaginationResumesFromOffsetAndYieldsEachPage() = MockWebServer().use { server ->
         server.json(serverPage(total = 4, issue("ENG-2"), issue("ENG-3")))
         server.json(serverPage(total = 4, issue("ENG-4")))

@@ -38,19 +38,21 @@ class RemoteConnectorLoaders(
         source: ConnectorSource,
         config: JsonNode?,
         credentials: JsonNode,
+        start: Instant? = null,
+        end: Instant? = null,
         includePermissions: Boolean = false,
     ): Sequence<ConnectorBatch> = when (source) {
         ConnectorSource.JIRA -> {
             jira.validate(config, credentials)
-            jira.retrieveAllSlimDocuments(config, credentials, includePermissions = includePermissions)
+            jira.retrieveAllSlimDocuments(config, credentials, start, end, includePermissions)
         }
         ConnectorSource.CONFLUENCE -> {
             confluence.validate(config, credentials)
-            confluence.retrieveAllSlimDocuments(config, credentials, includePermissions = includePermissions)
+            confluence.retrieveAllSlimDocuments(config, credentials, start, end, includePermissions)
         }
         ConnectorSource.GITHUB -> {
             github.validate(config, credentials)
-            github.retrieveAllSlimDocuments(config, credentials, includePermissions = includePermissions)
+            github.retrieveAllSlimDocuments(config, credentials, start, end, includePermissions)
         }
         else -> error("Unsupported slim remote connector: ${source.value}")
     }

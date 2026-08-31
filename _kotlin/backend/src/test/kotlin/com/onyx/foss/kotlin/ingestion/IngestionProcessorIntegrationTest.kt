@@ -62,6 +62,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     @MockitoBean private lateinit var remoteLoaders: RemoteConnectorLoaders
     @MockitoBean private lateinit var embedder: ModelServerClient
     @MockitoBean private lateinit var indexer: OpenSearchIndexer
+    @MockitoBean private lateinit var permissionSync: PermissionSyncWorker
 
     @BeforeEach
     fun resetDatabase() {
@@ -91,6 +92,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.SUCCESS)
         assertThat(jobs.findById(run.jobId).orElseThrow().state).isEqualTo(JobState.SUCCEEDED)
         assertThat(pairs.findById(run.pairId).orElseThrow().status).isEqualTo(PairStatus.ACTIVE)
+        verify(permissionSync).process(run.pairId)
     }
 
     @Test
@@ -170,6 +172,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         assertThat(documents.findByCcPairIdAndSourceDocumentId(run.pairId, "missing")).isNotNull()
         assertThat(pairs.findById(run.pairId).orElseThrow().lastPrunedAt).isNotNull()
         assertThat(pairs.findById(run.pairId).orElseThrow().inRepeatedErrorState).isFalse()
+        verify(permissionSync).process(run.pairId)
     }
 
     @Test
@@ -185,6 +188,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         assertThat(attempt.errorMessage).isEqualTo("fatal retrieval failure")
         assertThat(jobs.findById(run.jobId).orElseThrow().state).isEqualTo(JobState.FAILED)
         assertThat(error.failureMessage).isEqualTo("fatal retrieval failure")
+        verifyNoInteractions(permissionSync)
     }
 
     @Test
@@ -391,6 +395,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         )
         verifyNoMoreInteractions(remoteLoaders)
         verifyNoInteractions(embedder)
+        verifyNoInteractions(permissionSync)
         assertThat(jobs.count()).isEqualTo(1)
     }
 

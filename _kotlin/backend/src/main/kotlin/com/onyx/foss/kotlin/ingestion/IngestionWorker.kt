@@ -74,6 +74,7 @@ class IngestionProcessor(
     private val embedder: ModelServerClient,
     private val indexer: OpenSearchIndexer,
     private val pruning: PruningService,
+    private val permissionSync: PermissionSyncWorker,
     private val mapper: ObjectMapper,
 ) {
     fun process(jobId: Long) {
@@ -88,6 +89,7 @@ class IngestionProcessor(
             pairs.save(pair)
         }
         var refreshFreq: Long? = null
+        var runPermissionSync = false
         try {
             val connector = admin.connector(pair.connectorId)
             refreshFreq = connector.refreshFreq
@@ -218,6 +220,7 @@ class IngestionProcessor(
             pairs.save(pair)
             job.state = JobState.SUCCEEDED
             jobs.save(job)
+            runPermissionSync = !attempt.pruneOnly
         } catch (error: Exception) {
             attempt.status = AttemptStatus.FAILED
             attempt.errorMessage = error.message?.take(1000) ?: "Ingestion failed"
@@ -239,6 +242,7 @@ class IngestionProcessor(
             job.lastError = attempt.errorMessage
             jobs.save(job)
         }
+        if (runPermissionSync) permissionSync.process(requireNotNull(pair.id))
     }
 
     private fun hash(value: String): String =
@@ -348,6 +352,57 @@ class OpenSearchIndexer(
             ),
             "document deletion",
         )
+    }
+
+    fun updateAccess(pairId: Long, accessByDocument: Map<String, ExternalAccess>) {
+        if (accessByDocument.isEmpty()) return
+        val access = accessByDocument.mapValues { (_, value) ->
+            mapOf(
+                "external_user_emails" to value.externalUserEmails,
+                "external_user_group_ids" to value.externalUserGroupIds,
+                "is_public" to value.isPublic,
+            )
+        }
+        val body = mapOf(
+            "script" to mapOf(
+                "source" to """
+                    def access = params.access_by_document[ctx._source.source_document_id];
+                    ctx._source.external_user_emails = access.external_user_emails;
+                    ctx._source.external_user_group_ids = access.external_user_group_ids;
+                    ctx._source.is_public = access.is_public;
+                """.trimIndent(),
+                "params" to mapOf("access_by_document" to access),
+            ),
+            "query" to mapOf(
+                "bool" to mapOf(
+                    "filter" to listOf(
+                        mapOf("term" to mapOf("cc_pair_id" to pairId)),
+                        mapOf("terms" to mapOf("source_document_id" to accessByDocument.keys)),
+                    ),
+                ),
+            ),
+        )
+        val response = clientBuilder.build()
+            .post()
+            .uri(
+                properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index +
+                    "/_update_by_query?refresh=true&conflicts=proceed",
+            )
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue(mapper.valueToTree<JsonNode>(body))
+            .exchangeToMono { result ->
+                if (result.statusCode().is2xxSuccessful) {
+                    result.bodyToMono(JsonNode::class.java).defaultIfEmpty(mapper.createObjectNode())
+                } else {
+                    result.bodyToMono(String::class.java).flatMap {
+                        Mono.error(IllegalStateException("OpenSearch ACL update failed: $it"))
+                    }
+                }
+            }
+            .block()
+        check(response != null && response.path("failures").size() == 0 && response.path("version_conflicts").asInt(0) == 0) {
+            "OpenSearch did not confirm the ACL update"
+        }
     }
 
     private fun deleteByQuery(query: Map<String, Any>, operation: String) {
