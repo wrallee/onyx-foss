@@ -6,7 +6,12 @@ import com.onyx.foss.kotlin.domain.ConnectorCredentialPairRepository
 import com.onyx.foss.kotlin.domain.ConnectorRepository
 import com.onyx.foss.kotlin.domain.CredentialRepository
 import com.onyx.foss.kotlin.domain.DocumentSetRepository
+import com.onyx.foss.kotlin.domain.AttemptStatus
+import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
+import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
 import com.onyx.foss.kotlin.domain.IngestionJobRepository
+import com.onyx.foss.kotlin.domain.IndexedDocumentEntity
+import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
 import com.onyx.foss.kotlin.service.AdminService
 import com.onyx.foss.kotlin.service.FileStorageService
@@ -14,6 +19,8 @@ import com.onyx.foss.kotlin.support.PostgresIntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.mockito.Mockito.inOrder
+import org.mockito.Mockito.mockingDetails
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc
 import org.springframework.http.MediaType
@@ -23,6 +30,8 @@ import org.springframework.test.web.servlet.MockMvc
 import org.springframework.test.context.bean.override.mockito.MockitoBean
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
+import java.sql.Timestamp
+import java.time.Instant
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete
@@ -42,6 +51,8 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var pairs: ConnectorCredentialPairRepository
     @Autowired private lateinit var sets: DocumentSetRepository
     @Autowired private lateinit var jobs: IngestionJobRepository
+    @Autowired private lateinit var attempts: IngestionAttemptRepository
+    @Autowired private lateinit var documents: IndexedDocumentRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
     @Autowired private lateinit var storedFiles: FileStorageService
     @MockitoBean private lateinit var indexer: OpenSearchIndexer
@@ -124,6 +135,38 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
         assertThat(second.body.path("data").asLong()).isEqualTo(first)
         assertThat(pairs.count()).isEqualTo(1)
         assertThat(queuedJobs()).isEqualTo(1)
+    }
+
+    @Test
+    fun connectorCreation() {
+        val connectorId = createConnector("file")
+        val credentialId = createCredential("file", "file-secret")
+
+        val pairId = associate(connectorId, credentialId)
+        val detail = request(get("/manage/admin/cc-pair/$pairId"))
+
+        assertThat(detail.status).isEqualTo(200)
+        assertThat(detail.body.path("connector").path("id").asLong()).isEqualTo(connectorId)
+        assertThat(detail.body.path("credential").path("id").asLong()).isEqualTo(credentialId)
+        assertThat(attempts.findAllByCcPairIdOrderByIdDesc(pairId)).hasSize(1)
+        assertThat(queuedJobs()).isEqualTo(1)
+    }
+
+    @Test
+    fun overlappingConnectorCreation() {
+        val credentialId = createCredential("github", "secret-token")
+        val firstConnectorId = createConnector("github")
+        val secondConnectorId = createConnector("github")
+
+        val firstPairId = associate(firstConnectorId, credentialId, "first")
+        val secondPairId = associate(secondConnectorId, credentialId, "second")
+
+        assertThat(firstPairId).isNotEqualTo(secondPairId)
+        assertThat(attempts.findAllByCcPairIdOrderByIdDesc(firstPairId)).hasSize(1)
+        assertThat(attempts.findAllByCcPairIdOrderByIdDesc(secondPairId)).hasSize(1)
+        assertThat(connectors.count()).isEqualTo(2)
+        assertThat(pairs.count()).isEqualTo(2)
+        assertThat(queuedJobs()).isEqualTo(2)
     }
 
     @Test
@@ -232,6 +275,72 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun multipleDocumentSetsSyncingSameConnnector() {
+        val connectorId = createConnector("file")
+        val credentialId = createCredential("file", "file-secret")
+        val pairId = associate(connectorId, credentialId)
+        saveIndexedDocument(pairId, "shared")
+
+        postJson("/manage/admin/document-set", documentSet("first", listOf(pairId)))
+        val secondId = postJson("/manage/admin/document-set", documentSet("second", listOf(pairId))).body.asLong()
+        patchJson(
+            "/manage/admin/document-set",
+            mapOf("id" to secondId, "name" to "second", "cc_pair_ids" to emptyList<Long>()),
+        )
+
+        inOrder(indexer).apply {
+            verify(indexer).updateDocumentSets(pairId, setOf("shared"), listOf("first"))
+            verify(indexer).updateDocumentSets(pairId, setOf("shared"), listOf("first", "second"))
+            verify(indexer).updateDocumentSets(pairId, setOf("shared"), listOf("first"))
+        }
+    }
+
+    @Test
+    fun renamingDocumentSet() {
+        val connectorId = createConnector("file")
+        val credentialId = createCredential("file", "file-secret")
+        val pairId = associate(connectorId, credentialId)
+        saveIndexedDocument(pairId, "shared")
+        val setId = postJson("/manage/admin/document-set", documentSet("original", listOf(pairId))).body.asLong()
+
+        patchJson(
+            "/manage/admin/document-set",
+            mapOf("id" to setId, "name" to "renamed", "cc_pair_ids" to listOf(pairId)),
+        )
+        request(delete("/manage/admin/document-set/$setId"))
+
+        inOrder(indexer).apply {
+            verify(indexer).updateDocumentSets(pairId, setOf("shared"), listOf("original"))
+            verify(indexer).updateDocumentSets(pairId, setOf("shared"), listOf("renamed"))
+            verify(indexer).updateDocumentSets(pairId, setOf("shared"), emptyList())
+        }
+    }
+
+    @Test
+    fun documentSetUpdatesUseBoundedPages() {
+        val connectorId = createConnector("file")
+        val credentialId = createCredential("file", "file-secret")
+        val pairId = associate(connectorId, credentialId)
+        jdbc.update(
+            """
+                INSERT INTO indexed_documents
+                    (cc_pair_id, source_document_id, title, content_hash, metadata)
+                SELECT ?, 'document-' || generate_series, 'title', 'hash', '{}'::jsonb
+                FROM generate_series(1, 501)
+            """.trimIndent(),
+            pairId,
+        )
+
+        postJson("/manage/admin/document-set", documentSet("bounded", listOf(pairId)))
+
+        val pages = mockingDetails(indexer).invocations
+            .filter { it.method.name == "updateDocumentSets" }
+            .map { @Suppress("UNCHECKED_CAST") (it.arguments[1] as Set<String>) }
+        assertThat(pages.map(Set<String>::size)).containsExactly(500, 1)
+        assertThat(pages.flatten().toSet()).hasSize(501)
+    }
+
+    @Test
     fun deletingPairRemovesItsDocumentSetMembership() {
         val connectorId = createConnector("github")
         val credentialId = createCredential("github", "secret-token")
@@ -270,6 +379,63 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
         assertThat(pageZero.body.path("total_items").asInt()).isEqualTo(2)
         assertThat(pairs.count()).isEqualTo(1)
         assertThat(queuedJobs()).isEqualTo(2)
+    }
+
+    @Test
+    fun lastIndexedMixedStatuses() {
+        val pairId = createPairWithoutQueuedAttempt()
+        val olderSuccess = Instant.parse("2026-08-31T01:00:00Z")
+        val newerPartial = Instant.parse("2026-08-31T02:00:00Z")
+        saveAttempt(pairId, AttemptStatus.SUCCESS, olderSuccess)
+        saveAttempt(pairId, AttemptStatus.FAILED, Instant.parse("2026-08-31T04:00:00Z"))
+        saveAttempt(pairId, AttemptStatus.COMPLETED_WITH_ERRORS, newerPartial)
+        saveAttempt(pairId, AttemptStatus.IN_PROGRESS, Instant.parse("2026-08-31T05:00:00Z"))
+
+        assertLastIndexed(pairId, newerPartial)
+    }
+
+    @Test
+    fun lastIndexedCompletedWithErrors() {
+        val pairId = createPairWithoutQueuedAttempt()
+        val partial = Instant.parse("2026-08-31T02:00:00Z")
+        saveAttempt(pairId, AttemptStatus.SUCCESS, Instant.parse("2026-08-31T01:00:00Z"))
+        saveAttempt(pairId, AttemptStatus.COMPLETED_WITH_ERRORS, partial)
+        repeat(10) { offset ->
+            saveAttempt(pairId, AttemptStatus.FAILED, Instant.parse("2026-08-31T03:00:00Z").plusSeconds(offset.toLong()))
+        }
+
+        assertLastIndexed(pairId, partial)
+    }
+
+    @Test
+    fun lastIndexedFirstPageAllErrors() {
+        val pairId = createPairWithoutQueuedAttempt()
+        val success = Instant.parse("2026-08-31T01:00:00Z")
+        saveAttempt(pairId, AttemptStatus.SUCCESS, success)
+        repeat(10) { offset ->
+            saveAttempt(pairId, AttemptStatus.FAILED, Instant.parse("2026-08-31T02:00:00Z").plusSeconds(offset.toLong()))
+        }
+
+        assertLastIndexed(pairId, success)
+    }
+
+    @Test
+    fun lastIndexedCredentialSwapScenario() {
+        val connectorId = createConnector("github")
+        val firstCredentialId = createCredential("github", "first-secret")
+        val secondCredentialId = createCredential("github", "second-secret")
+        val firstPairId = associate(connectorId, firstCredentialId, "first")
+        val secondPairId = associate(connectorId, secondCredentialId, "second")
+        jdbc.update("DELETE FROM ingestion_jobs")
+        jdbc.update("DELETE FROM ingestion_attempts")
+        saveAttempt(firstPairId, AttemptStatus.SUCCESS, Instant.parse("2026-08-31T01:00:00Z"))
+        val secondSuccess = Instant.parse("2026-08-31T02:00:00Z")
+        saveAttempt(secondPairId, AttemptStatus.SUCCESS, secondSuccess)
+        repeat(10) { offset ->
+            saveAttempt(secondPairId, AttemptStatus.FAILED, Instant.parse("2026-08-31T03:00:00Z").plusSeconds(offset.toLong()))
+        }
+
+        assertLastIndexed(secondPairId, secondSuccess)
     }
 
     @Test
@@ -421,6 +587,49 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
 
     private fun createConnector(source: String): Long =
         postJson("/manage/admin/connector", connector(source)).body.path("id").asLong()
+
+    private fun createPairWithoutQueuedAttempt(): Long {
+        val connectorId = createConnector("file")
+        val credentialId = createCredential("file", "file-secret")
+        val pairId = associate(connectorId, credentialId)
+        jdbc.update("DELETE FROM ingestion_jobs")
+        jdbc.update("DELETE FROM ingestion_attempts")
+        return pairId
+    }
+
+    private fun saveAttempt(pairId: Long, status: AttemptStatus, started: Instant) {
+        val attempt = attempts.save(
+            IngestionAttemptEntity(ccPairId = pairId, status = status, timeStarted = started),
+        )
+        jdbc.update(
+            "UPDATE ingestion_attempts SET time_started = ?, time_updated = ? WHERE id = ?",
+            Timestamp.from(started),
+            Timestamp.from(started.plusSeconds(30)),
+            requireNotNull(attempt.id),
+        )
+    }
+
+    private fun saveIndexedDocument(pairId: Long, sourceDocumentId: String) {
+        documents.save(
+            IndexedDocumentEntity(
+                ccPairId = pairId,
+                sourceDocumentId = sourceDocumentId,
+                title = sourceDocumentId,
+                contentHash = sourceDocumentId,
+                metadata = mapper.createObjectNode(),
+            ),
+        )
+    }
+
+    private fun assertLastIndexed(pairId: Long, expected: Instant) {
+        val detail = request(get("/manage/admin/cc-pair/$pairId"))
+        val listing = postJson("/manage/admin/connector/indexing-status", emptyMap<String, Any>())
+            .body.flatMap { it.path("indexing_statuses").toList() }
+            .first { it.path("cc_pair_id").asLong() == pairId }
+
+        assertThat(Instant.parse(detail.body.path("last_indexed").asText())).isEqualTo(expected)
+        assertThat(Instant.parse(listing.path("last_success").asText())).isEqualTo(expected)
+    }
 
     private fun associate(connectorId: Long, credentialId: Long, name: String = "pair"): Long {
         val response = putJson("/manage/connector/$connectorId/credential/$credentialId", pairMetadata(name))

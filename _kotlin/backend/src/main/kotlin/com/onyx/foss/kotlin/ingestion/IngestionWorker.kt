@@ -129,7 +129,12 @@ class IngestionProcessor(
             var completeEnumeration = false
             val seenDocumentIds = mutableSetOf<String>()
             val failedDocumentIds = mutableSetOf<String>()
-            batches.forEach { batch ->
+            val batchIterator = batches.iterator()
+            while (true) {
+                stopIfPaused(requireNotNull(pair.id))
+                if (!batchIterator.hasNext()) break
+                val batch = batchIterator.next()
+                stopIfPaused(requireNotNull(pair.id))
                 val batchFailedDocumentIds = batch.failures.mapNotNull { failure ->
                     (failure.target as? FailureTarget.Document)?.id
                 }.toSet()
@@ -198,6 +203,7 @@ class IngestionProcessor(
                 }
                 completeEnumeration = !batch.checkpoint.hasMore
             }
+            stopIfPaused(requireNotNull(pair.id))
             attempt.docsRemovedFromIndex = pruning.prune(
                 requireNotNull(pair.id),
                 seenDocumentIds,
@@ -221,6 +227,11 @@ class IngestionProcessor(
             job.state = JobState.SUCCEEDED
             jobs.save(job)
             runPermissionSync = !attempt.pruneOnly
+        } catch (_: ConnectorPausedException) {
+            attempt.status = AttemptStatus.CANCELED
+            attempts.save(attempt)
+            job.state = JobState.SUCCEEDED
+            jobs.save(job)
         } catch (error: Exception) {
             attempt.status = AttemptStatus.FAILED
             attempt.errorMessage = error.message?.take(1000) ?: "Ingestion failed"
@@ -243,6 +254,10 @@ class IngestionProcessor(
             jobs.save(job)
         }
         if (runPermissionSync) permissionSync.process(requireNotNull(pair.id))
+    }
+
+    private fun stopIfPaused(pairId: Long) {
+        if (pairs.findById(pairId).orElseThrow().status == PairStatus.PAUSED) throw ConnectorPausedException()
     }
 
     private fun hash(value: String): String =
@@ -271,6 +286,8 @@ class IngestionProcessor(
         attempt.pollRangeEnd = Instant.now()
     }
 }
+
+private class ConnectorPausedException : RuntimeException()
 
 internal fun isRepeatedError(refreshFreq: Long?, recent: List<IngestionAttemptEntity>): Boolean {
     val required = if (refreshFreq == null) 1 else 5
@@ -382,6 +399,29 @@ class OpenSearchIndexer(
                 ),
             ),
         )
+        updateByQuery(body, "ACL update", accessByDocument.size)
+    }
+
+    fun updateDocumentSets(pairId: Long, sourceDocumentIds: Set<String>, documentSetNames: List<String>) {
+        if (sourceDocumentIds.isEmpty()) return
+        val body = mapOf(
+            "script" to mapOf(
+                "source" to "ctx._source.document_sets = params.document_sets",
+                "params" to mapOf("document_sets" to documentSetNames),
+            ),
+            "query" to mapOf(
+                "bool" to mapOf(
+                    "filter" to listOf(
+                        mapOf("term" to mapOf("cc_pair_id" to pairId)),
+                        mapOf("terms" to mapOf("source_document_id" to sourceDocumentIds)),
+                    ),
+                ),
+            ),
+        )
+        updateByQuery(body, "document set update", sourceDocumentIds.size)
+    }
+
+    private fun updateByQuery(body: Map<String, Any>, operation: String, minimumTotal: Int) {
         val response = clientBuilder.build()
             .post()
             .uri(
@@ -395,7 +435,7 @@ class OpenSearchIndexer(
                     result.bodyToMono(JsonNode::class.java).defaultIfEmpty(mapper.createObjectNode())
                 } else {
                     result.bodyToMono(String::class.java).flatMap {
-                        Mono.error(IllegalStateException("OpenSearch ACL update failed: $it"))
+                        Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
                     }
                 }
             }
@@ -407,8 +447,8 @@ class OpenSearchIndexer(
             response != null && !response.path("timed_out").asBoolean(true) &&
                 response.path("failures").isArray && response.path("failures").isEmpty &&
                 response.path("version_conflicts").asInt(-1) == 0 &&
-                total >= accessByDocument.size && updated + noops == total,
-        ) { "OpenSearch did not fully apply the ACL update" }
+                total >= minimumTotal && updated + noops == total,
+        ) { "OpenSearch did not fully apply the $operation" }
     }
 
     private fun deleteByQuery(query: Map<String, Any>, operation: String) {

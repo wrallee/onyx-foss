@@ -13,6 +13,7 @@ class AttemptStatusTest {
             "success",
             "failed",
             "completed_with_errors",
+            "canceled",
         )
         assertThat(jacksonObjectMapper().writeValueAsString(AttemptStatus.NOT_STARTED))
             .isEqualTo("\"not_started\"")

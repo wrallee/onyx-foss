@@ -70,6 +70,10 @@ interface FileAssetRepository : JpaRepository<FileAssetEntity, String>
 interface IngestionAttemptRepository : JpaRepository<IngestionAttemptEntity, Long> {
     fun findAllByCcPairIdOrderByIdDesc(ccPairId: Long): List<IngestionAttemptEntity>
     fun findFirstByCcPairIdOrderByIdDesc(ccPairId: Long): IngestionAttemptEntity?
+    fun findFirstByCcPairIdAndStatusInOrderByTimeStartedDescIdDesc(
+        ccPairId: Long,
+        statuses: Collection<AttemptStatus>,
+    ): IngestionAttemptEntity?
 }
 
 interface IngestionCheckpointRepository : JpaRepository<IngestionCheckpointEntity, Long>

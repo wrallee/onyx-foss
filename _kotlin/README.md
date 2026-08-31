@@ -49,6 +49,9 @@ docker compose build
 docker compose up -d
 ```
 
+For an isolated stack, set `WEB_PORT`, `COMPOSE_SUBNET`, and `MODEL_DIR`. The
+model directory is mounted read-only.
+
 Start the UI, API, worker, Python model-server, PostgreSQL, and OpenSearch:
 
 ```bash
@@ -61,11 +64,15 @@ Open `http://localhost:3000`. Only the Web service is published to the host.
 
 ```bash
 # Backend
-docker run --rm -v "$PWD/backend:/workspace" -w /workspace \
-  gradle:8.14.3-jdk21 gradle test --no-daemon
+cd backend
+JAVA_HOME="$HOME/.sdkman/candidates/java/21-zulu" ./gradlew test
+cd ..
+
+# Web-to-PostgreSQL-to-OpenSearch File ingestion
+./scripts/test-kotlin-file-ingestion.sh
 
 # Python model-server
-cd python-model-server
+cd model-server
 python3.13 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
@@ -80,12 +87,11 @@ npm run types:check
 npm run build
 ```
 
-## Current connector limits
+The File, Jira, Confluence, and GitHub loaders support bounded batches,
+checkpoints, poll windows, pruning, document failures, and permission sync.
+Document Set changes update existing OpenSearch chunks.
 
-- Jira uses the REST v2 search endpoint.
-- Confluence collects pages but not attachments or comments.
-- GitHub private organization repositories must be listed explicitly.
-- Remote Connector rate-limit retry and backoff are not implemented yet.
+Image-specific vector embedding is not complete. It remains WATCHLIST work.
 
 See `SOURCE_PROVENANCE.md` for source and license boundaries and
 `docs/model-server-spike.md` for the model compatibility gate.

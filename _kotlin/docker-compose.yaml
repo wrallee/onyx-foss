@@ -77,7 +77,7 @@ services:
       TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-4}
     shm_size: 1gb
     volumes:
-      - ./models:/models:ro
+      - ${MODEL_DIR:-./models}:/models:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/actuator/health/readiness"]
       interval: 30s
@@ -126,7 +126,7 @@ networks:
   default:
     ipam:
       config:
-        - subnet: 192.168.240.0/24
+        - subnet: ${COMPOSE_SUBNET:-192.168.240.0/24}
 
 volumes:
   connector_files:

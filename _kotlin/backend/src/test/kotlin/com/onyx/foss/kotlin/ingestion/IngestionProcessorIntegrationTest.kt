@@ -96,6 +96,23 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun overlappingConnectorCreation() {
+        val first = createRun()
+        val second = createRun()
+        load(sequenceOf(batch(1, false, document("shared"))))
+        processor.process(first.jobId)
+        load(sequenceOf(batch(1, false, document("shared"))))
+
+        processor.process(second.jobId)
+
+        assertThat(documents.findByCcPairIdAndSourceDocumentId(first.pairId, "shared")).isNotNull()
+        assertThat(documents.findByCcPairIdAndSourceDocumentId(second.pairId, "shared")).isNotNull()
+        assertThat(documents.count()).isEqualTo(2)
+        assertThat(attempts.findById(first.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.SUCCESS)
+        assertThat(attempts.findById(second.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.SUCCESS)
+    }
+
+    @Test
     fun passesAttemptPollWindowToRemoteLoader() {
         val start = Instant.parse("2026-08-31T00:00:00Z")
         val end = Instant.parse("2026-09-01T00:00:00Z")
@@ -122,6 +139,61 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         val savedAttempt = attempts.findById(run.attemptId).orElseThrow()
         assertThat(savedAttempt.pollRangeStart).isEqualTo(start)
         assertThat(savedAttempt.pollRangeEnd).isEqualTo(end)
+    }
+
+    @Test
+    fun connectorPauseWhileIndexing() {
+        val run = createRun()
+        var requestedSecondBatch = false
+        doAnswer {
+            val pair = pairs.findById(run.pairId).orElseThrow()
+            pair.status = PairStatus.PAUSED
+            pairs.saveAndFlush(pair)
+            listOf(listOf(0.1))
+        }.`when`(embedder).embed(anyList<String>())
+        load(
+            sequence {
+                yield(batch(1, true, document("one")))
+                requestedSecondBatch = true
+                yield(batch(2, false, document("two")))
+            },
+        )
+
+        processor.process(run.jobId)
+
+        assertThat(documents.findAll().map { it.sourceDocumentId }).containsExactly("one")
+        assertThat(requestedSecondBatch).isFalse()
+        assertThat(checkpoints.findById(run.pairId).orElseThrow().checkpointJson?.path("cursor")?.asInt()).isEqualTo(1)
+        assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.CANCELED)
+        assertThat(jobs.findById(run.jobId).orElseThrow().state).isEqualTo(JobState.SUCCEEDED)
+        assertThat(pairs.findById(run.pairId).orElseThrow().status).isEqualTo(PairStatus.PAUSED)
+        verifyNoInteractions(permissionSync)
+    }
+
+    @Test
+    fun pollConnectorTimeRanges() {
+        val first = createRun()
+        load(sequenceOf(batch(1, false)))
+        val beforeFirst = Instant.now()
+
+        processor.process(first.jobId)
+
+        val afterFirst = Instant.now()
+        val firstAttempt = attempts.findById(first.attemptId).orElseThrow()
+        assertThat(firstAttempt.pollRangeStart).isEqualTo(Instant.EPOCH)
+        assertThat(firstAttempt.pollRangeEnd).isBetween(beforeFirst, afterFirst)
+
+        val secondAttempt = attempts.save(IngestionAttemptEntity(ccPairId = first.pairId))
+        val secondJob = jobs.save(IngestionJobEntity(attemptId = requireNotNull(secondAttempt.id)))
+        load(sequenceOf(batch(2, false)))
+        val beforeSecond = Instant.now()
+
+        processor.process(requireNotNull(secondJob.id))
+
+        val afterSecond = Instant.now()
+        val savedSecond = attempts.findById(requireNotNull(secondAttempt.id)).orElseThrow()
+        assertThat(savedSecond.pollRangeStart).isEqualTo(requireNotNull(firstAttempt.pollRangeEnd).minusSeconds(30 * 60))
+        assertThat(savedSecond.pollRangeEnd).isBetween(beforeSecond, afterSecond)
     }
 
     @Test

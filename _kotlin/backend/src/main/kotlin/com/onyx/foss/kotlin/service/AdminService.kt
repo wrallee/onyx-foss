@@ -227,6 +227,7 @@ class AdminService(
     fun pairDetail(pairId: Long): Map<String, Any?> {
         val pair = pair(pairId)
         val latest = attempts.findFirstByCcPairIdOrderByIdDesc(pairId)
+        val lastSuccessful = lastSuccessfulAttempt(pairId)
         return mapOf(
             "id" to pairId,
             "name" to pair.name,
@@ -245,7 +246,7 @@ class AdminService(
             "indexing" to (latest?.status == AttemptStatus.IN_PROGRESS),
             "creator" to null,
             "creator_email" to null,
-            "last_indexed" to latest?.takeIf { it.status == AttemptStatus.SUCCESS }?.timeUpdated,
+            "last_indexed" to lastSuccessful?.timeStarted,
             "last_pruned" to null,
             "last_full_permission_sync" to null,
             "overall_indexing_speed" to null,
@@ -316,6 +317,7 @@ class AdminService(
     private fun indexingRow(pair: ConnectorCredentialPairEntity): Map<String, Any?> {
         val pairId = id(pair)
         val latest = attempts.findFirstByCcPairIdOrderByIdDesc(pairId)
+        val lastSuccessful = lastSuccessfulAttempt(pairId)
         return mapOf(
             "cc_pair_id" to pairId,
             "name" to pair.name,
@@ -326,7 +328,7 @@ class AdminService(
             "in_repeated_error_state" to pair.inRepeatedErrorState,
             "last_finished_status" to latest?.status?.takeIf { it != AttemptStatus.IN_PROGRESS }?.value,
             "last_status" to latest?.status?.value,
-            "last_success" to latest?.takeIf { it.status == AttemptStatus.SUCCESS }?.timeUpdated,
+            "last_success" to lastSuccessful?.timeStarted,
             "is_editable" to true,
             "permissions" to mapOf("edit" to true, "delete" to true, "manage" to true),
             "docs_indexed" to documents.countByCcPairId(pairId),
@@ -334,14 +336,21 @@ class AdminService(
         )
     }
 
+    private fun lastSuccessfulAttempt(pairId: Long): IngestionAttemptEntity? =
+        attempts.findFirstByCcPairIdAndStatusInOrderByTimeStartedDescIdDesc(
+            pairId,
+            listOf(AttemptStatus.SUCCESS, AttemptStatus.COMPLETED_WITH_ERRORS),
+        )
+
     @Transactional
     fun createSet(request: DocumentSetRequest): Long {
         validatePairs(request.ccPairIds)
         if (sets.existsByName(request.name.trim())) {
             throw ApiException(HttpStatus.CONFLICT, "Document set name already exists")
         }
-        val set = sets.save(DocumentSetEntity(name = request.name.trim(), description = request.description, isPublic = true))
+        val set = sets.saveAndFlush(DocumentSetEntity(name = request.name.trim(), description = request.description, isPublic = true))
         replaceSetPairs(id(set), request.ccPairIds)
+        syncDocumentSets(request.ccPairIds)
         return id(set)
     }
 
@@ -353,18 +362,23 @@ class AdminService(
         if (sets.existsByNameAndIdNot(request.name.trim(), setId)) {
             throw ApiException(HttpStatus.CONFLICT, "Document set name already exists")
         }
+        val previousPairIds = setPairIds(setId)
         set.name = request.name.trim()
         set.description = request.description
         set.isPublic = true
-        sets.save(set)
+        sets.saveAndFlush(set)
         replaceSetPairs(setId, request.ccPairIds)
+        syncDocumentSets(previousPairIds + request.ccPairIds)
     }
 
     @Transactional
     fun deleteSet(setId: Long) {
         if (!sets.existsById(setId)) throw ApiException(HttpStatus.NOT_FOUND, "Document set not found")
+        val pairIds = setPairIds(setId)
         jdbc.update("DELETE FROM document_set_cc_pairs WHERE document_set_id = ?", setId)
         sets.deleteById(setId)
+        sets.flush()
+        syncDocumentSets(pairIds)
     }
 
     fun listSets(): List<Map<String, Any?>> = sets.findAll().map(::setSnapshot)
@@ -413,8 +427,42 @@ class AdminService(
         pairIds.distinct().forEach { jdbc.update("INSERT INTO document_set_cc_pairs(document_set_id, cc_pair_id) VALUES (?, ?)", setId, it) }
     }
 
+    private fun setPairIds(setId: Long): List<Long> = jdbc.queryForList(
+        "SELECT cc_pair_id FROM document_set_cc_pairs WHERE document_set_id = ? ORDER BY cc_pair_id",
+        Long::class.java,
+        setId,
+    )
+
+    private fun syncDocumentSets(pairIds: Collection<Long>) {
+        pairIds.distinct().forEach { pairId ->
+            val names = jdbc.queryForList(
+                """
+                    SELECT document_set.name
+                    FROM document_sets document_set
+                    JOIN document_set_cc_pairs membership ON membership.document_set_id = document_set.id
+                    WHERE membership.cc_pair_id = ?
+                    ORDER BY document_set.name
+                """.trimIndent(),
+                String::class.java,
+                pairId,
+            )
+            var afterSourceDocumentId = ""
+            while (true) {
+                val page = documents.findPageByCcPairId(pairId, afterSourceDocumentId, DOCUMENT_SET_SYNC_PAGE_SIZE)
+                if (page.isEmpty()) break
+                indexer.updateDocumentSets(pairId, page.map { it.sourceDocumentId }.toSet(), names)
+                if (page.size < DOCUMENT_SET_SYNC_PAGE_SIZE) break
+                afterSourceDocumentId = page.last().sourceDocumentId
+            }
+        }
+    }
+
     private fun validatePairs(pairIds: List<Long>) {
         if (pairIds.any { !pairs.existsById(it) }) throw ApiException(HttpStatus.BAD_REQUEST, "Document set references a missing connector")
+    }
+
+    private companion object {
+        const val DOCUMENT_SET_SYNC_PAGE_SIZE = 500
     }
 
     private fun mergeMaskedCredential(current: JsonNode, update: JsonNode): JsonNode {

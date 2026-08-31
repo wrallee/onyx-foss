@@ -40,6 +40,7 @@ enum class AttemptStatus(@get:JsonValue val value: String) {
     SUCCESS("success"),
     FAILED("failed"),
     COMPLETED_WITH_ERRORS("completed_with_errors"),
+    CANCELED("canceled"),
 }
 enum class JobState { QUEUED, RUNNING, SUCCEEDED, FAILED }
 
