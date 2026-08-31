@@ -49,8 +49,28 @@ docker compose build
 docker compose up -d
 ```
 
-For an isolated stack, set `WEB_PORT`, `COMPOSE_SUBNET`, and `MODEL_DIR`. The
-model directory is mounted read-only.
+For an isolated stack, use a separate project, port, subnet, and read-only model path:
+
+```bash
+COMPOSE_PROJECT_NAME=onyx-kotlin-isolated \
+WEB_PORT=13300 \
+COMPOSE_SUBNET=192.168.241.0/24 \
+MODEL_DIR=/absolute/path/to/models \
+docker compose up -d --build
+
+COMPOSE_PROJECT_NAME=onyx-kotlin-isolated \
+WEB_PORT=13300 \
+./scripts/test-kotlin-file-ingestion.sh
+
+COMPOSE_PROJECT_NAME=onyx-kotlin-isolated \
+WEB_PORT=13300 \
+COMPOSE_SUBNET=192.168.241.0/24 \
+MODEL_DIR=/absolute/path/to/models \
+docker compose down -v --remove-orphans
+```
+
+The script derives `http://localhost:13300` from `WEB_PORT`. Set
+`WEB_BASE_URL` only when the Web service uses another address.
 
 Start the UI, API, worker, Python model-server, PostgreSQL, and OpenSearch:
 

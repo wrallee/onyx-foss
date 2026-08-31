@@ -6,6 +6,7 @@ import com.onyx.foss.kotlin.domain.ConnectorCredentialPairRepository
 import com.onyx.foss.kotlin.domain.ConnectorRepository
 import com.onyx.foss.kotlin.domain.CredentialRepository
 import com.onyx.foss.kotlin.domain.DocumentSetRepository
+import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxRepository
 import com.onyx.foss.kotlin.domain.AttemptStatus
 import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
 import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
@@ -19,8 +20,6 @@ import com.onyx.foss.kotlin.support.PostgresIntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import org.mockito.Mockito.inOrder
-import org.mockito.Mockito.mockingDetails
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc
 import org.springframework.http.MediaType
@@ -50,6 +49,7 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var connectors: ConnectorRepository
     @Autowired private lateinit var pairs: ConnectorCredentialPairRepository
     @Autowired private lateinit var sets: DocumentSetRepository
+    @Autowired private lateinit var documentSetSyncOutbox: DocumentSetSyncOutboxRepository
     @Autowired private lateinit var jobs: IngestionJobRepository
     @Autowired private lateinit var attempts: IngestionAttemptRepository
     @Autowired private lateinit var documents: IndexedDocumentRepository
@@ -60,7 +60,7 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
     @BeforeEach
     fun resetDatabase() {
         jdbc.execute(
-            "TRUNCATE ingestion_errors, ingestion_jobs, ingestion_attempts, ingestion_checkpoints, " +
+            "TRUNCATE document_set_sync_outbox, ingestion_errors, ingestion_jobs, ingestion_attempts, ingestion_checkpoints, " +
                 "indexed_documents, document_set_cc_pairs, document_sets, connector_credential_pairs, " +
                 "connectors, credentials RESTART IDENTITY CASCADE",
         )
@@ -288,11 +288,9 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
             mapOf("id" to secondId, "name" to "second", "cc_pair_ids" to emptyList<Long>()),
         )
 
-        inOrder(indexer).apply {
-            verify(indexer).updateDocumentSets(pairId, setOf("shared"), listOf("first"))
-            verify(indexer).updateDocumentSets(pairId, setOf("shared"), listOf("first", "second"))
-            verify(indexer).updateDocumentSets(pairId, setOf("shared"), listOf("first"))
-        }
+        assertThat(documentSetSyncOutbox.findAll()).hasSize(3)
+        assertThat(documentSetSyncOutbox.findAll().map { row -> row.ccPairIds?.map { it.asLong() } })
+            .containsOnly(listOf(pairId))
     }
 
     @Test
@@ -309,35 +307,9 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
         )
         request(delete("/manage/admin/document-set/$setId"))
 
-        inOrder(indexer).apply {
-            verify(indexer).updateDocumentSets(pairId, setOf("shared"), listOf("original"))
-            verify(indexer).updateDocumentSets(pairId, setOf("shared"), listOf("renamed"))
-            verify(indexer).updateDocumentSets(pairId, setOf("shared"), emptyList())
-        }
-    }
-
-    @Test
-    fun documentSetUpdatesUseBoundedPages() {
-        val connectorId = createConnector("file")
-        val credentialId = createCredential("file", "file-secret")
-        val pairId = associate(connectorId, credentialId)
-        jdbc.update(
-            """
-                INSERT INTO indexed_documents
-                    (cc_pair_id, source_document_id, title, content_hash, metadata)
-                SELECT ?, 'document-' || generate_series, 'title', 'hash', '{}'::jsonb
-                FROM generate_series(1, 501)
-            """.trimIndent(),
-            pairId,
-        )
-
-        postJson("/manage/admin/document-set", documentSet("bounded", listOf(pairId)))
-
-        val pages = mockingDetails(indexer).invocations
-            .filter { it.method.name == "updateDocumentSets" }
-            .map { @Suppress("UNCHECKED_CAST") (it.arguments[1] as Set<String>) }
-        assertThat(pages.map(Set<String>::size)).containsExactly(500, 1)
-        assertThat(pages.flatten().toSet()).hasSize(501)
+        assertThat(documentSetSyncOutbox.findAll()).hasSize(3)
+        assertThat(documentSetSyncOutbox.findAll().map { row -> row.ccPairIds?.map { it.asLong() } })
+            .containsOnly(listOf(pairId))
     }
 
     @Test

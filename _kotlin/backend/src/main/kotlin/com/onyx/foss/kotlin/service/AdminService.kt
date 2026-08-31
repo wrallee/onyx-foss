@@ -24,6 +24,8 @@ import com.onyx.foss.kotlin.domain.CredentialEntity
 import com.onyx.foss.kotlin.domain.CredentialRepository
 import com.onyx.foss.kotlin.domain.DocumentSetEntity
 import com.onyx.foss.kotlin.domain.DocumentSetRepository
+import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxEntity
+import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxRepository
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
 import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
@@ -46,6 +48,7 @@ class AdminService(
     private val connectors: ConnectorRepository,
     private val pairs: ConnectorCredentialPairRepository,
     private val sets: DocumentSetRepository,
+    private val documentSetSyncOutbox: DocumentSetSyncOutboxRepository,
     private val attempts: IngestionAttemptRepository,
     private val jobs: IngestionJobRepository,
     private val documents: IndexedDocumentRepository,
@@ -350,7 +353,7 @@ class AdminService(
         }
         val set = sets.saveAndFlush(DocumentSetEntity(name = request.name.trim(), description = request.description, isPublic = true))
         replaceSetPairs(id(set), request.ccPairIds)
-        syncDocumentSets(request.ccPairIds)
+        enqueueDocumentSetSync(request.ccPairIds)
         return id(set)
     }
 
@@ -368,7 +371,7 @@ class AdminService(
         set.isPublic = true
         sets.saveAndFlush(set)
         replaceSetPairs(setId, request.ccPairIds)
-        syncDocumentSets(previousPairIds + request.ccPairIds)
+        enqueueDocumentSetSync(previousPairIds + request.ccPairIds)
     }
 
     @Transactional
@@ -378,7 +381,7 @@ class AdminService(
         jdbc.update("DELETE FROM document_set_cc_pairs WHERE document_set_id = ?", setId)
         sets.deleteById(setId)
         sets.flush()
-        syncDocumentSets(pairIds)
+        enqueueDocumentSetSync(pairIds)
     }
 
     fun listSets(): List<Map<String, Any?>> = sets.findAll().map(::setSnapshot)
@@ -433,36 +436,17 @@ class AdminService(
         setId,
     )
 
-    private fun syncDocumentSets(pairIds: Collection<Long>) {
-        pairIds.distinct().forEach { pairId ->
-            val names = jdbc.queryForList(
-                """
-                    SELECT document_set.name
-                    FROM document_sets document_set
-                    JOIN document_set_cc_pairs membership ON membership.document_set_id = document_set.id
-                    WHERE membership.cc_pair_id = ?
-                    ORDER BY document_set.name
-                """.trimIndent(),
-                String::class.java,
-                pairId,
+    private fun enqueueDocumentSetSync(pairIds: Collection<Long>) {
+        val distinctPairIds = pairIds.distinct()
+        if (distinctPairIds.isNotEmpty()) {
+            documentSetSyncOutbox.save(
+                DocumentSetSyncOutboxEntity(ccPairIds = mapper.valueToTree(distinctPairIds)),
             )
-            var afterSourceDocumentId = ""
-            while (true) {
-                val page = documents.findPageByCcPairId(pairId, afterSourceDocumentId, DOCUMENT_SET_SYNC_PAGE_SIZE)
-                if (page.isEmpty()) break
-                indexer.updateDocumentSets(pairId, page.map { it.sourceDocumentId }.toSet(), names)
-                if (page.size < DOCUMENT_SET_SYNC_PAGE_SIZE) break
-                afterSourceDocumentId = page.last().sourceDocumentId
-            }
         }
     }
 
     private fun validatePairs(pairIds: List<Long>) {
         if (pairIds.any { !pairs.existsById(it) }) throw ApiException(HttpStatus.BAD_REQUEST, "Document set references a missing connector")
-    }
-
-    private companion object {
-        const val DOCUMENT_SET_SYNC_PAGE_SIZE = 500
     }
 
     private fun mergeMaskedCredential(current: JsonNode, update: JsonNode): JsonNode {

@@ -43,6 +43,7 @@ enum class AttemptStatus(@get:JsonValue val value: String) {
     CANCELED("canceled"),
 }
 enum class JobState { QUEUED, RUNNING, SUCCEEDED, FAILED }
+enum class DocumentSetSyncStatus { PENDING, IN_PROGRESS, DONE }
 
 @Entity
 @Table(name = "credentials")
@@ -144,6 +145,26 @@ class DocumentSetPairEntity(
     var documentSetId: Long = 0,
     @Column(name = "cc_pair_id")
     var ccPairId: Long = 0,
+)
+
+@Entity
+@Table(name = "document_set_sync_outbox")
+class DocumentSetSyncOutboxEntity(
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    var id: Long? = null,
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "cc_pair_ids", nullable = false, columnDefinition = "jsonb")
+    var ccPairIds: JsonNode? = null,
+    @Enumerated(EnumType.STRING)
+    var status: DocumentSetSyncStatus = DocumentSetSyncStatus.PENDING,
+    @Column(name = "attempt_count", nullable = false)
+    var attemptCount: Int = 0,
+    @Column(name = "last_error")
+    var lastError: String? = null,
+    @CreationTimestamp @Column(name = "created_at", updatable = false)
+    var createdAt: Instant? = null,
+    @UpdateTimestamp @Column(name = "updated_at")
+    var updatedAt: Instant? = null,
 )
 
 @Entity

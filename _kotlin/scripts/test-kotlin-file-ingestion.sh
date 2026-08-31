@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-web_url="${WEB_BASE_URL:-http://localhost:3000}"
+web_url="${WEB_BASE_URL:-http://localhost:${WEB_PORT:-3000}}"
 compose_project="${COMPOSE_PROJECT_NAME:-onyx-foss-kotlin}"
 opensearch_index="${OPENSEARCH_INDEX:-onyx-kotlin-chunks}"
 compose=(docker compose -p "$compose_project")

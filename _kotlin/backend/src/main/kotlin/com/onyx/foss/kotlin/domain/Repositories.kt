@@ -65,6 +65,20 @@ interface DocumentSetRepository : JpaRepository<DocumentSetEntity, Long> {
     fun existsByNameAndIdNot(name: String, id: Long): Boolean
 }
 
+interface DocumentSetSyncOutboxRepository : JpaRepository<DocumentSetSyncOutboxEntity, Long> {
+    @Query(
+        value = """
+            SELECT * FROM document_set_sync_outbox
+            WHERE status = 'PENDING'
+            ORDER BY id
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        """,
+        nativeQuery = true,
+    )
+    fun lockNextPending(): DocumentSetSyncOutboxEntity?
+}
+
 interface FileAssetRepository : JpaRepository<FileAssetEntity, String>
 
 interface IngestionAttemptRepository : JpaRepository<IngestionAttemptEntity, Long> {
