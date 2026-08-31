@@ -117,6 +117,10 @@ class IngestionProcessor(
             val seenDocumentIds = mutableSetOf<String>()
             val failedDocumentIds = mutableSetOf<String>()
             batches.forEach { batch ->
+                val batchFailedDocumentIds = batch.failures.mapNotNull { failure ->
+                    (failure.target as? FailureTarget.Document)?.id
+                }.toSet()
+                failedDocumentIds += batchFailedDocumentIds
                 batch.documents.forEach { document ->
                     if (!seenDocumentIds.add(document.id) || (document.title.isBlank() && document.content.isBlank())) {
                         return@forEach
@@ -156,16 +160,15 @@ class IngestionProcessor(
                     attempt.newDocsIndexed = newDocuments
                     attempt.totalDocsIndexed = totalDocuments
                     attempts.save(attempt)
-                    val resolvedErrors = errors
-                        .findUnresolvedByCcPairIdAndSourceDocumentId(requireNotNull(pair.id), document.id)
-                        .onEach { it.isResolved = true }
-                    errors.saveAll(resolvedErrors)
+                    if (document.id !in batchFailedDocumentIds) {
+                        val resolvedErrors = errors
+                            .findUnresolvedByCcPairIdAndSourceDocumentId(requireNotNull(pair.id), document.id)
+                            .onEach { it.isResolved = true }
+                        errors.saveAll(resolvedErrors)
+                    }
                 }
                 if (batch.failures.isNotEmpty()) {
                     hasFailures = true
-                    failedDocumentIds += batch.failures.mapNotNull { failure ->
-                        (failure.target as? FailureTarget.Document)?.id
-                    }
                     errors.saveAll(batch.failures.map { failure -> failure.toEntity(requireNotNull(attempt.id)) })
                 }
                 checkpoints.save(
@@ -184,6 +187,11 @@ class IngestionProcessor(
                 completeEnumeration,
             )
             if (attempt.fromBeginning && completeEnumeration) pair.lastPrunedAt = Instant.now()
+            if (!hasFailures) {
+                val resolvedEntityErrors = errors.findUnresolvedEntityErrorsByCcPairId(requireNotNull(pair.id))
+                    .onEach { it.isResolved = true }
+                errors.saveAll(resolvedEntityErrors)
+            }
             attempt.status = if (hasFailures) AttemptStatus.COMPLETED_WITH_ERRORS else AttemptStatus.SUCCESS
             attempt.newDocsIndexed = newDocuments
             attempt.totalDocsIndexed = totalDocuments

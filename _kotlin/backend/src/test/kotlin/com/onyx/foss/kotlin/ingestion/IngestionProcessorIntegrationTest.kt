@@ -34,10 +34,11 @@ import org.mockito.Mockito.doThrow
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
 import java.sql.Timestamp
 import java.time.Instant
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var processor: IngestionProcessor
@@ -173,6 +174,45 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun successfulAttemptResolvesPriorEntityErrors() {
+        val run = createRun()
+        val priorAttempt = attempts.save(IngestionAttemptEntity(ccPairId = run.pairId, status = AttemptStatus.COMPLETED_WITH_ERRORS))
+        val entityError = errors.save(
+            IngestionErrorEntity(attemptId = requireNotNull(priorAttempt.id), entityId = "space-1", failureMessage = "old entity"),
+        )
+        load(sequenceOf(batch(1, false)))
+
+        processor.process(run.jobId)
+
+        assertThat(errors.findById(requireNotNull(entityError.id)).orElseThrow().isResolved).isTrue()
+    }
+
+    @Test
+    fun failedDocumentDoesNotResolveItsPriorErrorWhenAlsoReturned() {
+        val run = createRun()
+        val priorAttempt = attempts.save(IngestionAttemptEntity(ccPairId = run.pairId, status = AttemptStatus.COMPLETED_WITH_ERRORS))
+        val priorError = errors.save(
+            IngestionErrorEntity(attemptId = requireNotNull(priorAttempt.id), sourceDocumentId = "one", failureMessage = "old one"),
+        )
+        load(
+            sequenceOf(
+                ConnectorBatch(
+                    documents = listOf(document("one")),
+                    failures = listOf(
+                        ConnectorFailure(FailureTarget.Document("one"), "still failed"),
+                    ),
+                    checkpoint = checkpoint(1, false),
+                ),
+            ),
+        )
+
+        processor.process(run.jobId)
+
+        assertThat(errors.findById(requireNotNull(priorError.id)).orElseThrow().isResolved).isFalse()
+        assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.COMPLETED_WITH_ERRORS)
+    }
+
+    @Test
     fun scheduledConnectorNeedsFiveConsecutiveFailures() {
         val failures = List(5) { IngestionAttemptEntity(status = AttemptStatus.FAILED) }
 
@@ -292,6 +332,48 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         val queued = attempts.findAllByCcPairIdOrderByIdDesc(pairId).single()
         assertThat(queued.fromBeginning).isTrue()
         assertThat(jobs.count()).isEqualTo(1)
+    }
+
+    @Test
+    fun concurrentSchedulerCallsQueueOneJob() {
+        val now = Instant.parse("2026-09-01T00:00:00Z")
+        createPair(refreshFreq = 1)
+        jdbc.execute(
+            """
+                CREATE FUNCTION delay_ingestion_attempt_insert() RETURNS trigger AS ${'$'}${'$'}
+                BEGIN
+                    PERFORM pg_sleep(0.5);
+                    RETURN NEW;
+                END;
+                ${'$'}${'$'} LANGUAGE plpgsql
+            """.trimIndent(),
+        )
+        jdbc.execute(
+            """
+                CREATE TRIGGER delay_ingestion_attempt_insert
+                BEFORE INSERT ON ingestion_attempts
+                FOR EACH ROW EXECUTE FUNCTION delay_ingestion_attempt_insert()
+            """.trimIndent(),
+        )
+        val start = CountDownLatch(1)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val results = List(2) {
+                executor.submit {
+                    start.await()
+                    scheduler.scheduleDue(now)
+                }
+            }
+            start.countDown()
+            results.forEach { it.get(10, TimeUnit.SECONDS) }
+
+            assertThat(attempts.count()).isEqualTo(1)
+            assertThat(jobs.count()).isEqualTo(1)
+        } finally {
+            executor.shutdownNow()
+            jdbc.execute("DROP TRIGGER delay_ingestion_attempt_insert ON ingestion_attempts")
+            jdbc.execute("DROP FUNCTION delay_ingestion_attempt_insert()")
+        }
     }
 
     private fun createRun(

@@ -5,6 +5,7 @@ import com.onyx.foss.kotlin.domain.ConnectorCredentialPairRepository
 import com.onyx.foss.kotlin.service.AdminService
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
+import org.springframework.transaction.annotation.Transactional
 import java.time.Instant
 
 @Component
@@ -14,10 +15,12 @@ class IngestionScheduler(
     private val admin: AdminService,
 ) {
     @Scheduled(fixedDelayString = "\${onyx.worker.poll-delay-ms:1000}")
+    @Transactional
     fun schedule() {
         if (properties.worker.enabled) scheduleDue(Instant.now())
     }
 
+    @Transactional
     fun scheduleDue(now: Instant) {
         pairs.findSchedulable().forEach { pair ->
             val pruneDue = pair.pruneFreq?.let { frequency ->

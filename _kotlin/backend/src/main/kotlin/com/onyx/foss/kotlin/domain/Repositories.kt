@@ -22,10 +22,13 @@ interface ConnectorCredentialPairRepository : JpaRepository<ConnectorCredentialP
                    connector.refresh_freq AS "refreshFreq",
                    connector.prune_freq AS "pruneFreq",
                    pair.last_pruned_at AS "lastPrunedAt",
-                   MAX(attempt.time_updated) AS "lastAttemptAt"
+                   (
+                       SELECT MAX(attempt.time_updated)
+                       FROM ingestion_attempts attempt
+                       WHERE attempt.cc_pair_id = pair.id
+                   ) AS "lastAttemptAt"
             FROM connector_credential_pairs pair
             JOIN connectors connector ON connector.id = pair.connector_id
-            LEFT JOIN ingestion_attempts attempt ON attempt.cc_pair_id = pair.id
             WHERE pair.status IN ('SCHEDULED', 'INITIAL_INDEXING', 'ACTIVE')
               AND NOT EXISTS (
                   SELECT 1
@@ -34,7 +37,7 @@ interface ConnectorCredentialPairRepository : JpaRepository<ConnectorCredentialP
                   WHERE active_attempt.cc_pair_id = pair.id
                     AND active_job.state IN ('QUEUED', 'RUNNING')
               )
-            GROUP BY pair.id, connector.refresh_freq, connector.prune_freq, pair.last_pruned_at
+            FOR UPDATE OF pair SKIP LOCKED
         """,
         nativeQuery = true,
     )
@@ -103,6 +106,18 @@ interface IngestionErrorRepository : JpaRepository<IngestionErrorEntity, Long> {
         @Param("ccPairId") ccPairId: Long,
         @Param("sourceDocumentId") sourceDocumentId: String,
     ): List<IngestionErrorEntity>
+
+    @Query(
+        """
+            SELECT error FROM IngestionErrorEntity error, IngestionAttemptEntity attempt
+            WHERE error.attemptId = attempt.id
+              AND attempt.ccPairId = :ccPairId
+              AND error.entityId IS NOT NULL
+              AND error.isResolved = false
+            ORDER BY error.id DESC
+        """,
+    )
+    fun findUnresolvedEntityErrorsByCcPairId(@Param("ccPairId") ccPairId: Long): List<IngestionErrorEntity>
 }
 
 interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptEntity, Long>
