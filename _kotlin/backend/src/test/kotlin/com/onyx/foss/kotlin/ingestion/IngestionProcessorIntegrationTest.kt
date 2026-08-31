@@ -55,7 +55,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var errors: IngestionErrorRepository
     @Autowired private lateinit var documents: IndexedDocumentRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
-    @MockitoBean private lateinit var fileLoader: FileDocumentLoader
+    @MockitoBean private lateinit var fileLoader: FileConnectorLoader
     @MockitoBean private lateinit var remoteLoaders: RemoteConnectorLoaders
     @MockitoBean private lateinit var embedder: ModelServerClient
     @MockitoBean private lateinit var indexer: OpenSearchIndexer

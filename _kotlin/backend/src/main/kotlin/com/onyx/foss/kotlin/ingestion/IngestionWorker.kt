@@ -19,10 +19,6 @@ import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.domain.JobState
 import com.onyx.foss.kotlin.domain.PairStatus
 import com.onyx.foss.kotlin.service.AdminService
-import com.onyx.foss.kotlin.service.FileStorageService
-import org.apache.tika.metadata.Metadata
-import org.apache.tika.parser.AutoDetectParser
-import org.apache.tika.sax.BodyContentHandler
 import org.springframework.http.MediaType
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
@@ -31,7 +27,6 @@ import org.springframework.transaction.annotation.Transactional
 import org.springframework.web.reactive.function.client.WebClient
 import reactor.core.publisher.Mono
 import java.nio.charset.StandardCharsets
-import java.nio.file.Files
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.Base64
@@ -74,7 +69,7 @@ class IngestionProcessor(
     private val checkpoints: IngestionCheckpointRepository,
     private val errors: IngestionErrorRepository,
     private val documents: IndexedDocumentRepository,
-    private val fileLoader: FileDocumentLoader,
+    private val fileLoader: FileConnectorLoader,
     private val remoteLoaders: RemoteConnectorLoaders,
     private val embedder: ModelServerClient,
     private val indexer: OpenSearchIndexer,
@@ -251,39 +246,6 @@ private fun ConnectorFailure.toEntity(attemptId: Long): IngestionErrorEntity = w
         failureMessage = message,
         errorType = errorType,
     )
-}
-
-@Service
-class FileDocumentLoader(
-    private val mapper: ObjectMapper,
-    private val files: FileStorageService,
-) {
-    fun load(config: JsonNode?): Sequence<ConnectorBatch> {
-        val locations = config?.path("file_locations") ?: mapper.createArrayNode()
-        val documents = locations.map { location ->
-            val assetId = location.asText()
-            val path = files.filePath(assetId)
-            val handler = BodyContentHandler(-1)
-            Files.newInputStream(path).use { input ->
-                AutoDetectParser().parse(input, handler, Metadata())
-            }
-            SourceDocument(
-                id = "FILE_CONNECTOR__" + assetId,
-                title = path.fileName.toString(),
-                content = handler.toString().trim(),
-                metadata = mapOf("source" to "file", "file_id" to assetId),
-            )
-        }
-        return sequenceOf(
-            ConnectorBatch(
-                documents = documents,
-                checkpoint = ConnectorCheckpoint(
-                    mapper.valueToTree(mapOf("last_success_at" to Instant.now().toString(), "documents" to documents.size)),
-                    hasMore = false,
-                ),
-            ),
-        )
-    }
 }
 
 @Service

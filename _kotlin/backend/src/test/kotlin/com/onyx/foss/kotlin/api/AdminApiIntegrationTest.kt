@@ -9,6 +9,7 @@ import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
 import com.onyx.foss.kotlin.service.AdminService
+import com.onyx.foss.kotlin.service.FileStorageService
 import com.onyx.foss.kotlin.support.PostgresIntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
@@ -20,6 +21,10 @@ import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.mock.web.MockMultipartFile
 import org.springframework.test.web.servlet.MockMvc
 import org.springframework.test.context.bean.override.mockito.MockitoBean
+import java.io.ByteArrayOutputStream
+import java.nio.file.Files
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart
@@ -38,6 +43,7 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var sets: DocumentSetRepository
     @Autowired private lateinit var jobs: IngestionJobRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
+    @Autowired private lateinit var storedFiles: FileStorageService
     @MockitoBean private lateinit var indexer: OpenSearchIndexer
 
     @BeforeEach
@@ -317,8 +323,38 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
         assertThat(queuedJobs()).isEqualTo(2)
     }
 
+    @Test
+    fun zipUploadStoresFilesAndMetadataSeparately() {
+        val response = request(
+            multipart("/manage/admin/connector/file/upload")
+                .file(MockMultipartFile("files", "files.zip", "application/zip", zipFile())),
+        )
+
+        assertThat(response.status).isEqualTo(200)
+        assertThat(response.body.path("file_paths").map(JsonNode::asText)).hasSize(2)
+        assertThat(response.body.path("file_names").map(JsonNode::asText)).containsExactly("one.txt", "two.txt")
+        val metadataId = response.body.path("zip_metadata_file_id").asText()
+        assertThat(metadataId).isNotBlank()
+        assertThat(Files.readString(storedFiles.filePath(metadataId))).contains("one.txt")
+    }
+
     private fun createCredential(source: String, token: String): Long =
         postJson("/manage/credential", credential(source, token)).body.path("id").asLong()
+
+    private fun zipFile(): ByteArray = ByteArrayOutputStream().use { bytes ->
+        ZipOutputStream(bytes).use { zip ->
+            zip.putNextEntry(ZipEntry(".onyx_metadata.json"))
+            zip.write("""[{"filename":"one.txt","file_display_name":"One"}]""".toByteArray())
+            zip.closeEntry()
+            zip.putNextEntry(ZipEntry("one.txt"))
+            zip.write("one".toByteArray())
+            zip.closeEntry()
+            zip.putNextEntry(ZipEntry("two.txt"))
+            zip.write("two".toByteArray())
+            zip.closeEntry()
+        }
+        bytes.toByteArray()
+    }
 
     private fun createConnector(source: String): Long =
         postJson("/manage/admin/connector", connector(source)).body.path("id").asLong()

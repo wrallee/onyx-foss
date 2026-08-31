@@ -12,10 +12,12 @@ import org.springframework.http.HttpStatus
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import org.springframework.web.multipart.MultipartFile
+import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.UUID
+import java.util.zip.ZipInputStream
 
 @Service
 class FileStorageService(
@@ -33,12 +35,13 @@ class FileStorageService(
     @Transactional
     fun upload(files: List<MultipartFile>): Map<String, Any?> {
         if (files.isEmpty()) throw ApiException(HttpStatus.BAD_REQUEST, "At least one file is required")
-        val assets = files.filter { !it.isEmpty }.map(::store)
+        val uploaded = storeUploads(files.filterNot(MultipartFile::isEmpty))
+        val assets = uploaded.assets
         if (assets.isEmpty()) throw ApiException(HttpStatus.BAD_REQUEST, "No non-empty files were uploaded")
         return mapOf(
             "file_paths" to assets.map { it.id },
             "file_names" to assets.map { it.originalName },
-            "zip_metadata_file_id" to null,
+            "zip_metadata_file_id" to uploaded.metadataId,
         )
     }
 
@@ -118,18 +121,71 @@ class FileStorageService(
     }
 
     private fun store(file: MultipartFile): FileAssetEntity {
+        return file.inputStream.use { input ->
+            store(
+                file.originalFilename?.substringAfterLast('/')?.substringAfterLast('\\') ?: UUID.randomUUID().toString(),
+                file.contentType,
+                file.size,
+                input,
+            )
+        }
+    }
+
+    private fun storeUploads(files: List<MultipartFile>): UploadedFiles {
+        val assets = mutableListOf<FileAssetEntity>()
+        var metadataId: String? = null
+        var seenZip = false
+        files.forEach { file ->
+            if (file.isZip()) {
+                if (seenZip) throw ApiException(HttpStatus.BAD_REQUEST, "Only one ZIP file can be uploaded at a time")
+                seenZip = true
+                file.inputStream.use { input ->
+                    ZipInputStream(input).use { zip ->
+                        generateSequence { zip.nextEntry }.forEach { entry ->
+                            val name = entry.name.replace('\\', '/')
+                            if (!entry.isDirectory && name == ".onyx_metadata.json") {
+                                val bytes = zip.readBytes()
+                                mapper.readTree(bytes)
+                                metadataId = store(name, "application/json", bytes.size.toLong(), bytes.inputStream())
+                                    .id
+                            } else if (!entry.isDirectory && name.split('/').none { it.startsWith('.') }) {
+                                val bytes = zip.readBytes()
+                                assets += store(
+                                    name.substringAfterLast('/'),
+                                    Files.probeContentType(Path.of(name)) ?: "application/octet-stream",
+                                    bytes.size.toLong(),
+                                    bytes.inputStream(),
+                                )
+                            }
+                            zip.closeEntry()
+                        }
+                    }
+                }
+            } else {
+                assets += store(file)
+            }
+        }
+        return UploadedFiles(assets, metadataId)
+    }
+
+    private fun store(name: String, contentType: String?, size: Long, input: InputStream): FileAssetEntity {
         val assetId = UUID.randomUUID().toString()
         val path = root.resolve(assetId).normalize()
         if (!path.startsWith(root)) error("Invalid file storage path")
-        file.inputStream.use { Files.copy(it, path, StandardCopyOption.REPLACE_EXISTING) }
+        Files.copy(input, path, StandardCopyOption.REPLACE_EXISTING)
         return fileAssets.save(
             FileAssetEntity(
                 id = assetId,
-                originalName = file.originalFilename?.substringAfterLast('/')?.substringAfterLast('\\') ?: assetId,
-                mediaType = file.contentType,
-                byteSize = file.size,
+                originalName = name,
+                mediaType = contentType,
+                byteSize = size,
                 storagePath = path.toString(),
             ),
         )
     }
+
+    private fun MultipartFile.isZip(): Boolean =
+        contentType?.startsWith("application/zip") == true || originalFilename?.endsWith(".zip", true) == true
+
+    private data class UploadedFiles(val assets: List<FileAssetEntity>, val metadataId: String?)
 }
