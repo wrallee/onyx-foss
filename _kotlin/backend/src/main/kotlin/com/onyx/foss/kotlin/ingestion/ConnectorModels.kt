@@ -1,6 +1,7 @@
 package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.onyx.foss.kotlin.domain.ConnectorSource
 import java.time.Instant
 
 data class ExternalAccess(
@@ -33,4 +34,8 @@ data class SourceDocument(
     val link: String? = null,
     val metadata: Map<String, Any?> = emptyMap(),
     val externalAccess: ExternalAccess? = null,
+    val source: ConnectorSource? = null,
+    val updatedAt: Instant? = null,
+    val primaryOwners: List<String> = emptyList(),
+    val secondaryOwners: List<String> = emptyList(),
 )

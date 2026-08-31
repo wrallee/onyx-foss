@@ -331,26 +331,89 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
         )
 
         assertThat(response.status).isEqualTo(200)
-        assertThat(response.body.path("file_paths").map(JsonNode::asText)).hasSize(2)
-        assertThat(response.body.path("file_names").map(JsonNode::asText)).containsExactly("one.txt", "two.txt")
+        assertThat(response.body.path("file_paths").map(JsonNode::asText)).hasSize(1)
+        assertThat(response.body.path("file_names").map(JsonNode::asText)).containsExactly("one.txt")
         val metadataId = response.body.path("zip_metadata_file_id").asText()
         assertThat(metadataId).isNotBlank()
         assertThat(Files.readString(storedFiles.filePath(metadataId))).contains("one.txt")
     }
 
+    @Test
+    fun connectorFileUpdateMergesZipMetadata() {
+        val connectorId = createConnector("file")
+        val credentialId = createCredential("file", "file-secret")
+        associate(connectorId, credentialId)
+        val initial = request(
+            multipart("/manage/admin/connector/file/upload")
+                .file(MockMultipartFile("files", "first.zip", "application/zip", zipFile("one.txt", "One"))),
+        )
+        patchJson(
+            "/manage/admin/connector/$connectorId",
+            connector(
+                "file",
+                mapOf(
+                    "file_locations" to initial.body.path("file_paths").map(JsonNode::asText),
+                    "file_names" to initial.body.path("file_names").map(JsonNode::asText),
+                    "zip_metadata_file_id" to initial.body.path("zip_metadata_file_id").asText(),
+                ),
+            ),
+        )
+
+        val response = request(
+            multipart("/manage/admin/connector/$connectorId/files/update")
+                .file(MockMultipartFile("files", "second.zip", "application/x-zip", zipFile("two.txt", "Two"))),
+        )
+        val config = requireNotNull(connectors.findById(connectorId).orElseThrow().connectorSpecificConfig)
+        val metadata = Files.readString(storedFiles.filePath(config.path("zip_metadata_file_id").asText()))
+
+        assertThat(response.status).isEqualTo(200)
+        assertThat(config.path("file_names").map(JsonNode::asText)).containsExactly("one.txt", "two.txt")
+        assertThat(metadata).contains("one.txt", "two.txt")
+    }
+
+    @Test
+    fun zipUploadRecognizesFossMimeVariants() {
+        listOf("application/x-zip-compressed", "application/x-zip", "multipart/x-zip").forEach { contentType ->
+            val response = request(
+                multipart("/manage/admin/connector/file/upload")
+                    .file(MockMultipartFile("files", "archive", contentType, zipFile("archive.txt", contentType))),
+            )
+
+            assertThat(response.status).isEqualTo(200)
+            assertThat(response.body.path("file_paths").size()).isEqualTo(1)
+            assertThat(response.body.path("zip_metadata_file_id").asText()).isNotBlank()
+        }
+    }
+
+    @Test
+    fun zipUploadRejectsEntriesLargerThanTheUploadLimit() {
+        val response = request(
+            multipart("/manage/admin/connector/file/upload")
+                .file(MockMultipartFile("files", "large.zip", "application/zip", oversizedZipFile())),
+        )
+
+        assertThat(response.status).isEqualTo(400)
+    }
+
     private fun createCredential(source: String, token: String): Long =
         postJson("/manage/credential", credential(source, token)).body.path("id").asLong()
 
-    private fun zipFile(): ByteArray = ByteArrayOutputStream().use { bytes ->
+    private fun zipFile(fileName: String = "one.txt", displayName: String = "One"): ByteArray = ByteArrayOutputStream().use { bytes ->
         ZipOutputStream(bytes).use { zip ->
             zip.putNextEntry(ZipEntry(".onyx_metadata.json"))
-            zip.write("""[{"filename":"one.txt","file_display_name":"One"}]""".toByteArray())
+            zip.write("""[{"filename":"$fileName","file_display_name":"$displayName"}]""".toByteArray())
             zip.closeEntry()
-            zip.putNextEntry(ZipEntry("one.txt"))
+            zip.putNextEntry(ZipEntry(fileName))
             zip.write("one".toByteArray())
             zip.closeEntry()
-            zip.putNextEntry(ZipEntry("two.txt"))
-            zip.write("two".toByteArray())
+        }
+        bytes.toByteArray()
+    }
+
+    private fun oversizedZipFile(): ByteArray = ByteArrayOutputStream().use { bytes ->
+        ZipOutputStream(bytes).use { zip ->
+            zip.putNextEntry(ZipEntry("large.txt"))
+            repeat(101) { zip.write(ByteArray(1024 * 1024)) }
             zip.closeEntry()
         }
         bytes.toByteArray()

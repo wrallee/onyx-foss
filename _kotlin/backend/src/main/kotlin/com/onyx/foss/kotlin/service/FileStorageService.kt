@@ -79,10 +79,17 @@ class FileStorageService(
         val currentFiles = config.withArray("file_locations").mapIndexed { index, location ->
             location.asText() to (currentNames.get(index)?.asText() ?: location.asText())
         }.filterNot { (id) -> id in idsToRemove }.toMutableList()
-        val added = newFiles.filter { !it.isEmpty }.map(::store)
+        val uploaded = storeUploads(newFiles.filterNot(MultipartFile::isEmpty))
+        val added = uploaded.assets
         currentFiles += added.map { it.id to it.originalName }
+        val metadataId = mergeMetadata(
+            config.path("zip_metadata_file_id").asText().takeIf(String::isNotBlank),
+            uploaded.metadataId,
+            currentFiles.map { it.second }.toSet(),
+        )
         config.set<ArrayNode>("file_locations", mapper.valueToTree(currentFiles.map { it.first }))
         config.set<ArrayNode>("file_names", mapper.valueToTree(currentFiles.map { it.second }))
+        config.put("zip_metadata_file_id", metadataId)
         connector.connectorSpecificConfig = config
         admin.updateConnector(
             connectorId,
@@ -105,7 +112,7 @@ class FileStorageService(
         return mapOf(
             "file_paths" to added.map { it.id },
             "file_names" to added.map { it.originalName },
-            "zip_metadata_file_id" to null,
+            "zip_metadata_file_id" to metadataId,
         )
     }
 
@@ -134,6 +141,7 @@ class FileStorageService(
     private fun storeUploads(files: List<MultipartFile>): UploadedFiles {
         val assets = mutableListOf<FileAssetEntity>()
         var metadataId: String? = null
+        var extractedBytes = 0L
         var seenZip = false
         files.forEach { file ->
             if (file.isZip()) {
@@ -144,18 +152,19 @@ class FileStorageService(
                         generateSequence { zip.nextEntry }.forEach { entry ->
                             val name = entry.name.replace('\\', '/')
                             if (!entry.isDirectory && name == ".onyx_metadata.json") {
-                                val bytes = zip.readBytes()
-                                mapper.readTree(bytes)
-                                metadataId = store(name, "application/json", bytes.size.toLong(), bytes.inputStream())
-                                    .id
+                                val stored = storeZipEntry(name, "application/json", zip, extractedBytes)
+                                extractedBytes = stored.extractedBytes
+                                Files.newInputStream(Path.of(stored.asset.storagePath)).use(mapper::readTree)
+                                metadataId = stored.asset.id
                             } else if (!entry.isDirectory && name.split('/').none { it.startsWith('.') }) {
-                                val bytes = zip.readBytes()
-                                assets += store(
+                                val stored = storeZipEntry(
                                     name.substringAfterLast('/'),
                                     Files.probeContentType(Path.of(name)) ?: "application/octet-stream",
-                                    bytes.size.toLong(),
-                                    bytes.inputStream(),
+                                    zip,
+                                    extractedBytes,
                                 )
+                                assets += stored.asset
+                                extractedBytes = stored.extractedBytes
                             }
                             zip.closeEntry()
                         }
@@ -184,8 +193,59 @@ class FileStorageService(
         )
     }
 
+    private fun storeZipEntry(name: String, contentType: String, input: InputStream, priorBytes: Long): StoredZipEntry {
+        val assetId = UUID.randomUUID().toString()
+        val path = root.resolve(assetId).normalize()
+        var extractedBytes = priorBytes
+        try {
+            Files.newOutputStream(path).use { output ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val count = input.read(buffer)
+                    if (count < 0) break
+                    extractedBytes += count
+                    if (extractedBytes > MAX_ZIP_EXTRACTED_BYTES) {
+                        throw ApiException(HttpStatus.BAD_REQUEST, "ZIP contents exceed the 100 MB upload limit")
+                    }
+                    output.write(buffer, 0, count)
+                }
+            }
+        } catch (error: Exception) {
+            Files.deleteIfExists(path)
+            throw error
+        }
+        return StoredZipEntry(
+            fileAssets.save(FileAssetEntity(assetId, name, contentType, extractedBytes - priorBytes, path.toString())),
+            extractedBytes,
+        )
+    }
+
+    private fun mergeMetadata(existingId: String?, newId: String?, names: Set<String>): String? {
+        val metadata = (existingId?.let(::readMetadata).orEmpty() + newId?.let(::readMetadata).orEmpty())
+            .filterKeys(names::contains)
+        if (metadata.isEmpty()) return null
+        val bytes = mapper.writeValueAsBytes(metadata)
+        return store(".onyx_metadata.json", "application/json", bytes.size.toLong(), bytes.inputStream()).id
+    }
+
+    private fun readMetadata(assetId: String): Map<String, Any?> {
+        val node = Files.newInputStream(filePath(assetId)).use(mapper::readTree)
+        return when {
+            node.isArray -> node.mapNotNull { entry -> entry.path("filename").asText().takeIf(String::isNotBlank)?.let { it to entry } }.toMap()
+            node.isObject -> node.fields().asSequence().associate { it.key to it.value }
+            else -> emptyMap()
+        }
+    }
+
     private fun MultipartFile.isZip(): Boolean =
-        contentType?.startsWith("application/zip") == true || originalFilename?.endsWith(".zip", true) == true
+        contentType in ZIP_MEDIA_TYPES || originalFilename?.endsWith(".zip", true) == true
 
     private data class UploadedFiles(val assets: List<FileAssetEntity>, val metadataId: String?)
+
+    private data class StoredZipEntry(val asset: FileAssetEntity, val extractedBytes: Long)
+
+    private companion object {
+        const val MAX_ZIP_EXTRACTED_BYTES = 100L * 1024 * 1024
+        val ZIP_MEDIA_TYPES = setOf("application/zip", "application/x-zip-compressed", "application/x-zip", "multipart/x-zip")
+    }
 }

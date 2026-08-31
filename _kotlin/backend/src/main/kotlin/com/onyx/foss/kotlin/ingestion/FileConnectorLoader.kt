@@ -2,6 +2,7 @@ package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.onyx.foss.kotlin.domain.ConnectorSource
 import com.onyx.foss.kotlin.service.FileStorageService
 import org.apache.tika.metadata.Metadata
 import org.apache.tika.parser.AutoDetectParser
@@ -54,6 +55,12 @@ class FileConnectorLoader(
             content = extracted.content,
             link = metadata["link"]?.asText()?.takeIf(String::isNotBlank),
             metadata = documentMetadata,
+            source = metadata["connector_type"]?.asText()?.let { value ->
+                ConnectorSource.entries.firstOrNull { it.value.equals(value, ignoreCase = true) }
+            } ?: ConnectorSource.FILE,
+            updatedAt = metadata["doc_updated_at"]?.asText()?.takeIf(String::isNotBlank)?.let(Instant::parse),
+            primaryOwners = metadata["primary_owners"].stringList(),
+            secondaryOwners = metadata["secondary_owners"].stringList(),
         )
     }
 
@@ -80,6 +87,9 @@ class FileConnectorLoader(
 
     private fun JsonNode?.asMap(): Map<String, JsonNode> =
         if (this?.isObject == true) fields().asSequence().associate { it.key to it.value } else emptyMap()
+
+    private fun JsonNode?.stringList(): List<String> =
+        if (this?.isArray == true) mapNotNull { it.asText().takeIf(String::isNotBlank) } else emptyList()
 
     private fun String.fileName(): String = substringAfterLast('/').substringAfterLast('\\')
 

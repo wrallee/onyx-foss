@@ -1,6 +1,7 @@
 package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.onyx.foss.kotlin.domain.ConnectorSource
 import com.onyx.foss.kotlin.service.FileStorageService
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -8,6 +9,7 @@ import org.mockito.Mockito.doReturn
 import org.mockito.Mockito.mock
 import java.nio.file.Files
 import java.nio.file.Path
+import java.time.Instant
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
@@ -26,7 +28,7 @@ class FileConnectorLoaderTest {
                 "text-1" to write(
                     "notes.txt",
                     """
-                    #ONYX_METADATA={"link":"https://onyx.app","file_display_name":"Display name","tag_of_your_choice":"test-tag"}
+                    #ONYX_METADATA={"link":"https://onyx.app","file_display_name":"Display name","tag_of_your_choice":"test-tag","primary_owners":["wenxi@onyx.app"],"secondary_owners":["founders@onyx.app"],"doc_updated_at":"2001-01-01T00:00:00Z"}
                     Test answer is 12345
                     """.trimIndent(),
                 ),
@@ -39,8 +41,12 @@ class FileConnectorLoaderTest {
         assertEquals("Test answer is 12345", document.content)
         assertEquals("https://onyx.app", document.link)
         assertEquals("file", document.metadata["source"])
+        assertEquals(ConnectorSource.FILE, document.source)
         assertEquals("test-tag", document.metadata["tag_of_your_choice"])
         assertNull(document.metadata["file_id"])
+        assertEquals(listOf("wenxi@onyx.app"), document.primaryOwners)
+        assertEquals(listOf("founders@onyx.app"), document.secondaryOwners)
+        assertEquals(Instant.parse("2001-01-01T00:00:00Z"), document.updatedAt)
     }
 
     @Test
@@ -52,8 +58,8 @@ class FileConnectorLoaderTest {
                 "metadata" to write(
                     ".onyx_metadata.json",
                     """[
-                      {"filename":"file1.txt","file_display_name":"Display 1","link":"https://onyx.app/1","tag":"one"},
-                      {"filename":"file2.txt","file_display_name":"Display 2","link":"https://onyx.app/2","tag":"two"}
+                      {"filename":"file1.txt","file_display_name":"Display 1","link":"https://onyx.app/1","tag":"one","primary_owners":["alice@onyx.app"],"secondary_owners":["bob@onyx.app"],"doc_updated_at":"2022-02-02T00:00:00Z"},
+                      {"filename":"file2.txt","file_display_name":"Display 2","link":"https://onyx.app/2","tag":"two","primary_owners":["carol@onyx.app"],"secondary_owners":["dave@onyx.app"],"doc_updated_at":"2023-03-03T00:00:00Z"}
                     ]""",
                 ),
             ),
@@ -66,6 +72,12 @@ class FileConnectorLoaderTest {
         assertEquals(listOf("https://onyx.app/1", "https://onyx.app/2"), documents.map { it.link })
         assertEquals(listOf("one", "two"), documents.map { it.metadata["tag"] })
         assertTrue(documents.all { it.metadata["file_id"] == null })
+        assertEquals(listOf(listOf("alice@onyx.app"), listOf("carol@onyx.app")), documents.map { it.primaryOwners })
+        assertEquals(listOf(listOf("bob@onyx.app"), listOf("dave@onyx.app")), documents.map { it.secondaryOwners })
+        assertEquals(
+            listOf(Instant.parse("2022-02-02T00:00:00Z"), Instant.parse("2023-03-03T00:00:00Z")),
+            documents.map { it.updatedAt },
+        )
     }
 
     @Test
