@@ -13,10 +13,11 @@ import java.util.Base64
 @Service
 class RemoteConnectorLoaders(
     private val http: RemoteJsonClient,
+    private val jira: JiraConnectorLoader,
 ) {
     fun load(source: ConnectorSource, config: JsonNode?, credentials: JsonNode, checkpoint: JsonNode?): Sequence<ConnectorBatch> {
+        if (source == ConnectorSource.JIRA) return jira.load(config, credentials, checkpoint)
         val documents = when (source) {
-            ConnectorSource.JIRA -> jira(config, credentials, checkpoint)
             ConnectorSource.CONFLUENCE -> confluence(config, credentials, checkpoint)
             ConnectorSource.GITHUB -> github(config, credentials, checkpoint)
             else -> error("Unsupported remote connector: " + source.value)
@@ -32,37 +33,6 @@ class RemoteConnectorLoaders(
                 ),
             ),
         )
-    }
-
-    private fun jira(config: JsonNode?, credentials: JsonNode, checkpoint: JsonNode?): List<SourceDocument> {
-        val base = required(config, "jira_base_url", "base_url")
-        val project = config?.text("project_key")
-        val customJql = config?.text("jql_query")
-        val jql = customJql ?: if (project.isNullOrBlank()) "order by updated asc" else "project = " + project + " order by updated asc"
-        val headers = auth(credentials, basic = true)
-        val result = mutableListOf<SourceDocument>()
-        var start = 0
-        while (true) {
-            val path = "/rest/api/2/search?jql=" + query(jql) + "&startAt=" + start + "&maxResults=100&fields=summary,description,updated"
-            val response = http.get(base, path, headers)
-            val issues = response.path("issues")
-            issues.forEach { issue ->
-                val key = issue.path("key").asText()
-                val fields = issue.path("fields")
-                result += SourceDocument(
-                    id = key,
-                    title = key + ": " + fields.path("summary").asText(key),
-                    content = adfText(fields.path("description")).ifBlank { fields.path("summary").asText() },
-                    link = base.trimEnd('/') + "/browse/" + key,
-                    metadata = mapOf("source" to "jira", "key" to key, "updated" to fields.path("updated").asText()),
-                )
-            }
-            val pageSize = issues.size()
-            val total = response.path("total").asInt(start + pageSize)
-            start += pageSize
-            if (pageSize == 0 || start >= total) break
-        }
-        return afterCheckpoint(result, checkpoint)
     }
 
     private fun confluence(config: JsonNode?, credentials: JsonNode, checkpoint: JsonNode?): List<SourceDocument> {
@@ -247,12 +217,6 @@ class RemoteConnectorLoaders(
     private fun query(value: String): String = UriUtils.encodeQueryParam(value, StandardCharsets.UTF_8)
 
     private fun segment(value: String): String = UriUtils.encodePathSegment(value, StandardCharsets.UTF_8)
-
-    private fun adfText(node: JsonNode): String = when {
-        node.isTextual -> node.asText()
-        node.isArray || node.isObject -> node.map(::adfText).joinToString(" ")
-        else -> ""
-    }
 
     private fun stripHtml(value: String): String = value.replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
 }

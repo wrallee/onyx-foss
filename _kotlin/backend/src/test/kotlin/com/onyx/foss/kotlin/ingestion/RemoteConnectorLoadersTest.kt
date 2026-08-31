@@ -17,7 +17,12 @@ class RemoteConnectorLoadersTest {
     fun collectsJiraIssuesWithBasicAuthentication() = MockWebServer().use { server ->
         server.enqueue(
             MockResponse().setHeader("Content-Type", "application/json").setBody(
-                """{"total":1,"issues":[{"key":"DOC-1","fields":{"summary":"Jira summary","description":{"type":"doc","content":[{"type":"text","text":"Issue body"}]},"updated":"2026-01-01"}}]}""",
+                """{"issues":[{"id":"10001"}]}""",
+            ),
+        )
+        server.enqueue(
+            MockResponse().setHeader("Content-Type", "application/json").setBody(
+                """{"issues":[{"id":"10001","key":"DOC-1","fields":{"summary":"Jira summary","description":{"type":"doc","content":[{"type":"text","text":"Issue body"}]},"updated":"2026-01-01"}}]}""",
             ),
         )
         server.start()
@@ -30,10 +35,10 @@ class RemoteConnectorLoadersTest {
         ).single().documents
 
         assertEquals(1, docs.size)
-        assertEquals("DOC-1", docs.single().id)
+        assertEquals(base + "/browse/DOC-1", docs.single().id)
         assertTrue(docs.single().content.contains("Issue body"))
         val request = server.takeRequest()
-        assertTrue(request.path!!.startsWith("/rest/api/2/search?"))
+        assertTrue(request.path!!.startsWith("/rest/api/3/search/jql?"))
         assertEquals(
             "Basic " + Base64.getEncoder().encodeToString("a@example.com:token".toByteArray()),
             request.getHeader("Authorization"),
@@ -119,5 +124,7 @@ class RemoteConnectorLoadersTest {
     }
 
     private fun loaders(): RemoteConnectorLoaders =
-        RemoteConnectorLoaders(RemoteJsonClient(WebClient.builder()))
+        RemoteJsonClient(WebClient.builder()).let { http ->
+            RemoteConnectorLoaders(http, JiraConnectorLoader(http, mapper))
+        }
 }

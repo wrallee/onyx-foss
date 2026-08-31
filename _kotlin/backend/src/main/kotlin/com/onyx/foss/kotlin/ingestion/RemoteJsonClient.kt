@@ -24,4 +24,17 @@ class RemoteJsonClient(
             .retrieve()
             .bodyToMono(JsonNode::class.java)
             .block() ?: error("Remote connector returned an empty response")
+
+    fun post(base: String, path: String, headers: Map<String, String>, body: Any): JsonNode =
+        clientBuilder.clone().codecs { codecs ->
+            codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
+        }.build().post()
+            .uri(URI.create(base.trimEnd('/') + path))
+            .accept(MediaType.APPLICATION_JSON)
+            .contentType(MediaType.APPLICATION_JSON)
+            .headers { httpHeaders -> headers.forEach { (name, value) -> httpHeaders.set(name, value) } }
+            .bodyValue(body)
+            .retrieve()
+            .bodyToMono(JsonNode::class.java)
+            .block() ?: error("Remote connector returned an empty response")
 }
