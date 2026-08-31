@@ -91,23 +91,35 @@ class IngestionProcessor(
         try {
             val connector = admin.connector(pair.connectorId)
             refreshFreq = connector.refreshFreq
-            setPollRange(attempt, connector.indexingStart)
+            if (!attempt.pruneOnly) setPollRange(attempt, connector.indexingStart)
             attempts.save(attempt)
-            val checkpoint = if (attempt.fromBeginning) {
+            val checkpoint = if (attempt.fromBeginning || attempt.pruneOnly) {
                 null
             } else {
                 checkpoints.findById(requireNotNull(pair.id)).orElse(null)?.checkpointJson
             }
-            val batches = when (connector.source) {
-                ConnectorSource.FILE -> fileLoader.load(connector.connectorSpecificConfig)
-                else -> remoteLoaders.load(
+            val credentials = admin.credentialSecret(pair.credentialId)
+            val batches = if (attempt.pruneOnly) {
+                when (connector.source) {
+                    ConnectorSource.FILE -> fileLoader.load(connector.connectorSpecificConfig)
+                    else -> remoteLoaders.loadSlim(
+                        connector.source,
+                        connector.connectorSpecificConfig,
+                        credentials,
+                    )
+                }
+            } else {
+                when (connector.source) {
+                    ConnectorSource.FILE -> fileLoader.load(connector.connectorSpecificConfig)
+                    else -> remoteLoaders.load(
                     connector.source,
                     connector.connectorSpecificConfig,
-                    admin.credentialSecret(pair.credentialId),
+                    credentials,
                     checkpoint,
                     attempt.pollRangeStart,
                     attempt.pollRangeEnd,
                 )
+                }
             }
             var newDocuments = 0
             var totalDocuments = 0
@@ -121,7 +133,11 @@ class IngestionProcessor(
                 }.toSet()
                 failedDocumentIds += batchFailedDocumentIds
                 batch.documents.forEach { document ->
-                    if (!seenDocumentIds.add(document.id) || (document.title.isBlank() && document.content.isBlank())) {
+                    if (!seenDocumentIds.add(document.id)) {
+                        return@forEach
+                    }
+                    if (attempt.pruneOnly) return@forEach
+                    if (document.title.isBlank() && document.content.isBlank()) {
                         return@forEach
                     }
                     val indexableContent = document.content.ifBlank { document.title }
@@ -170,22 +186,24 @@ class IngestionProcessor(
                     hasFailures = true
                     errors.saveAll(batch.failures.map { failure -> failure.toEntity(requireNotNull(attempt.id)) })
                 }
-                checkpoints.save(
-                    IngestionCheckpointEntity(
-                        ccPairId = requireNotNull(pair.id),
-                        checkpointJson = batch.checkpoint.value,
-                    ),
-                )
+                if (!attempt.pruneOnly) {
+                    checkpoints.save(
+                        IngestionCheckpointEntity(
+                            ccPairId = requireNotNull(pair.id),
+                            checkpointJson = batch.checkpoint.value,
+                        ),
+                    )
+                }
                 completeEnumeration = !batch.checkpoint.hasMore
             }
             attempt.docsRemovedFromIndex = pruning.prune(
                 requireNotNull(pair.id),
                 seenDocumentIds,
                 failedDocumentIds,
-                attempt.fromBeginning,
+                attempt.fromBeginning || attempt.pruneOnly,
                 completeEnumeration,
             )
-            if (attempt.fromBeginning && completeEnumeration) pair.lastPrunedAt = Instant.now()
+            if ((attempt.fromBeginning || attempt.pruneOnly) && completeEnumeration) pair.lastPrunedAt = Instant.now()
             if (!hasFailures) {
                 val resolvedEntityErrors = errors.findUnresolvedEntityErrorsByCcPairId(requireNotNull(pair.id))
                     .onEach { it.isResolved = true }

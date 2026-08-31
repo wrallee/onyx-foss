@@ -281,11 +281,12 @@ class AdminService(
     }
 
     @Transactional
-    fun enqueuePair(pairId: Long, fromBeginning: Boolean): Long {
+    fun enqueuePair(pairId: Long, fromBeginning: Boolean, pruneOnly: Boolean = false): Long {
         val attempt = attempts.save(
             IngestionAttemptEntity(
                 ccPairId = pairId,
                 fromBeginning = fromBeginning,
+                pruneOnly = pruneOnly,
             ),
         )
         return id(jobs.save(IngestionJobEntity(attemptId = id(attempt), state = JobState.QUEUED)))

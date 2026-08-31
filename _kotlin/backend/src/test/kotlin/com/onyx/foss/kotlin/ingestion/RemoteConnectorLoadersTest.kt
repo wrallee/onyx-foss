@@ -4,9 +4,12 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.RecordedRequest
 import org.junit.jupiter.api.Test
 import org.springframework.web.reactive.function.client.WebClient
 import java.util.Base64
+import java.time.Instant
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
@@ -96,6 +99,11 @@ class RemoteConnectorLoadersTest {
                 """[{"id":7,"number":7,"title":"Improve docs","body":"Pull request body","html_url":"https://github.test/onyx/foss/pull/7","updated_at":"2026-01-01T00:00:00Z"}]""",
             ),
         )
+        server.enqueue(
+            MockResponse().setHeader("Content-Type", "application/json").setBody(
+                """{"id":7,"number":7,"title":"Improve docs","body":"Pull request body","html_url":"https://github.test/onyx/foss/pull/7","updated_at":"2026-01-01T00:00:00Z"}""",
+            ),
+        )
         server.start()
         val base = server.url("/").toString().trimEnd('/')
         val docs = loaders().load(
@@ -110,6 +118,47 @@ class RemoteConnectorLoadersTest {
         assertEquals(1, docs.size)
         assertEquals("https://github.test/onyx/foss/pull/7", docs.single().id)
         assertEquals("Bearer token", server.takeRequest().getHeader("Authorization"))
+    }
+
+    @Test
+    fun activeGithubCheckpointResumesBeforeValidationRequest() = MockWebServer().use { server ->
+        val requested = mutableListOf<String>()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                requested += request.path.orEmpty()
+                return when {
+                    request.requestUrl!!.encodedPath.endsWith("/issues") -> MockResponse()
+                        .setHeader("Content-Type", "application/json")
+                        .setBody(
+                            """[{"id":1,"number":1,"title":"Issue","body":"Body","html_url":"https://github.test/onyx/foss/issues/1","updated_at":"2026-01-01T00:00:00Z"}]""",
+                        )
+                    else -> MockResponse().setResponseCode(500)
+                }
+            }
+        }
+        server.start()
+        val base = server.url("/").toString().trimEnd('/')
+        val checkpoint = GithubCheckpoint(
+            stage = GithubStage.ISSUES,
+            repositories = listOf(
+                GithubRepository(1, "foss", "onyx/foss", false, "https://github.test/onyx/foss", "main"),
+            ),
+            repository = GithubRepository(1, "foss", "onyx/foss", false, "https://github.test/onyx/foss", "main"),
+        )
+
+        val documents = loaders().load(
+            ConnectorSource.GITHUB,
+            mapper.readTree(
+                """{"github_base_url":"$base","repo_owner":"onyx","repositories":"foss","include_prs":false,"include_issues":true}""",
+            ),
+            mapper.readTree("""{"github_access_token":"token"}"""),
+            mapper.valueToTree(checkpoint),
+            Instant.EPOCH,
+            Instant.parse("2026-01-02T00:00:00Z"),
+        ).flatMap { it.documents }.toList()
+
+        assertEquals(listOf("https://github.test/onyx/foss/issues/1"), documents.map { it.id })
+        assertTrue(requested.first().contains("/issues"))
     }
 
     @Test
@@ -158,7 +207,7 @@ class RemoteConnectorLoadersTest {
             RemoteConnectorLoaders(
                 JiraConnectorLoader(http, mapper),
                 ConfluenceConnectorLoader(http, mapper).also { it.sleepMillis = {} },
-                GithubConnectorLoader(http, mapper).also { it.sleepMillis = {} },
+                GithubConnectorLoader(http, mapper, {}, Instant::now),
             )
         }
 }

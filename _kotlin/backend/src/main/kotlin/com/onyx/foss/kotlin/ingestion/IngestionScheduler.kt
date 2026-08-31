@@ -29,7 +29,10 @@ class IngestionScheduler(
             val refreshDue = pair.refreshFreq?.let { frequency ->
                 pair.lastAttemptAt?.plusSeconds(frequency)?.isAfter(now) != true
             } == true
-            if (pruneDue || refreshDue) admin.enqueuePair(pair.pairId, fromBeginning = pruneDue)
+            when {
+                pruneDue -> admin.enqueuePair(pair.pairId, fromBeginning = false, pruneOnly = true)
+                refreshDue -> admin.enqueuePair(pair.pairId, fromBeginning = false)
+            }
         }
     }
 }

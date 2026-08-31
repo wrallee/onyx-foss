@@ -31,6 +31,9 @@ import org.mockito.Mockito.anyList
 import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.doReturn
 import org.mockito.Mockito.doThrow
+import org.mockito.Mockito.verify
+import org.mockito.Mockito.verifyNoInteractions
+import org.mockito.Mockito.verifyNoMoreInteractions
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
@@ -352,14 +355,42 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
-    fun queuesFromBeginningRunWhenPruneFrequencyIsDue() {
+    fun scheduledPruneUsesPersistedSlimPathWithoutEmbeddingOrFullLoading() {
         val now = Instant.parse("2026-09-01T00:00:00Z")
-        val pairId = createPair(pruneFreq = 60, lastPrunedAt = now.minusSeconds(61))
+        val pairId = createPair(
+            pruneFreq = 60,
+            lastPrunedAt = now.minusSeconds(61),
+            source = ConnectorSource.GITHUB,
+        )
+        saveDocument(pairId, "seen")
+        saveDocument(pairId, "obsolete")
+        doReturn(
+            sequenceOf(
+                batch(1, false, SourceDocument(id = "seen", title = "", content = "")),
+            ),
+        ).`when`(remoteLoaders).loadSlim(
+            ConnectorSource.GITHUB,
+            mapper.createObjectNode(),
+            mapper.createObjectNode(),
+        )
 
         scheduler.scheduleDue(now)
-
         val queued = attempts.findAllByCcPairIdOrderByIdDesc(pairId).single()
-        assertThat(queued.fromBeginning).isTrue()
+        processor.process(requireNotNull(jobs.findAll().single().id))
+
+        val saved = attempts.findById(requireNotNull(queued.id)).orElseThrow()
+        assertThat(saved.pruneOnly).isTrue()
+        assertThat(saved.fromBeginning).isFalse()
+        assertThat(saved.docsRemovedFromIndex).isEqualTo(1)
+        assertThat(documents.findAll().map { it.sourceDocumentId }).containsExactly("seen")
+        assertThat(pairs.findById(pairId).orElseThrow().lastPrunedAt).isNotNull()
+        verify(remoteLoaders).loadSlim(
+            ConnectorSource.GITHUB,
+            mapper.createObjectNode(),
+            mapper.createObjectNode(),
+        )
+        verifyNoMoreInteractions(remoteLoaders)
+        verifyNoInteractions(embedder)
         assertThat(jobs.count()).isEqualTo(1)
     }
 

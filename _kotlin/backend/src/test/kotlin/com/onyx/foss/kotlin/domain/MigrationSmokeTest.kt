@@ -18,5 +18,11 @@ class MigrationSmokeTest : PostgresIntegrationTest() {
         )
         assertTrue("ingestion_jobs" in tables)
         assertTrue("indexed_documents" in tables)
+        assertTrue(
+            jdbc.queryForObject(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'ingestion_attempts' AND column_name = 'prune_only')",
+                Boolean::class.java,
+            ) == true,
+        )
     }
 }

@@ -20,17 +20,41 @@ class RemoteConnectorLoaders(
         end: Instant? = null,
     ): Sequence<ConnectorBatch> = when (source) {
         ConnectorSource.JIRA -> {
-            jira.validate(config, credentials)
+            if (!checkpoint.isActive()) jira.validate(config, credentials)
             jira.load(config, credentials, checkpoint, start = start, end = end)
         }
         ConnectorSource.CONFLUENCE -> {
-            confluence.validate(config, credentials)
+            if (!checkpoint.isActive()) confluence.validate(config, credentials)
             confluence.load(config, credentials, checkpoint, start = start, end = end)
         }
         ConnectorSource.GITHUB -> {
-            github.validate(config, credentials)
+            if (!checkpoint.isActive()) github.validate(config, credentials)
             github.load(config, credentials, checkpoint, start = start, end = end)
         }
         else -> error("Unsupported remote connector: ${source.value}")
     }
+
+    fun loadSlim(
+        source: ConnectorSource,
+        config: JsonNode?,
+        credentials: JsonNode,
+        includePermissions: Boolean = false,
+    ): Sequence<ConnectorBatch> = when (source) {
+        ConnectorSource.JIRA -> {
+            jira.validate(config, credentials)
+            jira.retrieveAllSlimDocuments(config, credentials, includePermissions = includePermissions)
+        }
+        ConnectorSource.CONFLUENCE -> {
+            confluence.validate(config, credentials)
+            confluence.retrieveAllSlimDocuments(config, credentials, includePermissions = includePermissions)
+        }
+        ConnectorSource.GITHUB -> {
+            github.validate(config, credentials)
+            github.retrieveAllSlimDocuments(config, credentials, includePermissions = includePermissions)
+        }
+        else -> error("Unsupported slim remote connector: ${source.value}")
+    }
+
+    private fun JsonNode?.isActive(): Boolean =
+        this?.path("hasMore")?.takeIf(JsonNode::isBoolean)?.asBoolean() == true
 }

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import org.springframework.http.HttpHeaders
+import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import org.springframework.web.reactive.function.client.WebClientResponseException
 import org.springframework.web.util.UriUtils
@@ -11,16 +12,22 @@ import java.net.URI
 import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
-import java.time.Duration
 import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.Base64
 
 enum class GithubStage {
     REPOSITORIES,
+    PERMISSIONS,
     PULL_REQUESTS,
     ISSUES,
     FILES,
+}
+
+enum class GithubPermissionStage {
+    COLLABORATORS,
+    USERS,
+    TEAMS,
 }
 
 data class GithubRepository(
@@ -42,6 +49,13 @@ data class GithubCheckpoint(
     val repositoryPage: Int = 1,
     val repositoryListingComplete: Boolean = false,
     val repositoryOwnerKind: String? = null,
+    val permissionStage: GithubPermissionStage = GithubPermissionStage.COLLABORATORS,
+    val permissionCollaboratorPage: Int = 1,
+    val permissionUserLogins: List<String> = emptyList(),
+    val permissionUserOffset: Int = 0,
+    val permissionTeamPage: Int = 1,
+    val permissionEmails: Set<String> = emptySet(),
+    val permissionTeamIds: Set<String> = emptySet(),
     val pullRequestPage: Int = 1,
     val pullRequestCursor: String? = null,
     val pullRequestsRetrieved: Int = 0,
@@ -69,12 +83,22 @@ class GithubRateLimitValidationException(message: String, cause: Throwable? = nu
 class GithubConnectorLoader(
     private val http: RemoteJsonClient,
     private val mapper: ObjectMapper,
+    private val sleepMillis: (Long) -> Unit,
+    private val nowSource: () -> Instant,
 ) {
+    @Autowired
+    constructor(http: RemoteJsonClient, mapper: ObjectMapper) : this(http, mapper, Thread::sleep, Instant::now)
+
     companion object {
         private const val PAGE_SIZE = 100
         private const val FILE_BATCH_SIZE = 100
         private const val MAX_FILE_SIZE_BYTES = 1_000_000
         private const val MAX_RATE_LIMIT_RETRIES = 5
+        private const val MAX_RATE_LIMIT_WAIT_SECONDS = 60 * 60L
+        private const val MAX_REPOSITORIES = 10_000
+        private const val MAX_FILE_PATHS = 100_000
+        private const val MAX_PERMISSION_ENTRIES = 5_000
+        private const val MAX_CHECKPOINT_BYTES = 8 * 1024 * 1024
         private val INDEXABLE_EXTENSIONS = setOf("md", "mdx", "markdown", "rst", "txt")
         private val INDEXABLE_NAMES = setOf(
             "readme", "license", "licence", "changelog", "contributing", "authors", "notice", "copying",
@@ -91,9 +115,6 @@ class GithubConnectorLoader(
             return extension in INDEXABLE_EXTENSIONS || (extension.isEmpty() && basename in INDEXABLE_NAMES)
         }
     }
-
-    internal var sleepMillis: (Long) -> Unit = Thread::sleep
-    internal var nowSource: () -> Instant = Instant::now
 
     fun load(
         config: JsonNode?,
@@ -192,12 +213,17 @@ class GithubConnectorLoader(
     ): Sequence<ConnectorBatch> = sequence {
         val context = context(config, credentials, includePermissions)
         var checkpoint = parseCheckpoint(checkpointNode).let { if (it.hasMore) it else GithubCheckpoint() }
-        val accessCache = mutableMapOf<String, ExternalAccess>()
         while (checkpoint.hasMore) {
             when (checkpoint.stage) {
                 GithubStage.REPOSITORIES -> {
-                    checkpoint = selectRepository(context, checkpoint)
-                    yield(batch(checkpoint))
+                    val result = selectRepository(context, checkpoint)
+                    checkpoint = result.checkpoint
+                    yield(batch(checkpoint, failures = result.failures))
+                }
+                GithubStage.PERMISSIONS -> {
+                    val result = processPermissions(context, checkpoint)
+                    checkpoint = result.checkpoint
+                    yield(batch(checkpoint, result.documents, result.failures))
                 }
                 GithubStage.PULL_REQUESTS -> {
                     if (!context.includePullRequests) {
@@ -211,7 +237,6 @@ class GithubConnectorLoader(
                         start,
                         end,
                         slim,
-                        accessCache,
                     )
                     checkpoint = result.checkpoint
                     yield(batch(checkpoint, result.documents, result.failures))
@@ -228,14 +253,13 @@ class GithubConnectorLoader(
                         start,
                         end,
                         slim,
-                        accessCache,
                     )
                     checkpoint = result.checkpoint
                     yield(batch(checkpoint, result.documents, result.failures))
                 }
                 GithubStage.FILES -> {
                     val result = if (context.includeFiles) {
-                        processFiles(context, checkpoint, start, slim, accessCache)
+                        processFiles(context, checkpoint, start, slim)
                     } else {
                         ProcessResult(checkpoint = advanceRepository(context, checkpoint))
                     }
@@ -246,30 +270,47 @@ class GithubConnectorLoader(
         }
     }
 
-    private fun selectRepository(context: Context, checkpoint: GithubCheckpoint): GithubCheckpoint {
+    private fun selectRepository(context: Context, checkpoint: GithubCheckpoint): ProcessResult {
         if (checkpoint.repository != null) {
-            return checkpoint.copy(stage = firstStage(context)).resetPageState()
+            return ProcessResult(
+                checkpoint = checkpoint.copy(stage = firstStage(context, checkpoint.repository)).resetPageState(),
+            )
         }
         if (context.repositoryNames.isNotEmpty()) {
-            if (checkpoint.repositoryIndex >= context.repositoryNames.size) return terminal(checkpoint)
-            val repository = parseRepository(
-                get(context, repositoryPath(context.owner, context.repositoryNames[checkpoint.repositoryIndex])).body,
-                context,
-            )
-            val repositories = checkpoint.repositories.toMutableList().also { saved ->
-                if (saved.none { it.fullName == repository.fullName }) saved += repository
+            if (checkpoint.repositoryIndex >= context.repositoryNames.size) {
+                return ProcessResult(checkpoint = terminal())
             }
-            return checkpoint.copy(
-                repository = repository,
-                repositories = repositories,
-                stage = firstStage(context),
-                repositoryListingComplete = true,
-            ).resetPageState()
+            val repositoryName = context.repositoryNames[checkpoint.repositoryIndex]
+            val repository = try {
+                parseRepository(get(context, repositoryPath(context.owner, repositoryName)).body, context)
+            } catch (_: WebClientResponseException.NotFound) {
+                return ProcessResult(
+                    failures = listOf(
+                        ConnectorFailure(
+                            FailureTarget.Entity("${context.owner}/$repositoryName"),
+                            "GitHub repository not found: ${context.owner}/$repositoryName",
+                            "github_repository_not_found",
+                        ),
+                    ),
+                    checkpoint = advanceRepository(context, checkpoint),
+                )
+            }
+            return ProcessResult(
+                checkpoint = checkpoint.copy(
+                    repository = repository,
+                    repositories = listOf(repository),
+                    stage = firstStage(context, repository),
+                    repositoryListingComplete = true,
+                ).resetPageState(),
+            )
         }
 
         if (checkpoint.repositoryListingComplete) {
-            val repository = checkpoint.repositories.getOrNull(checkpoint.repositoryIndex) ?: return terminal(checkpoint)
-            return checkpoint.copy(repository = repository, stage = firstStage(context)).resetPageState()
+            val repository = checkpoint.repositories.getOrNull(checkpoint.repositoryIndex)
+                ?: return ProcessResult(checkpoint = terminal())
+            return ProcessResult(
+                checkpoint = checkpoint.copy(repository = repository, stage = firstStage(context, repository)).resetPageState(),
+            )
         }
         val ownerKind = checkpoint.repositoryOwnerKind ?: "orgs"
         var resolvedOwnerKind = ownerKind
@@ -288,23 +329,105 @@ class GithubConnectorLoader(
         }
         require(page.isArray) { "GitHub repository listing was not an array" }
         val parsed = page.map { parseRepository(it, context) }
+        if (checkpoint.repositories.size + parsed.size > MAX_REPOSITORIES) {
+            checkpointLimit("repository count exceeds $MAX_REPOSITORIES")
+        }
         val repositories = checkpoint.repositories + parsed
         val listingComplete = parsed.size < PAGE_SIZE
         if (!listingComplete) {
-            return checkpoint.copy(
-                repositories = repositories,
-                repositoryPage = checkpoint.repositoryPage + 1,
-                repositoryOwnerKind = resolvedOwnerKind,
+            return ProcessResult(
+                checkpoint = checkpoint.copy(
+                    repositories = repositories,
+                    repositoryPage = checkpoint.repositoryPage + 1,
+                    repositoryOwnerKind = resolvedOwnerKind,
+                ),
             )
         }
-        val repository = repositories.firstOrNull() ?: return terminal(checkpoint.copy(repositoryListingComplete = true))
-        return checkpoint.copy(
-            repositories = repositories,
-            repository = repository,
-            repositoryListingComplete = true,
-            repositoryOwnerKind = resolvedOwnerKind,
-            stage = firstStage(context),
-        ).resetPageState()
+        val repository = repositories.firstOrNull() ?: return ProcessResult(
+            checkpoint = terminal(),
+        )
+        return ProcessResult(
+            checkpoint = checkpoint.copy(
+                repositories = repositories,
+                repository = repository,
+                repositoryListingComplete = true,
+                repositoryOwnerKind = resolvedOwnerKind,
+                stage = firstStage(context, repository),
+            ).resetPageState(),
+        )
+    }
+
+    private fun processPermissions(context: Context, checkpoint: GithubCheckpoint): ProcessResult {
+        val repository = requireNotNull(checkpoint.repository) { "GitHub checkpoint has no current repository" }
+        val next = when (checkpoint.permissionStage) {
+            GithubPermissionStage.COLLABORATORS -> {
+                val response = get(
+                    context,
+                    "${repositoryPath(context.owner, repository.name)}/collaborators" +
+                        "?affiliation=all&per_page=$PAGE_SIZE&page=${checkpoint.permissionCollaboratorPage}",
+                ).body
+                require(response.isArray) { "GitHub collaborator response was not an array" }
+                val emails = checkpoint.permissionEmails + response.mapNotNull { it.text("email") }
+                val logins = checkpoint.permissionUserLogins + response.mapNotNull { collaborator ->
+                    if (collaborator.text("email") == null) collaborator.text("login") else null
+                }
+                if (response.size() == PAGE_SIZE) {
+                    checkpoint.copy(
+                        permissionCollaboratorPage = checkpoint.permissionCollaboratorPage + 1,
+                        permissionEmails = emails,
+                        permissionUserLogins = logins.distinct(),
+                    )
+                } else {
+                    checkpoint.copy(
+                        permissionStage = if (logins.isEmpty()) GithubPermissionStage.TEAMS else GithubPermissionStage.USERS,
+                        permissionEmails = emails,
+                        permissionUserLogins = logins.distinct(),
+                    )
+                }
+            }
+            GithubPermissionStage.USERS -> {
+                val login = checkpoint.permissionUserLogins.getOrNull(checkpoint.permissionUserOffset)
+                    ?: return ProcessResult(checkpoint = checkpoint.copy(permissionStage = GithubPermissionStage.TEAMS))
+                val email = try {
+                    get(context, "/users/${segment(login)}").body.text("email")
+                } catch (_: WebClientResponseException.NotFound) {
+                    null
+                }
+                val offset = checkpoint.permissionUserOffset + 1
+                checkpoint.copy(
+                    permissionStage = if (offset == checkpoint.permissionUserLogins.size) {
+                        GithubPermissionStage.TEAMS
+                    } else {
+                        GithubPermissionStage.USERS
+                    },
+                    permissionUserOffset = offset,
+                    permissionEmails = checkpoint.permissionEmails + listOfNotNull(email),
+                )
+            }
+            GithubPermissionStage.TEAMS -> {
+                val response = get(
+                    context,
+                    "${repositoryPath(context.owner, repository.name)}/teams" +
+                        "?per_page=$PAGE_SIZE&page=${checkpoint.permissionTeamPage}",
+                ).body
+                require(response.isArray) { "GitHub team response was not an array" }
+                val teamIds = checkpoint.permissionTeamIds + response.mapNotNull {
+                    it.path("id").asText().takeIf(String::isNotBlank)
+                }
+                if (response.size() == PAGE_SIZE) {
+                    checkpoint.copy(
+                        permissionTeamPage = checkpoint.permissionTeamPage + 1,
+                        permissionTeamIds = teamIds,
+                    )
+                } else {
+                    checkpoint.copy(
+                        stage = firstContentStage(context),
+                        permissionTeamIds = teamIds,
+                    )
+                }
+            }
+        }
+        return ProcessResult(checkpoint = next)
     }
 
     private fun processCollection(
@@ -314,7 +437,6 @@ class GithubConnectorLoader(
         start: Instant?,
         end: Instant?,
         slim: Boolean,
-        accessCache: MutableMap<String, ExternalAccess>,
     ): ProcessResult {
         val repository = requireNotNull(checkpoint.repository) { "GitHub checkpoint has no current repository" }
         val pageNumber = if (type == CollectionType.PULL_REQUEST) checkpoint.pullRequestPage else checkpoint.issuePage
@@ -329,11 +451,7 @@ class GithubConnectorLoader(
         } catch (error: WebClientResponseException.NotFound) {
             CollectionPage(emptyList(), rawSize = 0, nextCursor = null, cursorMode = cursor != null)
         }
-        val access = if (context.includePermissions) {
-            accessCache.getOrPut(repository.fullName) { repositoryAccess(context, repository) }
-        } else {
-            null
-        }
+        val access = checkpointAccess(context, checkpoint, repository)
         val documents = mutableListOf<SourceDocument>()
         val failures = mutableListOf<ConnectorFailure>()
         var reachedStart = false
@@ -346,7 +464,21 @@ class GithubConnectorLoader(
             }
             if (!slim && end != null && updated != null && updated.isAfter(end)) return@forEach
             try {
-                documents += if (slim) slimDocument(item, access) else collectionDocument(repository, item, type, access)
+                val documentItem = if (!slim && type == CollectionType.PULL_REQUEST) {
+                    val number = item.path("number").asInt()
+                    require(number > 0) { "GitHub pull request number is missing" }
+                    get(
+                        context,
+                        "${repositoryPath(context.owner, repository.name)}/pulls/$number",
+                    ).body
+                } else {
+                    item
+                }
+                documents += if (slim) {
+                    slimDocument(documentItem, access)
+                } else {
+                    collectionDocument(repository, documentItem, type, access)
+                }
             } catch (error: Exception) {
                 val link = item.text("html_url")
                 failures += ConnectorFailure(
@@ -367,13 +499,13 @@ class GithubConnectorLoader(
                 checkpoint.copy(
                     pullRequestPage = page.nextOffsetPage ?: checkpoint.pullRequestPage + if (page.cursorMode) 0 else 1,
                     pullRequestCursor = page.nextCursor,
-                    pullRequestsRetrieved = checkpoint.pullRequestsRetrieved + page.rawSize,
+                    pullRequestsRetrieved = checkpoint.pullRequestsRetrieved + page.items.size,
                 )
             } else {
                 checkpoint.copy(
                     issuePage = page.nextOffsetPage ?: checkpoint.issuePage + if (page.cursorMode) 0 else 1,
                     issueCursor = page.nextCursor,
-                    issuesRetrieved = checkpoint.issuesRetrieved + page.rawSize,
+                    issuesRetrieved = checkpoint.issuesRetrieved + page.items.size,
                 )
             }
         } else if (type == CollectionType.PULL_REQUEST) {
@@ -442,7 +574,6 @@ class GithubConnectorLoader(
         checkpoint: GithubCheckpoint,
         start: Instant?,
         slim: Boolean,
-        accessCache: MutableMap<String, ExternalAccess>,
     ): ProcessResult {
         val repository = requireNotNull(checkpoint.repository) { "GitHub checkpoint has no current repository" }
         val branch = context.configuredBranch ?: repository.defaultBranch
@@ -471,10 +602,21 @@ class GithubConnectorLoader(
                         throw error
                     }
                 }
-                filePaths = tree.path("tree").filter { entry ->
-                    entry.path("type").asText() == "blob" &&
-                        isIndexablePath(entry.path("path").asText(), entry.path("size").takeIf(JsonNode::isNumber)?.asInt())
-                }.map { it.path("path").asText() }.sorted()
+                filePaths = mutableListOf<String>().also { paths ->
+                    tree.path("tree").forEach { entry ->
+                        if (
+                            entry.path("type").asText() == "blob" &&
+                            isIndexablePath(
+                                entry.path("path").asText(),
+                                entry.path("size").takeIf(JsonNode::isNumber)?.asInt(),
+                            )
+                        ) {
+                            if (paths.size == MAX_FILE_PATHS) checkpointLimit("file path count exceeds $MAX_FILE_PATHS")
+                            paths += entry.path("path").asText()
+                        }
+                    }
+                    paths.sort()
+                }
                 if (tree.path("truncated").asBoolean(false) && !slim) {
                     failures += ConnectorFailure(
                         FailureTarget.Entity("${repository.fullName}:files"),
@@ -484,11 +626,7 @@ class GithubConnectorLoader(
                 }
             }
         }
-        val access = if (context.includePermissions) {
-            accessCache.getOrPut(repository.fullName) { repositoryAccess(context, repository) }
-        } else {
-            null
-        }
+        val access = checkpointAccess(context, checkpoint, repository)
         val documents = mutableListOf<SourceDocument>()
         val selected = filePaths.drop(fileOffset).take(FILE_BATCH_SIZE)
         selected.forEach { path ->
@@ -630,39 +768,14 @@ class GithubConnectorLoader(
         )
     }
 
-    private fun repositoryAccess(context: Context, repository: GithubRepository): ExternalAccess {
-        if (!repository.isPrivate) return ExternalAccess(isPublic = true)
-        val emails = paginateArray(
-            context,
-            "${repositoryPath(context.owner, repository.name)}/collaborators?affiliation=all&per_page=$PAGE_SIZE",
-        ).mapNotNull { collaborator -> collaboratorEmail(context, collaborator) }.toSet()
-        val teamIds = paginateArray(
-            context,
-            "${repositoryPath(context.owner, repository.name)}/teams?per_page=$PAGE_SIZE",
-        ).mapNotNull { it.path("id").asText().takeIf(String::isNotBlank) }.toSet()
-        return ExternalAccess(emails, teamIds, isPublic = false)
-    }
-
-    private fun collaboratorEmail(context: Context, collaborator: JsonNode): String? {
-        collaborator.text("email")?.let { return it }
-        val login = collaborator.text("login") ?: return null
-        return try {
-            get(context, "/users/${segment(login)}").body.text("email")
-        } catch (_: WebClientResponseException.NotFound) {
-            null
-        }
-    }
-
-    private fun paginateArray(context: Context, initialPath: String): List<JsonNode> {
-        val results = mutableListOf<JsonNode>()
-        var page = 1
-        while (true) {
-            val response = get(context, "$initialPath&page=$page").body
-            require(response.isArray) { "GitHub list response was not an array" }
-            results += response.toList()
-            if (response.size() < PAGE_SIZE) return results
-            page += 1
-        }
+    private fun checkpointAccess(
+        context: Context,
+        checkpoint: GithubCheckpoint,
+        repository: GithubRepository,
+    ): ExternalAccess? = if (context.includePermissions) {
+        ExternalAccess(checkpoint.permissionEmails, checkpoint.permissionTeamIds, isPublic = !repository.isPrivate)
+    } else {
+        null
     }
 
     private fun advanceRepository(context: Context, checkpoint: GithubCheckpoint): GithubCheckpoint {
@@ -675,10 +788,10 @@ class GithubConnectorLoader(
                     repositoryListingComplete = true,
                 )
             } else {
-                terminal(checkpoint)
+                terminal()
             }
         }
-        val nextRepository = checkpoint.repositories.getOrNull(nextIndex) ?: return terminal(checkpoint)
+        val nextRepository = checkpoint.repositories.getOrNull(nextIndex) ?: return terminal()
         return GithubCheckpoint(
             repositories = checkpoint.repositories,
             repository = nextRepository,
@@ -686,16 +799,12 @@ class GithubConnectorLoader(
             repositoryPage = checkpoint.repositoryPage,
             repositoryListingComplete = true,
             repositoryOwnerKind = checkpoint.repositoryOwnerKind,
-            stage = firstStage(context),
+            stage = firstStage(context, nextRepository),
         )
     }
 
-    private fun terminal(checkpoint: GithubCheckpoint): GithubCheckpoint = checkpoint.copy(
-        hasMore = false,
-        stage = GithubStage.FILES,
-        pullRequestCursor = null,
-        issueCursor = null,
-    )
+    private fun terminal(): GithubCheckpoint =
+        GithubCheckpoint(hasMore = false, stage = GithubStage.FILES)
 
     private fun GithubCheckpoint.resetPageState(): GithubCheckpoint = copy(
         pullRequestPage = if (stage == GithubStage.PULL_REQUESTS) pullRequestPage else 1,
@@ -709,7 +818,10 @@ class GithubConnectorLoader(
         branch = if (stage == GithubStage.FILES) branch else null,
     )
 
-    private fun firstStage(context: Context): GithubStage = when {
+    private fun firstStage(context: Context, repository: GithubRepository): GithubStage =
+        if (context.includePermissions && repository.isPrivate) GithubStage.PERMISSIONS else firstContentStage(context)
+
+    private fun firstContentStage(context: Context): GithubStage = when {
         context.includePullRequests -> GithubStage.PULL_REQUESTS
         context.includeIssues -> GithubStage.ISSUES
         else -> GithubStage.FILES
@@ -719,32 +831,71 @@ class GithubConnectorLoader(
         checkpoint: GithubCheckpoint,
         documents: List<SourceDocument> = emptyList(),
         failures: List<ConnectorFailure> = emptyList(),
-    ): ConnectorBatch = ConnectorBatch(
-        documents = documents,
-        failures = failures,
-        checkpoint = ConnectorCheckpoint(mapper.valueToTree(checkpoint), checkpoint.hasMore),
-    )
+    ): ConnectorBatch {
+        ensureCheckpointBounds(checkpoint)
+        val value = mapper.valueToTree<JsonNode>(checkpoint)
+        if (mapper.writeValueAsBytes(value).size > MAX_CHECKPOINT_BYTES) {
+            checkpointLimit("serialized size exceeds $MAX_CHECKPOINT_BYTES bytes")
+        }
+        return ConnectorBatch(
+            documents = documents,
+            failures = failures,
+            checkpoint = ConnectorCheckpoint(value, checkpoint.hasMore),
+        )
+    }
 
     private fun parseCheckpoint(node: JsonNode?): GithubCheckpoint {
         if (node == null || node.isNull) return GithubCheckpoint()
+        if (mapper.writeValueAsBytes(node).size > MAX_CHECKPOINT_BYTES) {
+            checkpointLimit("serialized size exceeds $MAX_CHECKPOINT_BYTES bytes")
+        }
         validateCheckpointTypes(node)
         val checkpoint = try {
             mapper.treeToValue(node, GithubCheckpoint::class.java)
         } catch (error: Exception) {
             throw GithubConnectorValidationException("Invalid GitHub checkpoint: ${error.message}", error)
         }
-        if (
-            checkpoint.repositoryIndex < 0 || checkpoint.repositoryPage < 1 || checkpoint.pullRequestPage < 1 ||
-            checkpoint.issuePage < 1 || checkpoint.pullRequestsRetrieved < 0 || checkpoint.issuesRetrieved < 0 ||
-            checkpoint.fileOffset < 0
-        ) {
-            throw GithubConnectorValidationException("Invalid GitHub checkpoint: page and offset values must be positive")
-        }
+        ensureCheckpointBounds(checkpoint)
         if (checkpoint.hasMore && checkpoint.stage != GithubStage.REPOSITORIES && checkpoint.repository == null) {
             throw GithubConnectorValidationException("Invalid GitHub checkpoint: active stage has no repository")
         }
         return checkpoint
     }
+
+    private fun ensureCheckpointBounds(checkpoint: GithubCheckpoint) {
+        if (
+            checkpoint.repositoryIndex < 0 || checkpoint.repositoryPage < 1 || checkpoint.pullRequestPage < 1 ||
+            checkpoint.issuePage < 1 || checkpoint.pullRequestsRetrieved < 0 || checkpoint.issuesRetrieved < 0 ||
+            checkpoint.fileOffset < 0 || checkpoint.permissionCollaboratorPage < 1 || checkpoint.permissionTeamPage < 1 ||
+            checkpoint.permissionUserOffset < 0
+        ) {
+            throw GithubConnectorValidationException("Invalid GitHub checkpoint: page and offset values must be positive")
+        }
+        if (checkpoint.repositories.size > MAX_REPOSITORIES) checkpointLimit("repository count exceeds $MAX_REPOSITORIES")
+        if ((checkpoint.filePaths?.size ?: 0) > MAX_FILE_PATHS) checkpointLimit("file path count exceeds $MAX_FILE_PATHS")
+        if (checkpoint.filePaths == null && checkpoint.fileOffset != 0) {
+            throw GithubConnectorValidationException("Invalid GitHub checkpoint: file offset requires saved paths")
+        }
+        if (checkpoint.filePaths != null && checkpoint.fileOffset > checkpoint.filePaths.size) {
+            throw GithubConnectorValidationException("Invalid GitHub checkpoint: file offset exceeds saved paths")
+        }
+        if (checkpoint.permissionUserOffset > checkpoint.permissionUserLogins.size) {
+            throw GithubConnectorValidationException("Invalid GitHub checkpoint: user offset exceeds saved users")
+        }
+        val unresolvedUsers = checkpoint.permissionUserLogins.size - checkpoint.permissionUserOffset
+        if (checkpoint.permissionEmails.size + checkpoint.permissionTeamIds.size + unresolvedUsers > MAX_PERMISSION_ENTRIES) {
+            checkpointLimit("permission entries exceed $MAX_PERMISSION_ENTRIES")
+        }
+        if (
+            checkpoint.repositoryOwnerKind != null && checkpoint.repository != null && checkpoint.repositories.isNotEmpty() &&
+            checkpoint.repositoryIndex !in checkpoint.repositories.indices
+        ) {
+            throw GithubConnectorValidationException("Invalid GitHub checkpoint: repository index exceeds saved repositories")
+        }
+    }
+
+    private fun checkpointLimit(message: String): Nothing =
+        throw GithubConnectorValidationException("GitHub checkpoint limit exceeded: $message")
 
     private fun validateCheckpointTypes(node: JsonNode) {
         if (!node.isObject) throw GithubConnectorValidationException("Invalid GitHub checkpoint: expected an object")
@@ -753,11 +904,11 @@ class GithubConnectorLoader(
         }
         listOf(
             "repositoryIndex", "repositoryPage", "pullRequestPage", "pullRequestsRetrieved", "issuePage",
-            "issuesRetrieved", "fileOffset",
+            "issuesRetrieved", "fileOffset", "permissionCollaboratorPage", "permissionUserOffset", "permissionTeamPage",
         ).forEach { name ->
             node.get(name)?.let { if (!it.isIntegralNumber) invalidCheckpointType(name) }
         }
-        listOf("stage").forEach { name ->
+        listOf("stage", "permissionStage").forEach { name ->
             node.get(name)?.let { if (!it.isTextual) invalidCheckpointType(name) }
         }
         listOf("repositoryOwnerKind", "pullRequestCursor", "issueCursor", "branch").forEach { name ->
@@ -770,6 +921,14 @@ class GithubConnectorLoader(
         node.get("repository")?.let { if (!it.isNull) validateRepositoryTypes(it, "repository") }
         node.get("filePaths")?.let { paths ->
             if (!paths.isNull && (!paths.isArray || paths.any { !it.isTextual })) invalidCheckpointType("filePaths")
+        }
+        node.get("permissionUserLogins")?.let { users ->
+            if (!users.isArray || users.any { !it.isTextual }) invalidCheckpointType("permissionUserLogins")
+        }
+        listOf("permissionEmails", "permissionTeamIds").forEach { name ->
+            node.get(name)?.let { values ->
+                if (!values.isArray || values.any { !it.isTextual }) invalidCheckpointType(name)
+            }
         }
     }
 
@@ -792,6 +951,7 @@ class GithubConnectorLoader(
         val token = credentials.firstText("github_access_token", "access_token", "token")
             ?: throw GithubCredentialExpiredException("GitHub credentials do not contain an access token.")
         val names = config.text("repositories")?.split(',')?.map(String::trim)?.filter(String::isNotEmpty).orEmpty()
+        if (names.size > MAX_REPOSITORIES) checkpointLimit("repository count exceeds $MAX_REPOSITORIES")
         return Context(
             base = config.text("github_base_url") ?: "https://api.github.com",
             owner = owner,
@@ -811,14 +971,24 @@ class GithubConnectorLoader(
     }
 
     private fun get(context: Context, path: String, attempt: Int = 0): RemoteJsonResponse {
-        if (attempt > MAX_RATE_LIMIT_RETRIES) error("GitHub rate limit retry limit was exceeded")
+        if (attempt > MAX_RATE_LIMIT_RETRIES) {
+            throw GithubRateLimitValidationException("GitHub rate limit retry limit was exceeded")
+        }
         try {
             return http.getResponse(context.base, path, context.headers)
         } catch (error: WebClientResponseException) {
             if (!isRateLimited(error)) throw error
             val reset = error.headers.getFirst("X-RateLimit-Reset")?.toLongOrNull()
                 ?: throw GithubRateLimitValidationException("GitHub rate limit response did not include a reset time.", error)
-            val wait = Duration.between(nowSource(), Instant.ofEpochSecond(reset)).toMillis().coerceAtLeast(0)
+            val waitSeconds = try {
+                Math.subtractExact(reset, nowSource().epochSecond)
+            } catch (_: ArithmeticException) {
+                throw GithubRateLimitValidationException("GitHub rate limit reset time is outside the supported range.", error)
+            }
+            if (waitSeconds > MAX_RATE_LIMIT_WAIT_SECONDS) {
+                throw GithubRateLimitValidationException("GitHub rate limit reset wait exceeds one hour.", error)
+            }
+            val wait = waitSeconds.coerceAtLeast(0) * 1000
             sleepMillis(wait)
             return get(context, path, attempt + 1)
         }

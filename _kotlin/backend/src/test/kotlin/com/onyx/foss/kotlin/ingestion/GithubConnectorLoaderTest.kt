@@ -8,6 +8,7 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.jupiter.api.Test
+import org.springframework.web.reactive.function.client.WebClientResponseException
 import org.springframework.web.reactive.function.client.WebClient
 import java.time.Instant
 import java.util.Base64
@@ -31,6 +32,13 @@ class GithubConnectorLoaderTest {
             repositoryIndex = 2,
             repositoryPage = 3,
             repositories = listOf(repository("one"), repository("two")),
+            permissionStage = GithubPermissionStage.USERS,
+            permissionCollaboratorPage = 2,
+            permissionUserLogins = listOf("alice"),
+            permissionUserOffset = 1,
+            permissionTeamPage = 3,
+            permissionEmails = setOf("alice@example.com"),
+            permissionTeamIds = setOf("42"),
             pullRequestPage = 4,
             pullRequestCursor = "/pulls?after=pr",
             pullRequestsRetrieved = 12,
@@ -63,6 +71,86 @@ class GithubConnectorLoaderTest {
                 loader().load(config(server), credentials(), invalid).first()
             }
         }
+    }
+
+    @Test
+    fun githubCheckpointRejectsOffsetsBeyondSavedCollections() = MockWebServer().use { server ->
+        server.dispatcher = routes()
+        val invalid = checkpoint(
+            stage = GithubStage.FILES,
+            filePaths = listOf("README.md"),
+            fileOffset = 2,
+        )
+
+        assertFailsWith<GithubConnectorValidationException> {
+            loader().load(fileConfig(server), credentials(), mapper.valueToTree(invalid)).first()
+        }
+        Unit
+    }
+
+    @Test
+    fun githubCheckpointRejectsOversizedRepositoryAndFileCollections() = MockWebServer().use { server ->
+        server.dispatcher = routes()
+        val tooManyRepositories = GithubCheckpoint(
+            repositories = List(10_001) { repository("repo$it", id = it.toLong()) },
+        )
+        val tooManyFiles = checkpoint(
+            stage = GithubStage.FILES,
+            filePaths = List(100_001) { "doc$it.md" },
+        )
+
+        assertFailsWith<GithubConnectorValidationException> {
+            loader().load(config(server), credentials(), mapper.valueToTree(tooManyRepositories)).first()
+        }
+        assertFailsWith<GithubConnectorValidationException> {
+            loader().load(fileConfig(server), credentials(), mapper.valueToTree(tooManyFiles)).first()
+        }
+        Unit
+    }
+
+    @Test
+    fun configuredRepositoryListRejectsAboveCheckpointCeiling() = MockWebServer().use { server ->
+        server.dispatcher = routes()
+        val names = (1..10_001).joinToString(",") { "repo$it" }
+
+        assertFailsWith<GithubConnectorValidationException> {
+            loader().load(config(server, "\"repositories\":${mapper.writeValueAsString(names)}"), credentials(), null).first()
+        }
+        Unit
+    }
+
+    @Test
+    fun githubCheckpointRejectsOversizedSerializedState() = MockWebServer().use { server ->
+        server.dispatcher = routes()
+        val invalid = mapper.createObjectNode()
+            .put("hasMore", true)
+            .put("stage", "REPOSITORIES")
+            .put("pullRequestCursor", "x".repeat(8 * 1024 * 1024 + 1))
+
+        assertFailsWith<GithubConnectorValidationException> {
+            loader().load(config(server), credentials(), invalid).first()
+        }
+        Unit
+    }
+
+    @Test
+    fun permissionCheckpointStopsBeforeMoreThanFiveThousandEntries() = MockWebServer().use { server ->
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = json("""[{"id":5001}]""")
+        }
+        val active = checkpoint(stage = GithubStage.PERMISSIONS).copy(
+            permissionStage = GithubPermissionStage.TEAMS,
+            permissionEmails = (1..5_000).mapTo(mutableSetOf()) { "user$it@example.com" },
+        )
+
+        assertFailsWith<GithubConnectorValidationException> {
+            loader().load(
+                config(server, "\"include_permissions\":true"),
+                credentials(),
+                mapper.valueToTree(active),
+            ).first()
+        }
+        Unit
     }
 
     @Test
@@ -115,6 +203,36 @@ class GithubConnectorLoaderTest {
     }
 
     @Test
+    fun pullRequestListFetchesDetailBeforeConversion() = MockWebServer().use { server ->
+        val requested = mutableListOf<String>()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                requested += request.path.orEmpty()
+                return when (request.requestUrl!!.encodedPath) {
+                    "/repos/test-org/test-repo" -> json(repoJson())
+                    "/repos/test-org/test-repo/pulls" -> json(
+                        """[{"id":70,"number":7,"title":"PR 7","html_url":"https://github.test/test-org/test-repo/pull/7","updated_at":"2026-01-02T00:00:00Z"}]""",
+                    )
+                    "/repos/test-org/test-repo/pulls/7" -> json(
+                        pull(7, body = "detail body").replace("\"merged\":false", "\"merged\":true")
+                            .replace("\"commits\":2", "\"commits\":8")
+                            .replace("\"changed_files\":3", "\"changed_files\":9"),
+                    )
+                    else -> json("[]")
+                }
+            }
+        }
+
+        val document = loader().load(config(server), credentials(), null).flatMap { it.documents }.single()
+
+        assertEquals("detail body", document.content)
+        assertEquals(true, document.metadata["merged"])
+        assertEquals(8, document.metadata["num_commits"])
+        assertEquals(9, document.metadata["num_files_changed"])
+        assertTrue(requested.any { it.startsWith("/repos/test-org/test-repo/pulls/7") })
+    }
+
+    @Test
     fun loadFromCheckpointHappyPath() = MockWebServer().use { server ->
         server.dispatcher = routes(pulls = listOf(pull(1), pull(2)), issues = listOf(issue(3), issue(4)))
 
@@ -140,20 +258,57 @@ class GithubConnectorLoaderTest {
                     .setHeader("X-RateLimit-Remaining", "0")
                     .setHeader("X-RateLimit-Reset", "1010")
                 request.requestUrl!!.encodedPath.endsWith("/pulls") -> json("[${pull(1)}]")
+                request.requestUrl!!.encodedPath.endsWith("/pulls/1") -> json(pull(1))
                 else -> json("[]")
             }
         }
         val sleeps = mutableListOf<Long>()
-        val loader = loader().also {
-            it.nowSource = { Instant.ofEpochSecond(1000) }
-            it.sleepMillis = sleeps::add
-        }
+        val loader = loader(now = { Instant.ofEpochSecond(1000) }, sleep = sleeps::add)
 
         val documents = loader.load(config(server), credentials(), null).flatMap { it.documents }.toList()
 
         assertEquals(1, documents.size)
         assertEquals(listOf(10_000L), sleeps)
         assertEquals(2, pullsCalls)
+    }
+
+    @Test
+    fun rateLimitWaitAllowsExactOneHourBoundary() = MockWebServer().use { server ->
+        var pullsCalls = 0
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when {
+                request.requestUrl!!.encodedPath == "/repos/test-org/test-repo" -> json(repoJson())
+                request.requestUrl!!.encodedPath.endsWith("/pulls") && pullsCalls++ == 0 -> json("{}", 403)
+                    .setHeader("X-RateLimit-Remaining", "0")
+                    .setHeader("X-RateLimit-Reset", "4600")
+                request.requestUrl!!.encodedPath.endsWith("/pulls") -> json("[${pull(1)}]")
+                request.requestUrl!!.encodedPath.endsWith("/pulls/1") -> json(pull(1))
+                else -> json("[]")
+            }
+        }
+        val sleeps = mutableListOf<Long>()
+
+        loader(now = { Instant.ofEpochSecond(1000) }, sleep = sleeps::add)
+            .load(config(server), credentials(), null).toList()
+
+        assertEquals(listOf(3_600_000L), sleeps)
+    }
+
+    @Test
+    fun rateLimitWaitRejectsExcessiveResetEpoch() = MockWebServer().use { server ->
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when {
+                request.requestUrl!!.encodedPath == "/repos/test-org/test-repo" -> json(repoJson())
+                else -> json("{}", 403)
+                    .setHeader("X-RateLimit-Remaining", "0")
+                    .setHeader("X-RateLimit-Reset", Long.MAX_VALUE.toString())
+            }
+        }
+
+        assertFailsWith<GithubRateLimitValidationException> {
+            loader(now = { Instant.ofEpochSecond(1000) }, sleep = {}).load(config(server), credentials(), null).toList()
+        }
+        Unit
     }
 
     @Test
@@ -167,6 +322,29 @@ class GithubConnectorLoaderTest {
         ).toList()
 
         assertTrue(batches.flatMap { it.documents }.isEmpty())
+        assertFalse(batches.last().checkpoint.hasMore)
+    }
+
+    @Test
+    fun missingConfiguredRepositoryYieldsFailureAndContinues() = MockWebServer().use { server ->
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
+                "/repos/test-org/missing" -> json("{\"message\":\"Not Found\"}", 404)
+                "/repos/test-org/valid" -> json(repoJson(name = "valid", id = 2))
+                "/repos/test-org/valid/pulls" -> json("[${pull(1, repo = "valid")}]")
+                "/repos/test-org/valid/pulls/1" -> json(pull(1, repo = "valid"))
+                else -> json("[]")
+            }
+        }
+
+        val batches = loader().load(
+            config(server, "\"repositories\":\"missing,valid\""),
+            credentials(),
+            null,
+        ).toList()
+
+        assertEquals(listOf("github_repository_not_found"), batches.flatMap { it.failures }.map { it.errorType })
+        assertEquals(listOf("https://github.test/test-org/valid/pull/1"), batches.flatMap { it.documents }.map { it.id })
         assertFalse(batches.last().checkpoint.hasMore)
     }
 
@@ -268,6 +446,9 @@ class GithubConnectorLoaderTest {
                         json("{\"message\":\"use cursor pagination\"}", 422)
                     }
                     url.encodedPath.endsWith("/pulls") -> json("[${pull(1)},${pull(2)}]")
+                    "/pulls/" in url.encodedPath -> json(
+                        if (url.encodedPath.endsWith("/1")) pull(1) else pull(2),
+                    )
                     else -> json("[]")
                 }
             }
@@ -305,6 +486,7 @@ class GithubConnectorLoaderTest {
                 return when {
                     url.queryParameter("after") == "expired" -> json("{\"message\":\"Cursor expired\"}", 422)
                     url.encodedPath.endsWith("/pulls") -> json("[${pull(1)},${pull(2)},${pull(3)}]")
+                    "/pulls/" in url.encodedPath -> json(pull(url.encodedPath.substringAfterLast('/').toInt()))
                     else -> json("[]")
                 }
             }
@@ -322,14 +504,49 @@ class GithubConnectorLoaderTest {
     }
 
     @Test
+    fun repeatedCursorExpirationCountsOnlyUnseenItems() = MockWebServer().use { server ->
+        server.start()
+        val base = server.url("/").toString().trimEnd('/')
+        var restartCalls = 0
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val url = request.requestUrl!!
+                return when {
+                    url.queryParameter("after") != null -> json("{\"message\":\"Cursor expired\"}", 422)
+                    url.encodedPath.endsWith("/pulls") && restartCalls++ == 0 ->
+                        json("[${pull(1)},${pull(2)},${pull(3)}]")
+                            .setHeader("Link", "<$base/repos/test-org/test-repo/pulls?after=expired2>; rel=\"next\"")
+                    url.encodedPath.endsWith("/pulls") -> json("[${pull(1)},${pull(2)},${pull(3)},${pull(4)}]")
+                    "/pulls/" in url.encodedPath -> json(pull(url.encodedPath.substringAfterLast('/').toInt()))
+                    else -> json("[]")
+                }
+            }
+        }
+        val active = checkpoint(
+            stage = GithubStage.PULL_REQUESTS,
+            pullRequestCursor = "/repos/test-org/test-repo/pulls?after=expired1",
+            pullRequestsRetrieved = 2,
+        )
+
+        val batches = loader().load(config(server), credentials(), mapper.valueToTree(active)).toList()
+
+        val documentBatches = batches.filter { it.documents.isNotEmpty() }
+        assertEquals(listOf(3), documentBatches.first().documents.map { it.metadata["id"] })
+        assertEquals(3, checkpointOf(documentBatches.first()).pullRequestsRetrieved)
+        assertEquals(listOf(4), documentBatches.last().documents.map { it.metadata["id"] })
+    }
+
+    @Test
     fun loadFromCheckpointCursorPaginationCompletion() = MockWebServer().use { server ->
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 val url = request.requestUrl!!
                 return when {
                     url.encodedPath.endsWith("/repo1/pulls") -> json("[${pull(1, repo = "repo1")}]")
+                    url.encodedPath.endsWith("/repo1/pulls/1") -> json(pull(1, repo = "repo1"))
                     url.encodedPath == "/repos/test-org/repo2" -> json(repoJson("repo2", id = 2))
                     url.encodedPath.endsWith("/repo2/pulls") -> json("[${pull(2, repo = "repo2")}]")
+                    url.encodedPath.endsWith("/repo2/pulls/2") -> json(pull(2, repo = "repo2"))
                     else -> json("[]")
                 }
             }
@@ -435,6 +652,17 @@ class GithubConnectorLoaderTest {
         assertEquals(250, batches.sumOf { it.documents.size })
         assertEquals(listOf(100, 100, 50), batches.filter { it.documents.isNotEmpty() }.map { it.documents.size })
         assertFalse(batches.last().checkpoint.hasMore)
+    }
+
+    @Test
+    fun terminalCheckpointDropsMaterializedRepositoryAndFileLists() = MockWebServer().use { server ->
+        server.dispatcher = fileRoutes(mapOf("README.md" to "hello".toByteArray()))
+
+        val terminal = fileLoad(server).last().checkpoint.value
+
+        assertEquals(0, terminal.path("repositories").size())
+        assertEquals(0, terminal.path("filePaths").size())
+        assertEquals(0, terminal.path("permissionEmails").size())
     }
 
     @Test
@@ -632,6 +860,48 @@ class GithubConnectorLoaderTest {
     }
 
     @Test
+    fun permissionPaginationYieldsEachPageAndResumesAfterFailure() = MockWebServer().use { server ->
+        var failSecondPage = true
+        val firstPage = (1..100).map { mapOf("login" to "user$it", "email" to "user$it@example.com") }
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val url = request.requestUrl!!
+                return when {
+                    url.encodedPath == "/repos/test-org/test-repo" -> json(repoJson(private = true))
+                    url.encodedPath.endsWith("/collaborators") && url.queryParameter("page") == "1" ->
+                        json(mapper.writeValueAsString(firstPage))
+                    url.encodedPath.endsWith("/collaborators") && failSecondPage -> json("{}", 500)
+                    url.encodedPath.endsWith("/collaborators") -> json("[]")
+                    url.encodedPath.endsWith("/teams") -> json("[]")
+                    url.encodedPath.endsWith("/pulls") -> json("[${pull(1)}]")
+                    else -> json("[]")
+                }
+            }
+        }
+        val iterator = loader().load(
+            config(server, "\"include_permissions\":true"),
+            credentials(),
+            null,
+        ).iterator()
+
+        assertEquals("PERMISSIONS", checkpointOf(iterator.next()).stage.name)
+        val firstPermissionPage = iterator.next()
+        assertEquals(2, firstPermissionPage.checkpoint.value.path("permissionCollaboratorPage").asInt())
+        assertEquals(100, firstPermissionPage.checkpoint.value.path("permissionEmails").size())
+        assertFailsWith<WebClientResponseException.InternalServerError> { iterator.next() }
+
+        failSecondPage = false
+        val resumed = loader().load(
+            config(server, "\"include_permissions\":true"),
+            credentials(),
+            firstPermissionPage.checkpoint.value,
+        ).first()
+
+        assertEquals(100, resumed.checkpoint.value.path("permissionEmails").size())
+        assertEquals("TEAMS", resumed.checkpoint.value.path("permissionStage").asText())
+    }
+
+    @Test
     fun retrieveAllSlimDocsSkipsPrIssues() = MockWebServer().use { server ->
         server.dispatcher = routes(
             pulls = emptyList(),
@@ -647,7 +917,7 @@ class GithubConnectorLoaderTest {
     }
 
     @Test
-    fun pruningRoutesToSlimConnectorPath() = MockWebServer().use { server ->
+    fun slimRetrievalDoesNotCopyPullRequestBody() = MockWebServer().use { server ->
         server.dispatcher = routes(pulls = listOf(pull(1, body = "must not be copied")))
 
         val document = loader().retrieveAllSlimDocuments(config(server), credentials())
@@ -707,7 +977,10 @@ class GithubConnectorLoaderTest {
         assertNull(document.externalAccess)
     }
 
-    private fun loader() = GithubConnectorLoader(RemoteJsonClient(WebClient.builder()), mapper)
+    private fun loader(
+        now: () -> Instant = Instant::now,
+        sleep: (Long) -> Unit = {},
+    ) = GithubConnectorLoader(RemoteJsonClient(WebClient.builder()), mapper, sleep, now)
 
     private fun credentials(): JsonNode = mapper.readTree("""{"github_access_token":"token"}""")
 
@@ -771,6 +1044,11 @@ class GithubConnectorLoaderTest {
             val url = request.requestUrl!!
             return when {
                 url.encodedPath == "/repos/test-org/test-repo" -> json(repoJson())
+                "/pulls/" in url.encodedPath -> {
+                    val number = url.encodedPath.substringAfterLast('/').toInt()
+                    val detail = (pulls + cursorPulls).firstOrNull { mapper.readTree(it).path("number").asInt() == number }
+                    json(detail ?: "{}")
+                }
                 url.encodedPath.endsWith("/pulls") && url.queryParameter("after") != null ->
                     json(cursorPulls.joinToString(",", "[", "]"))
                 url.encodedPath.endsWith("/pulls") -> json(pulls.joinToString(",", "[", "]"))

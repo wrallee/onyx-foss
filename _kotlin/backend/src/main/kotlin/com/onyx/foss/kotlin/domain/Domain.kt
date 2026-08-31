@@ -173,6 +173,8 @@ class IngestionAttemptEntity(
     var status: AttemptStatus = AttemptStatus.NOT_STARTED,
     @Column(name = "from_beginning", nullable = false)
     var fromBeginning: Boolean = false,
+    @Column(name = "prune_only", nullable = false)
+    var pruneOnly: Boolean = false,
     @Column(name = "new_docs_indexed", nullable = false)
     var newDocsIndexed: Int = 0,
     @Column(name = "total_docs_indexed", nullable = false)

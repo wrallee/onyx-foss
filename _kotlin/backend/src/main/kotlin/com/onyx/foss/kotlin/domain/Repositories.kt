@@ -26,6 +26,7 @@ interface ConnectorCredentialPairRepository : JpaRepository<ConnectorCredentialP
                        SELECT MAX(attempt.time_updated)
                        FROM ingestion_attempts attempt
                        WHERE attempt.cc_pair_id = pair.id
+                         AND attempt.prune_only = FALSE
                    ) AS "lastAttemptAt"
             FROM connector_credential_pairs pair
             JOIN connectors connector ON connector.id = pair.connector_id
