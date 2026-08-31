@@ -9,19 +9,34 @@ curl_args=(--fail-with-body --silent --show-error --connect-timeout 5 --max-time
 work_dir="$(mktemp -d)"
 connector_id=""
 credential_id=""
+asset_id=""
 
 cleanup() {
+  asset_cleanup_safe=true
   if [[ -n "$connector_id" && -n "$credential_id" ]]; then
+    asset_cleanup_safe=false
     if ! curl "${curl_args[@]}" -X POST "$web_url/api/manage/admin/deletion-attempt" \
       -H 'Content-Type: application/json' \
       -d "{\"connector_id\":$connector_id,\"credential_id\":$credential_id}" >/dev/null; then
-      curl "${curl_args[@]}" -X DELETE "$web_url/api/manage/admin/connector/$connector_id" >/dev/null || true
+      if curl "${curl_args[@]}" -X DELETE "$web_url/api/manage/admin/connector/$connector_id" >/dev/null; then
+        asset_cleanup_safe=true
+      fi
+    else
+      asset_cleanup_safe=true
     fi
   elif [[ -n "$connector_id" ]]; then
-    curl "${curl_args[@]}" -X DELETE "$web_url/api/manage/admin/connector/$connector_id" >/dev/null || true
+    asset_cleanup_safe=false
+    if curl "${curl_args[@]}" -X DELETE "$web_url/api/manage/admin/connector/$connector_id" >/dev/null; then
+      asset_cleanup_safe=true
+    fi
   fi
   if [[ -n "$credential_id" ]]; then
     curl "${curl_args[@]}" -X DELETE "$web_url/api/manage/credential/$credential_id" >/dev/null || true
+  fi
+  if [[ "$asset_cleanup_safe" == "true" && "$asset_id" =~ ^[A-Za-z0-9-]+$ ]]; then
+    "${compose[@]}" exec -T api rm -f -- "/var/lib/onyx/files/$asset_id" || true
+    "${compose[@]}" exec -T postgres psql -U onyx -d onyx -c \
+      "DELETE FROM file_assets WHERE id = '$asset_id'" >/dev/null || true
   fi
   rm -rf "$work_dir"
 }
