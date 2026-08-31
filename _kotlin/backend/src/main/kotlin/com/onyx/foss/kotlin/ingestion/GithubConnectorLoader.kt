@@ -212,7 +212,9 @@ class GithubConnectorLoader(
         includePermissions: Boolean,
     ): Sequence<ConnectorBatch> = sequence {
         val context = context(config, credentials, includePermissions)
-        var checkpoint = parseCheckpoint(checkpointNode).let { if (it.hasMore) it else GithubCheckpoint() }
+        val savedCheckpoint = parseCheckpoint(checkpointNode)
+        validateRepositoryIndex(context, savedCheckpoint)
+        var checkpoint = if (savedCheckpoint.hasMore) savedCheckpoint else GithubCheckpoint()
         while (checkpoint.hasMore) {
             when (checkpoint.stage) {
                 GithubStage.REPOSITORIES -> {
@@ -886,11 +888,19 @@ class GithubConnectorLoader(
         if (checkpoint.permissionEmails.size + checkpoint.permissionTeamIds.size + unresolvedUsers > MAX_PERMISSION_ENTRIES) {
             checkpointLimit("permission entries exceed $MAX_PERMISSION_ENTRIES")
         }
-        if (
-            checkpoint.repositoryOwnerKind != null && checkpoint.repository != null && checkpoint.repositories.isNotEmpty() &&
-            checkpoint.repositoryIndex !in checkpoint.repositories.indices
-        ) {
-            throw GithubConnectorValidationException("Invalid GitHub checkpoint: repository index exceeds saved repositories")
+    }
+
+    private fun validateRepositoryIndex(context: Context, checkpoint: GithubCheckpoint) {
+        if (!checkpoint.hasMore) return
+        val available = if (context.repositoryNames.isNotEmpty()) {
+            context.repositoryNames.indices
+        } else if (checkpoint.repositoryOwnerKind != null || checkpoint.repositoryListingComplete) {
+            checkpoint.repositories.indices
+        } else {
+            return
+        }
+        if (checkpoint.repositoryIndex !in available) {
+            throw GithubConnectorValidationException("Invalid GitHub checkpoint: repository index exceeds available repositories")
         }
     }
 

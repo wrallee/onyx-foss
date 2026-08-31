@@ -89,6 +89,48 @@ class GithubConnectorLoaderTest {
     }
 
     @Test
+    fun discoveredRepositoryCheckpointRejectsIndexPastSavedList() = MockWebServer().use { server ->
+        server.dispatcher = routes()
+        val invalid = GithubCheckpoint(
+            stage = GithubStage.REPOSITORIES,
+            repositories = listOf(repository("only")),
+            repositoryIndex = 1,
+            repositoryListingComplete = true,
+            repositoryOwnerKind = "orgs",
+        )
+
+        assertFailsWith<GithubConnectorValidationException> {
+            loader().load(
+                config(server, "\"repositories\":\"\""),
+                credentials(),
+                mapper.valueToTree(invalid),
+            ).first()
+        }
+        assertEquals(0, server.requestCount)
+        Unit
+    }
+
+    @Test
+    fun configuredRepositoryCheckpointRejectsIndexPastConfiguredList() = MockWebServer().use { server ->
+        server.dispatcher = routes()
+        val invalid = GithubCheckpoint(
+            stage = GithubStage.REPOSITORIES,
+            repositoryIndex = 2,
+            repositoryListingComplete = true,
+        )
+
+        assertFailsWith<GithubConnectorValidationException> {
+            loader().load(
+                config(server, "\"repositories\":\"one,two\""),
+                credentials(),
+                mapper.valueToTree(invalid),
+            ).first()
+        }
+        assertEquals(0, server.requestCount)
+        Unit
+    }
+
+    @Test
     fun githubCheckpointRejectsOversizedRepositoryAndFileCollections() = MockWebServer().use { server ->
         server.dispatcher = routes()
         val tooManyRepositories = GithubCheckpoint(
