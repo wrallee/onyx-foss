@@ -112,6 +112,8 @@ class ConnectorCredentialPairEntity(
     var processingMode: String = "REGULAR",
     @Column(name = "in_repeated_error_state", nullable = false)
     var inRepeatedErrorState: Boolean = false,
+    @Column(name = "last_pruned_at")
+    var lastPrunedAt: Instant? = null,
     @CreationTimestamp @Column(name = "created_at", updatable = false)
     var createdAt: Instant? = null,
     @UpdateTimestamp @Column(name = "updated_at")
@@ -243,6 +245,9 @@ class IndexedDocumentEntity(
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(columnDefinition = "jsonb", nullable = false)
     var metadata: JsonNode? = null,
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "external_access", columnDefinition = "jsonb")
+    var externalAccess: JsonNode? = null,
     @Column(name = "last_synced", nullable = false)
     var lastSynced: Instant = Instant.now(),
     @Column(name = "last_modified")
@@ -260,6 +265,12 @@ class IngestionErrorEntity(
     var sourceDocumentId: String? = null,
     @Column(name = "document_link")
     var documentLink: String? = null,
+    @Column(name = "entity_id")
+    var entityId: String? = null,
+    @Column(name = "failed_time_range_start")
+    var failedTimeRangeStart: Instant? = null,
+    @Column(name = "failed_time_range_end")
+    var failedTimeRangeEnd: Instant? = null,
     @Column(name = "failure_message", nullable = false)
     var failureMessage: String = "",
     @Column(name = "error_type")
@@ -268,4 +279,25 @@ class IngestionErrorEntity(
     var isResolved: Boolean = false,
     @CreationTimestamp @Column(name = "created_at", updatable = false)
     var createdAt: Instant? = null,
+)
+
+@Entity
+@Table(name = "permission_sync_attempts")
+class PermissionSyncAttemptEntity(
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    var id: Long? = null,
+    @Column(name = "cc_pair_id", nullable = false)
+    var ccPairId: Long = 0,
+    @Enumerated(EnumType.STRING)
+    var status: AttemptStatus = AttemptStatus.NOT_STARTED,
+    @Column(name = "error_msg")
+    var errorMessage: String? = null,
+    @Column(name = "time_started")
+    var timeStarted: Instant? = null,
+    @Column(name = "time_finished")
+    var timeFinished: Instant? = null,
+    @CreationTimestamp @Column(name = "created_at", updatable = false)
+    var createdAt: Instant? = null,
+    @UpdateTimestamp @Column(name = "updated_at")
+    var updatedAt: Instant? = null,
 )

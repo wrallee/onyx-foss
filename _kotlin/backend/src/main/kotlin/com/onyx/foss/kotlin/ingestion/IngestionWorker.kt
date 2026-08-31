@@ -36,14 +36,6 @@ import java.security.MessageDigest
 import java.time.Instant
 import java.util.Base64
 
-data class SourceDocument(
-    val id: String,
-    val title: String,
-    val content: String,
-    val link: String? = null,
-    val metadata: Map<String, Any?> = emptyMap(),
-)
-
 @Component
 class IngestionWorker(
     private val properties: OnyxProperties,
@@ -140,6 +132,7 @@ class IngestionProcessor(
                     link = document.link
                     contentHash = hash(document.content)
                     metadata = mapper.valueToTree(document.metadata)
+                    externalAccess = document.externalAccess?.let(mapper::valueToTree)
                     lastSynced = Instant.now()
                 }
                 documents.save(indexedDocument)

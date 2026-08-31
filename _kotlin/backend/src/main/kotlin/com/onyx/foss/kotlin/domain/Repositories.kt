@@ -55,3 +55,5 @@ interface IngestionErrorRepository : JpaRepository<IngestionErrorEntity, Long> {
     fun findAllByAttemptIdOrderByIdDesc(attemptId: Long): List<IngestionErrorEntity>
     fun findAllByAttemptIdInOrderByIdDesc(attemptIds: Collection<Long>): List<IngestionErrorEntity>
 }
+
+interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptEntity, Long>
