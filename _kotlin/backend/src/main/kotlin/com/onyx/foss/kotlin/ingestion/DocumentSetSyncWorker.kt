@@ -12,6 +12,13 @@ import org.springframework.stereotype.Component
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import java.time.Instant
+import java.util.UUID
+
+data class DocumentSetSyncClaim(
+    val id: Long,
+    val token: UUID,
+    val ccPairIds: List<Long>,
+)
 
 @Service
 class DocumentSetSyncClaimService(
@@ -19,7 +26,7 @@ class DocumentSetSyncClaimService(
     private val jdbc: JdbcTemplate,
 ) {
     @Transactional
-    fun claimNext(now: Instant = Instant.now()): DocumentSetSyncOutboxEntity? {
+    fun claimNext(now: Instant = Instant.now()): DocumentSetSyncClaim? {
         jdbc.queryForObject(
             "SELECT id FROM document_set_sync_claim_lock WHERE id = 1 FOR UPDATE",
             Short::class.java,
@@ -33,30 +40,35 @@ class DocumentSetSyncClaimService(
         return outbox.lockNextPending()?.let { claim(it, now) }
     }
 
-    private fun claim(row: DocumentSetSyncOutboxEntity, now: Instant): DocumentSetSyncOutboxEntity {
+    private fun claim(row: DocumentSetSyncOutboxEntity, now: Instant): DocumentSetSyncClaim {
+        val token = UUID.randomUUID()
         row.status = DocumentSetSyncStatus.IN_PROGRESS
         row.attemptCount += 1
         row.lockedAt = now
-        return outbox.save(row)
+        row.claimToken = token
+        outbox.save(row)
+        return DocumentSetSyncClaim(
+            id = requireNotNull(row.id),
+            token = token,
+            ccPairIds = row.ccPairIds.orEmpty().map { it.asLong() }.distinct(),
+        )
     }
 
     @Transactional
-    fun complete(id: Long) {
-        val row = outbox.findById(id).orElseThrow()
-        row.status = DocumentSetSyncStatus.DONE
-        row.lastError = null
-        row.lockedAt = null
-        outbox.save(row)
-    }
+    fun renew(id: Long, token: UUID, now: Instant = Instant.now()): Boolean =
+        outbox.renewOwned(id, token, now) == 1
 
     @Transactional
-    fun retry(id: Long, error: Exception) {
-        val row = outbox.findById(id).orElseThrow()
-        row.status = DocumentSetSyncStatus.PENDING
-        row.lastError = (error.message ?: error::class.simpleName ?: "Document Set sync failed").take(2000)
-        row.lockedAt = null
-        outbox.save(row)
-    }
+    fun complete(id: Long, token: UUID): Boolean = outbox.completeOwned(id, token) == 1
+
+    @Transactional
+    fun retry(id: Long, token: UUID, error: Exception): Boolean = outbox.retryOwned(
+        id,
+        token,
+        (error.message ?: error::class.simpleName ?: "Document Set sync failed").take(2000),
+    ) == 1
+
+    private fun JsonNode?.orEmpty(): List<JsonNode> = if (this?.isArray == true) toList() else emptyList()
 
     private companion object {
         const val LEASE_SECONDS = 60 * 60L
@@ -77,18 +89,24 @@ class DocumentSetSyncWorker(
     }
 
     fun processNext(): Boolean {
-        val row = claims.claimNext() ?: return false
-        val rowId = requireNotNull(row.id)
+        val claim = claims.claimNext() ?: return false
+        return process(claim)
+    }
+
+    fun process(claim: DocumentSetSyncClaim): Boolean {
         try {
-            row.ccPairIds.orEmpty().map { it.asLong() }.distinct().forEach(::syncPair)
-            claims.complete(rowId)
+            claim.ccPairIds.forEach { pairId ->
+                if (!claims.renew(claim.id, claim.token)) return true
+                if (!syncPair(claim, pairId)) return true
+            }
+            claims.complete(claim.id, claim.token)
         } catch (error: Exception) {
-            claims.retry(rowId, error)
+            claims.retry(claim.id, claim.token, error)
         }
         return true
     }
 
-    private fun syncPair(pairId: Long) {
+    private fun syncPair(claim: DocumentSetSyncClaim, pairId: Long): Boolean {
         val names = jdbc.queryForList(
             """
                 SELECT document_set.name
@@ -103,15 +121,13 @@ class DocumentSetSyncWorker(
         var afterSourceDocumentId = ""
         while (true) {
             val page = documents.findPageByCcPairId(pairId, afterSourceDocumentId, DOCUMENT_PAGE_SIZE)
-            if (page.isEmpty()) return
+            if (page.isEmpty()) return true
+            if (!claims.renew(claim.id, claim.token)) return false
             indexer.updateDocumentSets(pairId, page.map { it.sourceDocumentId }.toSet(), names)
-            if (page.size < DOCUMENT_PAGE_SIZE) return
+            if (page.size < DOCUMENT_PAGE_SIZE) return true
             afterSourceDocumentId = page.last().sourceDocumentId
         }
     }
-
-    private fun JsonNode?.orEmpty(): List<JsonNode> =
-        if (this?.isArray == true) toList() else emptyList()
 
     private companion object {
         const val DOCUMENT_PAGE_SIZE = 500

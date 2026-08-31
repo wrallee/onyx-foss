@@ -28,6 +28,7 @@ import org.springframework.web.reactive.function.client.WebClient
 import reactor.core.publisher.Mono
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.time.Duration
 import java.time.Instant
 import java.util.Base64
 
@@ -439,7 +440,7 @@ class OpenSearchIndexer(
                     }
                 }
             }
-            .block()
+            .block(DOCUMENT_SET_UPDATE_TIMEOUT)
         val total = response?.path("total")?.asInt(-1) ?: -1
         val updated = response?.path("updated")?.asInt(-1) ?: -1
         val noops = response?.path("noops")?.asInt(-1) ?: -1
@@ -506,3 +507,5 @@ class OpenSearchIndexer(
         check(response == true) { "OpenSearch did not confirm the index write" }
     }
 }
+
+internal val DOCUMENT_SET_UPDATE_TIMEOUT: Duration = Duration.ofSeconds(30)

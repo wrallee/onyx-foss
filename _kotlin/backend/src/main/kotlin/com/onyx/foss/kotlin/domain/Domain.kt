@@ -17,6 +17,7 @@ import org.hibernate.annotations.JdbcTypeCode
 import org.hibernate.annotations.UpdateTimestamp
 import org.hibernate.type.SqlTypes
 import java.time.Instant
+import java.util.UUID
 
 enum class ConnectorSource(@get:JsonValue val value: String) {
     FILE("file"),
@@ -163,6 +164,8 @@ class DocumentSetSyncOutboxEntity(
     var lastError: String? = null,
     @Column(name = "locked_at")
     var lockedAt: Instant? = null,
+    @Column(name = "claim_token")
+    var claimToken: UUID? = null,
     @CreationTimestamp @Column(name = "created_at", updatable = false)
     var createdAt: Instant? = null,
     @UpdateTimestamp @Column(name = "updated_at")

@@ -11,6 +11,7 @@ import org.springframework.stereotype.Repository
 import org.springframework.transaction.annotation.Transactional
 import java.sql.Types
 import java.time.Instant
+import java.util.UUID
 
 interface CredentialRepository : JpaRepository<CredentialEntity, Long> {
     fun findAllBySource(source: ConnectorSource): List<CredentialEntity>
@@ -89,6 +90,65 @@ interface DocumentSetSyncOutboxRepository : JpaRepository<DocumentSetSyncOutboxE
         nativeQuery = true,
     )
     fun lockNextPending(): DocumentSetSyncOutboxEntity?
+
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(
+        value = """
+            UPDATE document_set_sync_outbox
+            SET locked_at = :now,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :id
+              AND claim_token = :token
+              AND status = 'IN_PROGRESS'
+        """,
+        nativeQuery = true,
+    )
+    fun renewOwned(
+        @Param("id") id: Long,
+        @Param("token") token: UUID,
+        @Param("now") now: Instant,
+    ): Int
+
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(
+        value = """
+            UPDATE document_set_sync_outbox
+            SET status = 'DONE',
+                claim_token = NULL,
+                locked_at = NULL,
+                last_error = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :id
+              AND claim_token = :token
+              AND status = 'IN_PROGRESS'
+        """,
+        nativeQuery = true,
+    )
+    fun completeOwned(@Param("id") id: Long, @Param("token") token: UUID): Int
+
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(
+        value = """
+            UPDATE document_set_sync_outbox
+            SET status = 'PENDING',
+                claim_token = NULL,
+                locked_at = NULL,
+                last_error = :message,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :id
+              AND claim_token = :token
+              AND status = 'IN_PROGRESS'
+        """,
+        nativeQuery = true,
+    )
+    fun retryOwned(
+        @Param("id") id: Long,
+        @Param("token") token: UUID,
+        @Param("message") message: String,
+    ): Int
 }
 
 interface FileAssetRepository : JpaRepository<FileAssetEntity, String>

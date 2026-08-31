@@ -7,6 +7,7 @@ import okhttp3.mockwebserver.MockWebServer
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import org.springframework.web.reactive.function.client.WebClient
+import java.time.Duration
 
 class OpenSearchIndexerTest {
     private val mapper = jacksonObjectMapper()
@@ -100,6 +101,11 @@ class OpenSearchIndexerTest {
             assertThat(body.path("script").path("params").path("document_sets").map { it.asText() })
                 .containsExactly("first", "second")
         }
+    }
+
+    @Test
+    fun documentSetUpdateTimeoutIsBelowTheLease() {
+        assertThat(DOCUMENT_SET_UPDATE_TIMEOUT).isLessThan(Duration.ofHours(1))
     }
 
     @Test

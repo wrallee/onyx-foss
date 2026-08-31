@@ -146,6 +146,41 @@ class DocumentSetSyncOutboxIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun currentTokenCanRenewCompleteAndRetry() {
+        outbox.save(DocumentSetSyncOutboxEntity(ccPairIds = mapper.valueToTree(listOf(1L))))
+        val now = Instant.parse("2026-09-01T00:00:00Z")
+        val completedClaim = requireNotNull(claims.claimNext(now))
+
+        assertThat(claims.renew(completedClaim.id, completedClaim.token, now.plusSeconds(30))).isTrue()
+        assertThat(claims.complete(completedClaim.id, completedClaim.token)).isTrue()
+        assertThat(outbox.findById(completedClaim.id).orElseThrow().status).isEqualTo(DocumentSetSyncStatus.DONE)
+
+        outbox.save(DocumentSetSyncOutboxEntity(ccPairIds = mapper.valueToTree(listOf(2L))))
+        val retriedClaim = requireNotNull(claims.claimNext(now.plusSeconds(60)))
+        assertThat(claims.retry(retriedClaim.id, retriedClaim.token, IllegalStateException("retry me"))).isTrue()
+        val retried = outbox.findById(retriedClaim.id).orElseThrow()
+        assertThat(retried.status).isEqualTo(DocumentSetSyncStatus.PENDING)
+        assertThat(retried.lastError).isEqualTo("retry me")
+    }
+
+    @Test
+    fun staleTokenCannotRenewCompleteOrRetryReclaimedWork() {
+        outbox.save(DocumentSetSyncOutboxEntity(ccPairIds = mapper.valueToTree(listOf(1L))))
+        val old = Instant.parse("2026-09-01T00:00:00Z")
+        val stale = requireNotNull(claims.claimNext(old))
+        val owner = requireNotNull(claims.claimNext(old.plusSeconds(61 * 60)))
+
+        assertThat(owner.id).isEqualTo(stale.id)
+        assertThat(owner.token).isNotEqualTo(stale.token)
+        assertThat(claims.renew(stale.id, stale.token, old.plusSeconds(62 * 60))).isFalse()
+        assertThat(claims.complete(stale.id, stale.token)).isFalse()
+        assertThat(claims.retry(stale.id, stale.token, IllegalStateException("stale"))).isFalse()
+        val row = outbox.findById(owner.id).orElseThrow()
+        assertThat(row.status).isEqualTo(DocumentSetSyncStatus.IN_PROGRESS)
+        assertThat(row.claimToken).isEqualTo(owner.token)
+    }
+
+    @Test
     fun crashedStaleClaimIsReclaimedBeforeNewerWorkAndCompletes() {
         val pairId = createPair()
         saveDocuments(pairId, 1)
@@ -215,6 +250,70 @@ class DocumentSetSyncOutboxIntegrationTest : PostgresIntegrationTest() {
             val secondRequest = requireNotNull(server.takeRequest(5, TimeUnit.SECONDS))
             assertThat(documentSetNames(firstRequest)).containsExactly("old")
             assertThat(documentSetNames(secondRequest)).containsExactly("latest")
+            assertThat(outbox.findAll().map { it.id to it.status }).containsExactly(
+                1L to DocumentSetSyncStatus.DONE,
+                2L to DocumentSetSyncStatus.DONE,
+            )
+        } finally {
+            releaseFirstResponse.countDown()
+            executor.shutdownNow()
+            server.dispatcher = QueueDispatcher()
+        }
+    }
+
+    @Test
+    fun reclaimedTokenFencesLateWorkerAndPreservesLatestFinalState() {
+        val pairId = createPair()
+        saveDocuments(pairId, 501)
+        val setId = admin.createSet(DocumentSetRequest(name = "old", ccPairIds = listOf(pairId)))
+        val claimA = requireNotNull(claims.claimNext())
+        val requestsBefore = server.requestCount
+        val firstRequestStarted = CountDownLatch(1)
+        val releaseFirstResponse = CountDownLatch(1)
+        server.dispatcher = object : Dispatcher() {
+            private var count = 0
+
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                count += 1
+                if (count == 1) {
+                    firstRequestStarted.countDown()
+                    releaseFirstResponse.await(10, TimeUnit.SECONDS)
+                }
+                return success(if (sourceIds(request).size == 500) 500 else 1)
+            }
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val workerA = executor.submit<Boolean> { worker.process(claimA) }
+            assertThat(firstRequestStarted.await(10, TimeUnit.SECONDS)).isTrue()
+            admin.updateSet(DocumentSetRequest(id = setId, name = "latest", ccPairIds = listOf(pairId)))
+            jdbc.update(
+                "UPDATE document_set_sync_outbox SET locked_at = ? WHERE id = ?",
+                java.sql.Timestamp.from(Instant.now().minusSeconds(2 * 60 * 60)),
+                claimA.id,
+            )
+            val claimB = requireNotNull(claims.claimNext())
+
+            assertThat(claimB.id).isEqualTo(claimA.id)
+            assertThat(claimB.token).isNotEqualTo(claimA.token)
+            assertThat(claims.complete(claimA.id, claimA.token)).isFalse()
+            assertThat(claims.retry(claimA.id, claimA.token, IllegalStateException("late"))).isFalse()
+            assertThat(claims.claimNext()).isNull()
+            releaseFirstResponse.countDown()
+            assertThat(workerA.get(10, TimeUnit.SECONDS)).isTrue()
+            assertThat(server.requestCount).isEqualTo(requestsBefore + 1)
+
+            assertThat(worker.process(claimB)).isTrue()
+            val claimRowTwo = requireNotNull(claims.claimNext())
+            assertThat(claimRowTwo.id).isEqualTo(2L)
+            assertThat(worker.process(claimRowTwo)).isTrue()
+
+            val requests = List(5) { requireNotNull(server.takeRequest(5, TimeUnit.SECONDS)) }
+            assertThat(documentSetNames(requests.first())).containsExactly("old")
+            assertThat(requests.drop(1).map(::documentSetNames)).allSatisfy {
+                assertThat(it).containsExactly("latest")
+            }
+            assertThat(documentSetNames(requests.last())).containsExactly("latest")
             assertThat(outbox.findAll().map { it.id to it.status }).containsExactly(
                 1L to DocumentSetSyncStatus.DONE,
                 2L to DocumentSetSyncStatus.DONE,
