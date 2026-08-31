@@ -88,9 +88,12 @@ class RemoteConnectorLoadersTest {
 
     @Test
     fun collectsGithubPullRequestsWithBearerAuthentication() = MockWebServer().use { server ->
+        val repository = """{"id":1,"name":"foss","full_name":"onyx/foss","private":false,"html_url":"https://github.test/onyx/foss","default_branch":"main"}"""
+        server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody(repository))
+        server.enqueue(MockResponse().setHeader("Content-Type", "application/json").setBody(repository))
         server.enqueue(
             MockResponse().setHeader("Content-Type", "application/json").setBody(
-                """[{"number":7,"title":"Improve docs","body":"Pull request body","html_url":"https://github.test/pr/7","updated_at":"2026-01-01"}]""",
+                """[{"id":7,"number":7,"title":"Improve docs","body":"Pull request body","html_url":"https://github.test/onyx/foss/pull/7","updated_at":"2026-01-01T00:00:00Z"}]""",
             ),
         )
         server.start()
@@ -102,10 +105,10 @@ class RemoteConnectorLoadersTest {
             ),
             mapper.readTree("""{"github_access_token":"token"}"""),
             null,
-        ).single().documents
+        ).flatMap { it.documents }.toList()
 
         assertEquals(1, docs.size)
-        assertEquals("onyx/foss/pull_request/7", docs.single().id)
+        assertEquals("https://github.test/onyx/foss/pull/7", docs.single().id)
         assertEquals("Bearer token", server.takeRequest().getHeader("Authorization"))
     }
 
@@ -153,9 +156,9 @@ class RemoteConnectorLoadersTest {
     private fun loaders(): RemoteConnectorLoaders =
         RemoteJsonClient(WebClient.builder()).let { http ->
             RemoteConnectorLoaders(
-                http,
                 JiraConnectorLoader(http, mapper),
                 ConfluenceConnectorLoader(http, mapper).also { it.sleepMillis = {} },
+                GithubConnectorLoader(http, mapper).also { it.sleepMillis = {} },
             )
         }
 }

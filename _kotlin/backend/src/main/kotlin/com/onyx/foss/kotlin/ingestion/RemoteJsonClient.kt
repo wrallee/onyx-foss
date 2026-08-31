@@ -1,6 +1,7 @@
 package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.databind.JsonNode
+import org.springframework.http.HttpHeaders
 import org.springframework.http.MediaType
 import org.springframework.stereotype.Service
 import org.springframework.web.reactive.function.client.WebClient
@@ -12,6 +13,11 @@ data class RemoteTextResponse(
     val body: String,
 )
 
+data class RemoteJsonResponse(
+    val body: JsonNode,
+    val headers: HttpHeaders,
+)
+
 @Service
 class RemoteJsonClient(
     private val clientBuilder: WebClient.Builder,
@@ -21,14 +27,21 @@ class RemoteJsonClient(
     }
 
     fun get(base: String, path: String, headers: Map<String, String>): JsonNode =
-        clientBuilder.clone().codecs { codecs ->
-            codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
-        }.build().get()
+        getResponse(base, path, headers).body
+
+    fun getResponse(base: String, path: String, headers: Map<String, String>): RemoteJsonResponse =
+        configuredClient().get()
             .uri(URI.create(base.trimEnd('/') + path))
             .accept(MediaType.APPLICATION_JSON)
             .headers { httpHeaders -> headers.forEach { (name, value) -> httpHeaders.set(name, value) } }
             .retrieve()
-            .bodyToMono(JsonNode::class.java)
+            .toEntity(JsonNode::class.java)
+            .map { response ->
+                RemoteJsonResponse(
+                    response.body ?: error("Remote connector returned an empty response"),
+                    response.headers,
+                )
+            }
             .block() ?: error("Remote connector returned an empty response")
 
     fun post(base: String, path: String, headers: Map<String, String>, body: Any): JsonNode =

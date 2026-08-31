@@ -1,20 +1,15 @@
 package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.node.JsonNodeFactory
 import com.onyx.foss.kotlin.domain.ConnectorSource
-import org.springframework.http.HttpHeaders
 import org.springframework.stereotype.Service
-import org.springframework.web.util.UriUtils
-import java.nio.charset.StandardCharsets
 import java.time.Instant
-import java.util.Base64
 
 @Service
 class RemoteConnectorLoaders(
-    private val http: RemoteJsonClient,
     private val jira: JiraConnectorLoader,
     private val confluence: ConfluenceConnectorLoader,
+    private val github: GithubConnectorLoader,
 ) {
     fun load(
         source: ConnectorSource,
@@ -23,177 +18,19 @@ class RemoteConnectorLoaders(
         checkpoint: JsonNode?,
         start: Instant? = null,
         end: Instant? = null,
-    ): Sequence<ConnectorBatch> {
-        if (source == ConnectorSource.JIRA) {
+    ): Sequence<ConnectorBatch> = when (source) {
+        ConnectorSource.JIRA -> {
             jira.validate(config, credentials)
-            return jira.load(config, credentials, checkpoint, start = start, end = end)
+            jira.load(config, credentials, checkpoint, start = start, end = end)
         }
-        if (source == ConnectorSource.CONFLUENCE) {
+        ConnectorSource.CONFLUENCE -> {
             confluence.validate(config, credentials)
-            return confluence.load(config, credentials, checkpoint, start = start, end = end)
+            confluence.load(config, credentials, checkpoint, start = start, end = end)
         }
-        val documents = when (source) {
-            ConnectorSource.GITHUB -> github(config, credentials, checkpoint)
-            else -> error("Unsupported remote connector: " + source.value)
+        ConnectorSource.GITHUB -> {
+            github.validate(config, credentials)
+            github.load(config, credentials, checkpoint, start = start, end = end)
         }
-        return sequenceOf(
-            ConnectorBatch(
-                documents = documents,
-                checkpoint = ConnectorCheckpoint(
-                    JsonNodeFactory.instance.objectNode()
-                        .put("last_success_at", Instant.now().toString())
-                        .put("documents", documents.size),
-                    hasMore = false,
-                ),
-            ),
-        )
+        else -> error("Unsupported remote connector: ${source.value}")
     }
-
-    private fun github(config: JsonNode?, credentials: JsonNode, checkpoint: JsonNode?): List<SourceDocument> {
-        val base = config?.text("github_base_url") ?: "https://api.github.com"
-        val owner = required(config, "repo_owner", "owner")
-        val state = config?.text("state_filter") ?: "all"
-        val headers = auth(credentials, basic = false) + mapOf("Accept" to "application/vnd.github+json")
-        val configured = config?.text("repositories")?.split(",")?.map(String::trim)?.filter(String::isNotBlank).orEmpty()
-        val repos = if (configured.isNotEmpty()) configured else paginate(base, "/users/" + segment(owner) + "/repos?per_page=100", headers)
-            .map { it.path("name").asText() }.filter(String::isNotBlank)
-        val result = mutableListOf<SourceDocument>()
-        repos.forEach { repo ->
-            if (config?.path("include_prs")?.asBoolean(true) != false) {
-                githubItems(base, owner, repo, "pulls", state, headers, result, "pull_request")
-            }
-            if (config?.path("include_issues")?.asBoolean(false) == true) {
-                githubItems(base, owner, repo, "issues", state, headers, result, "issue")
-            }
-            if (config?.path("include_files")?.asBoolean(false) == true) {
-                githubFiles(base, owner, repo, config?.text("branch"), headers, result)
-            }
-        }
-        return afterCheckpoint(result, checkpoint)
-    }
-
-    private fun githubItems(
-        base: String,
-        owner: String,
-        repo: String,
-        type: String,
-        state: String,
-        headers: Map<String, String>,
-        output: MutableList<SourceDocument>,
-        source: String,
-    ) {
-        paginate(
-            base,
-            "/repos/" + segment(owner) + "/" + segment(repo) + "/" + type + "?state=" + query(state) + "&per_page=100&sort=updated&direction=desc",
-            headers,
-        ).forEach { item ->
-            if (source == "issue" && item.has("pull_request")) return@forEach
-            val number = item.path("number").asInt()
-            output += SourceDocument(
-                id = owner + "/" + repo + "/" + source + "/" + number,
-                title = item.path("title").asText(),
-                content = item.path("body").asText().ifBlank { item.path("title").asText() },
-                link = item.path("html_url").asText(null),
-                metadata = mapOf("source" to "github", "repository" to owner + "/" + repo, "updated" to item.path("updated_at").asText()),
-            )
-        }
-    }
-
-    private fun githubFiles(
-        base: String,
-        owner: String,
-        repo: String,
-        branch: String?,
-        headers: Map<String, String>,
-        output: MutableList<SourceDocument>,
-    ) {
-        val ref = branch?.takeIf(String::isNotBlank) ?: "HEAD"
-        val tree = http.get(
-            base,
-            "/repos/" + segment(owner) + "/" + segment(repo) + "/git/trees/" + query(ref) + "?recursive=1",
-            headers,
-        ).path("tree")
-        tree.filter {
-            it.path("type").asText() == "blob" &&
-                (it.path("path").asText().endsWith(".md", true) ||
-                    it.path("path").asText().endsWith(".txt", true) ||
-                    it.path("path").asText().endsWith(".rst", true))
-        }.take(500).forEach { entry ->
-            val path = entry.path("path").asText()
-            val encodedPath = path.split("/").joinToString("/") { segment(it) }
-            val response = http.get(
-                base,
-                "/repos/" + segment(owner) + "/" + segment(repo) + "/contents/" + encodedPath + "?ref=" + query(ref),
-                headers,
-            )
-            val raw = response.path("content").asText().replace("\n", "")
-            if (raw.isBlank()) return@forEach
-            val content = String(Base64.getDecoder().decode(raw), StandardCharsets.UTF_8)
-            output += SourceDocument(
-                id = owner + "/" + repo + "/file/" + path,
-                title = repo + "/" + path,
-                content = content,
-                link = response.path("html_url").asText(null),
-                metadata = mapOf("source" to "github", "repository" to owner + "/" + repo, "path" to path),
-            )
-        }
-    }
-
-    private fun paginate(base: String, initialPath: String, headers: Map<String, String>): List<JsonNode> {
-        val output = mutableListOf<JsonNode>()
-        var page = 1
-        while (page <= 100) {
-            val separator = if (initialPath.contains("?")) "&" else "?"
-            val response = http.get(base, initialPath + separator + "page=" + page, headers)
-            if (!response.isArray || response.isEmpty) break
-            output.addAll(response.toList())
-            if (response.size() < 100) break
-            page += 1
-        }
-        return output
-    }
-    private fun afterCheckpoint(documents: List<SourceDocument>, checkpoint: JsonNode?): List<SourceDocument> {
-        val since = checkpoint?.path("last_success_at")?.asText()?.takeIf(String::isNotBlank) ?: return documents
-        val checkpointInstant = runCatching { Instant.parse(since) }.getOrNull() ?: return documents
-        return documents.filter { document ->
-            val updated = document.metadata["updated"]?.toString()?.takeIf(String::isNotBlank) ?: return@filter true
-            runCatching { Instant.parse(updated).isAfter(checkpointInstant) }.getOrDefault(true)
-        }
-    }
-
-
-
-
-
-    private fun auth(credentials: JsonNode, basic: Boolean): Map<String, String> {
-        val token = credentials.firstText(
-            "jira_api_token",
-            "confluence_access_token",
-            "github_access_token",
-            "api_token",
-            "access_token",
-            "token",
-        )
-            ?: error("Connector credential does not contain an access token")
-        val username = credentials.firstText("jira_email", "confluence_username", "email", "username")
-        val value = if (basic && !username.isNullOrBlank()) {
-            "Basic " + Base64.getEncoder().encodeToString((username + ":" + token).toByteArray(StandardCharsets.UTF_8))
-        } else {
-            "Bearer " + token
-        }
-        return mapOf(HttpHeaders.AUTHORIZATION to value)
-    }
-
-    private fun required(node: JsonNode?, vararg names: String): String =
-        node?.firstText(*names) ?: error("Connector configuration is missing " + names.first())
-
-    private fun JsonNode.text(name: String): String? = path(name).asText().takeIf(String::isNotBlank)
-
-    private fun JsonNode.firstText(vararg names: String): String? =
-        names.asSequence().mapNotNull { text(it) }.firstOrNull()
-
-    private fun query(value: String): String = UriUtils.encodeQueryParam(value, StandardCharsets.UTF_8)
-
-    private fun segment(value: String): String = UriUtils.encodePathSegment(value, StandardCharsets.UTF_8)
-
 }
