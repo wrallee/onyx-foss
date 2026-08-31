@@ -11,16 +11,32 @@ import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
+import java.time.Instant
 
 @Service
 class DocumentSetSyncClaimService(
     private val outbox: DocumentSetSyncOutboxRepository,
+    private val jdbc: JdbcTemplate,
 ) {
     @Transactional
-    fun claimNext(): DocumentSetSyncOutboxEntity? {
-        val row = outbox.lockNextPending() ?: return null
+    fun claimNext(now: Instant = Instant.now()): DocumentSetSyncOutboxEntity? {
+        jdbc.queryForObject(
+            "SELECT id FROM document_set_sync_claim_lock WHERE id = 1 FOR UPDATE",
+            Short::class.java,
+        )
+        val active = outbox.lockOldestInProgress()
+        if (active != null) {
+            val lockedAt = active.lockedAt
+            if (lockedAt != null && !lockedAt.isBefore(now.minusSeconds(LEASE_SECONDS))) return null
+            return claim(active, now)
+        }
+        return outbox.lockNextPending()?.let { claim(it, now) }
+    }
+
+    private fun claim(row: DocumentSetSyncOutboxEntity, now: Instant): DocumentSetSyncOutboxEntity {
         row.status = DocumentSetSyncStatus.IN_PROGRESS
         row.attemptCount += 1
+        row.lockedAt = now
         return outbox.save(row)
     }
 
@@ -29,6 +45,7 @@ class DocumentSetSyncClaimService(
         val row = outbox.findById(id).orElseThrow()
         row.status = DocumentSetSyncStatus.DONE
         row.lastError = null
+        row.lockedAt = null
         outbox.save(row)
     }
 
@@ -37,7 +54,12 @@ class DocumentSetSyncClaimService(
         val row = outbox.findById(id).orElseThrow()
         row.status = DocumentSetSyncStatus.PENDING
         row.lastError = (error.message ?: error::class.simpleName ?: "Document Set sync failed").take(2000)
+        row.lockedAt = null
         outbox.save(row)
+    }
+
+    private companion object {
+        const val LEASE_SECONDS = 60 * 60L
     }
 }
 

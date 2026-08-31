@@ -161,6 +161,8 @@ class DocumentSetSyncOutboxEntity(
     var attemptCount: Int = 0,
     @Column(name = "last_error")
     var lastError: String? = null,
+    @Column(name = "locked_at")
+    var lockedAt: Instant? = null,
     @CreationTimestamp @Column(name = "created_at", updatable = false)
     var createdAt: Instant? = null,
     @UpdateTimestamp @Column(name = "updated_at")

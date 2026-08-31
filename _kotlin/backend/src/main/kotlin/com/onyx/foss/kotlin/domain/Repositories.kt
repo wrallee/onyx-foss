@@ -69,6 +69,18 @@ interface DocumentSetSyncOutboxRepository : JpaRepository<DocumentSetSyncOutboxE
     @Query(
         value = """
             SELECT * FROM document_set_sync_outbox
+            WHERE status = 'IN_PROGRESS'
+            ORDER BY id
+            FOR UPDATE
+            LIMIT 1
+        """,
+        nativeQuery = true,
+    )
+    fun lockOldestInProgress(): DocumentSetSyncOutboxEntity?
+
+    @Query(
+        value = """
+            SELECT * FROM document_set_sync_outbox
             WHERE status = 'PENDING'
             ORDER BY id
             FOR UPDATE SKIP LOCKED
