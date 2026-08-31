@@ -1,14 +1,14 @@
 # Onyx FOSS Kotlin port
 
-This project keeps the approved local FOSS admin UI and replaces the supported
-management and ingestion backend with Kotlin.
+This branch keeps the approved local FOSS admin UI and Kotlin management backend,
+and uses a Python 3.13 model-server for both embedding and reranking.
 
 ## Supported scope
 
 - File, Jira, Confluence, and GitHub connector administration and collection
 - Connector credentials encrypted at rest with AES-GCM
 - PostgreSQL-backed jobs, attempts, checkpoints, and document sets
-- Tika extraction, Kotlin model-server calls, and OpenSearch indexing
+- Tika extraction, Python model-server calls, and OpenSearch indexing
 - Authentication-free admin UI for local or private networks
 
 All other connector cards and unrelated admin routes remain visible but are
@@ -17,8 +17,9 @@ but disabled.
 
 ## Model artifacts
 
-The selected model-server implementation is Kotlin. The following pinned,
-Apache-2.0 artifacts are downloaded under the ignored `models/` directory:
+The selected model-server implementation on this branch is Python 3.13. The
+following pinned, Apache-2.0 artifacts are downloaded under the ignored `models/`
+directory:
 
 - Granite 311M Multilingual R2 INT8 OpenVINO embedding
 - GTE multilingual reranker-base
@@ -26,12 +27,12 @@ Apache-2.0 artifacts are downloaded under the ignored `models/` directory:
 
 See `MODELS.md` for revisions and SHA-256 values.
 
-The Kotlin service runs the real Granite INT8 OpenVINO model through JNA and the
-OpenVINO C API. DJL loads the exact Hugging Face tokenizer. The service returns
-768-dimensional CLS-pooled vectors with optional L2 normalization and never
-calls Python or fabricates output. GTE and BGE reranking remain separate
-candidates and return `RERANKER_EXPORT_NOT_CONFIGURED` until a selected export
-passes the golden score suite. Reranker readiness does not block ingestion.
+The Python service runs Granite INT8 through the OpenVINO Python API and GTE
+through its pinned PyTorch custom model code. It exposes the existing Onyx
+embedding and cross-encoder endpoints. The Kotlin backend can submit candidate
+arrays to `/manage/search/rerank`; it sorts by returned scores and preserves the
+retrieval order if the reranker is unavailable. BGE remains selectable through
+`RERANKER_MODEL` and `RERANKER_MODEL_PATH`.
 
 ## Run
 
@@ -39,8 +40,7 @@ Download the pinned Granite artifact, then create the local environment file and
 
 ```bash
 cd _kotlin
-python3 scripts/download_models.py
-# Add --with-rerankers to also download GTE and BGE.
+python3 scripts/download_models.py --with-rerankers
 cp .env.example .env
 openssl rand -base64 32
 # Paste the result into ONYX_CREDENTIAL_ENCRYPTION_KEY in .env.
@@ -50,8 +50,7 @@ docker compose up -d
 ```
 
 The default profile starts the UI, API, PostgreSQL, and OpenSearch. The worker
-and Kotlin model-server are in the `ingestion` profile. The downloaded Granite
-artifact passes readiness, so enable ingestion with:
+and Python model-server are in the `ingestion` profile. Enable them with:
 
 ```bash
 docker compose --profile ingestion up -d
@@ -66,9 +65,12 @@ Open `http://localhost:3000`. Only the Web service is published to the host.
 docker run --rm -v "$PWD/backend:/workspace" -w /workspace \
   gradle:8.14.3-jdk21 gradle test --no-daemon
 
-# Kotlin model-server
-docker run --rm -v "$PWD:/workspace" -w /workspace/model-server \
-  gradle:8.14.4-jdk21 gradle test --no-daemon
+# Python model-server
+cd python-model-server
+python3.13 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/pytest -q
+cd ..
 
 # Frontend (Node.js 24)
 cd web

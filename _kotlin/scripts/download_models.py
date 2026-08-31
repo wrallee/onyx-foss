@@ -73,6 +73,7 @@ def sha256(path: Path) -> str:
 
 def download(repo: str, revision: str, remote: str, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
+    target.parent.chmod(0o755)
     partial = target.with_suffix(target.suffix + ".partial")
     url = (
         f"https://huggingface.co/{repo}/resolve/{revision}/"
@@ -98,6 +99,7 @@ def download(repo: str, revision: str, remote: str, target: Path) -> None:
                 print(f"  {completed // (1024 * 1024)}{total_text} MiB", flush=True)
                 report_at += 128 * 1024 * 1024
     os.replace(partial, target)
+    target.chmod(0o644)
 
 
 def install(name: str) -> None:
@@ -122,6 +124,39 @@ def install(name: str) -> None:
             print(f"Verified {remote}")
 
 
+GTE_REMOTE_CODE = {
+    "repo": "Alibaba-NLP/new-impl",
+    "revision": "40ced75c3017eb27626c9d4ea981bde21a2662f4",
+    "files": {
+        "configuration.py": "3411088045ffb8a9a0aa9936eae275896b39983a2ee5b08f091b44e6289e4fe4",
+        "modeling.py": "374670b416fcc82f081c9cd28b5fd61c2bd91bbe18eb4798fcc48a81f9c250a0",
+    },
+}
+
+
+def install_gte_remote_code() -> None:
+    destination = MODELS / SPECS["gte"]["directory"] / "remote_code"
+    destination.mkdir(parents=True, exist_ok=True)
+    for remote, expected in GTE_REMOTE_CODE["files"].items():
+        target = destination / remote
+        if target.is_file() and sha256(target) == expected:
+            print(f"Using verified {target.relative_to(ROOT)}")
+            continue
+        download(
+            GTE_REMOTE_CODE["repo"],
+            GTE_REMOTE_CODE["revision"],
+            remote,
+            target,
+        )
+        actual = sha256(target)
+        if actual != expected:
+            target.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"SHA-256 mismatch for {remote}: expected {expected}, got {actual}"
+            )
+        print(f"Verified {remote}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -134,6 +169,7 @@ def main() -> None:
     install("granite")
     if args.with_rerankers:
         install("gte")
+        install_gte_remote_code()
         install("bge")
     print("Model download complete.")
 

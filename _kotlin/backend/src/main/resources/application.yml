@@ -35,6 +35,11 @@ onyx:
     model-name: ${ONYX_EMBEDDING_MODEL_NAME:}
     max-context-length: ${ONYX_EMBEDDING_MAX_CONTEXT_LENGTH:512}
     normalize-embeddings: ${ONYX_EMBEDDING_NORMALIZE:true}
+    reranker-enabled: ${ONYX_RERANKER_ENABLED:true}
+    reranker-model-name: ${ONYX_RERANKER_MODEL_NAME:Alibaba-NLP/gte-multilingual-reranker-base}
+    reranker-max-documents: ${ONYX_RERANKER_MAX_DOCUMENTS:100}
+    reranker-timeout-ms: ${ONYX_RERANKER_TIMEOUT_MS:30000}
+    reranker-fallback-on-error: ${ONYX_RERANKER_FALLBACK_ON_ERROR:true}
   opensearch:
     base-url: ${OPENSEARCH_URL:http://opensearch:9200}
     index: ${OPENSEARCH_INDEX:onyx-kotlin-chunks}

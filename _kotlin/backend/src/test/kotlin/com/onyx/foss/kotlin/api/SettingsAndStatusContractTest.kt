@@ -4,6 +4,7 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.service.AdminService
 import com.onyx.foss.kotlin.service.FileStorageService
 import com.onyx.foss.kotlin.service.IngestionQueryService
+import com.onyx.foss.kotlin.service.RerankingService
 import org.junit.jupiter.api.Test
 import org.mockito.Mockito.mock
 import org.mockito.Mockito.`when`
@@ -32,6 +33,7 @@ class SettingsAndStatusContractTest {
         val admin = mock(AdminService::class.java)
         val fileStorage = mock(FileStorageService::class.java)
         val ingestion = mock(IngestionQueryService::class.java)
+        val reranking = mock(RerankingService::class.java)
         `when`(admin.connectorStatuses()).thenReturn(
             listOf(
                 mapOf(
@@ -45,7 +47,7 @@ class SettingsAndStatusContractTest {
             ),
         )
         val mvc: MockMvc = MockMvcBuilders.standaloneSetup(
-            AdminController(admin, fileStorage, ingestion, jacksonObjectMapper()),
+            AdminController(admin, fileStorage, ingestion, reranking, jacksonObjectMapper()),
         ).build()
 
         mvc.perform(get("/manage/admin/connector/status"))

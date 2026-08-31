@@ -17,6 +17,11 @@ data class OnyxProperties(
         val modelName: String = "",
         val maxContextLength: Int = 512,
         val normalizeEmbeddings: Boolean = true,
+        val rerankerEnabled: Boolean = true,
+        val rerankerModelName: String = "Alibaba-NLP/gte-multilingual-reranker-base",
+        val rerankerMaxDocuments: Int = 100,
+        val rerankerTimeoutMs: Long = 30_000,
+        val rerankerFallbackOnError: Boolean = true,
     )
     data class OpenSearch(val baseUrl: String = "http://opensearch:9200", val index: String = "onyx-kotlin-chunks")
     data class Worker(val enabled: Boolean = false, val pollDelayMs: Long = 1000)

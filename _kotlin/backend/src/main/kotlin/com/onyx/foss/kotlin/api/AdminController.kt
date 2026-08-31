@@ -7,6 +7,7 @@ import com.onyx.foss.kotlin.domain.PairStatus
 import com.onyx.foss.kotlin.service.AdminService
 import com.onyx.foss.kotlin.service.FileStorageService
 import com.onyx.foss.kotlin.service.IngestionQueryService
+import com.onyx.foss.kotlin.service.RerankingService
 import jakarta.validation.Valid
 import org.springframework.http.MediaType
 import org.springframework.web.bind.annotation.DeleteMapping
@@ -27,6 +28,7 @@ class AdminController(
     private val admin: AdminService,
     private val files: FileStorageService,
     private val ingestion: IngestionQueryService,
+    private val reranking: RerankingService,
     private val mapper: ObjectMapper,
 ) {
     @PostMapping("/credential")
@@ -172,4 +174,9 @@ class AdminController(
 
     @GetMapping("/document-set-public")
     fun documentSetPublic(): Map<String, Boolean> = mapOf("is_public" to true)
+
+    @PostMapping("/search/rerank")
+    fun rerankCandidates(
+        @Valid @RequestBody request: RerankCandidatesRequest,
+    ): RerankCandidatesResponse = reranking.rerank(request)
 }

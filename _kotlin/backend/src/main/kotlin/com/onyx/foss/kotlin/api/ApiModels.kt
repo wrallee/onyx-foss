@@ -66,5 +66,32 @@ data class DocumentSetRequest(
     val groups: List<Long> = emptyList(),
 )
 
+data class RerankCandidate(
+    @field:NotBlank val id: String,
+    val title: String = "",
+    @field:NotBlank val content: String,
+    val retrievalScore: Double? = null,
+)
+
+data class RerankCandidatesRequest(
+    @field:NotBlank val query: String,
+    @field:NotEmpty val candidates: List<RerankCandidate>,
+)
+
+data class RankedCandidate(
+    val id: String,
+    val title: String,
+    val content: String,
+    val retrievalScore: Double?,
+    val rerankScore: Double?,
+    val originalIndex: Int,
+)
+
+data class RerankCandidatesResponse(
+    val reranked: Boolean,
+    val candidates: List<RankedCandidate>,
+    val warning: String? = null,
+)
+
 data class StatusResponse(val success: Boolean, val message: String, val data: Long? = null)
 data class ObjectCreationResponse(val id: Long, val credential: Map<String, Any?>? = null)

@@ -8,6 +8,9 @@ x-backend-environment: &backend-environment
   ONYX_FILE_STORAGE_ROOT: /var/lib/onyx/files
   MODEL_SERVER_URL: http://model-server:9000
   ONYX_EMBEDDING_MODEL_NAME: ${ONYX_EMBEDDING_MODEL_NAME:-ibm-granite/granite-embedding-311m-multilingual-r2}
+  ONYX_RERANKER_ENABLED: ${ONYX_RERANKER_ENABLED:-true}
+  ONYX_RERANKER_MODEL_NAME: ${RERANKER_MODEL:-Alibaba-NLP/gte-multilingual-reranker-base}
+  ONYX_RERANKER_MAX_DOCUMENTS: ${RERANKER_MAX_DOCUMENTS:-100}
   OPENSEARCH_URL: http://opensearch:9200
   OPENSEARCH_INDEX: ${OPENSEARCH_INDEX:-onyx-kotlin-chunks}
 
@@ -42,7 +45,6 @@ services:
     restart: unless-stopped
 
   worker:
-    profiles: ["ingestion"]
     build:
       context: ./backend
     environment:
@@ -61,15 +63,20 @@ services:
     restart: unless-stopped
 
   model-server:
-    profiles: ["ingestion"]
     build:
       context: ./model-server
     environment:
-      MODEL_SERVER_PORT: 9000
-      MODEL_ARTIFACT_MANIFEST: /config/granite-openvino-int8.manifest.json
+      EMBEDDING_MODEL_PATH: /models/granite-embedding-311m-multilingual-r2-int8-openvino
+      EMBEDDING_MODEL_NAME: ${ONYX_EMBEDDING_MODEL_NAME:-ibm-granite/granite-embedding-311m-multilingual-r2}
+      RERANKER_MODEL_PATH: ${RERANKER_MODEL_PATH:-/models/gte-multilingual-reranker-base}
       RERANKER_MODEL: ${RERANKER_MODEL:-Alibaba-NLP/gte-multilingual-reranker-base}
+      RERANKER_REQUIRED: "true"
+      RERANKER_MAX_DOCUMENTS: ${RERANKER_MAX_DOCUMENTS:-100}
+      RERANKER_MAX_LENGTH: ${RERANKER_MAX_LENGTH:-512}
+      MODEL_INFERENCE_CONCURRENCY: ${MODEL_INFERENCE_CONCURRENCY:-1}
+      TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-4}
+    shm_size: 1gb
     volumes:
-      - ./model-server/granite-openvino-int8.manifest.json:/config/granite-openvino-int8.manifest.json:ro
       - ./models:/models:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/actuator/health/readiness"]
@@ -114,6 +121,12 @@ services:
       timeout: 5s
       retries: 30
     restart: unless-stopped
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 192.168.240.0/24
 
 volumes:
   connector_files:
