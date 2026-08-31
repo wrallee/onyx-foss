@@ -51,13 +51,16 @@ class RemoteConnectorLoadersTest {
         val docs = loaders().load(
             "confluence",
             mapper.readTree("""{"wiki_base":"""" + base + """","space":"ENG"}"""),
-            mapper.readTree("""{"username":"a@example.com","api_token":"token"}"""),
+            mapper.readTree("""{"confluence_username":"a@example.com","confluence_access_token":"token"}"""),
             null,
         )
 
         assertEquals("42", docs.single().id)
         assertEquals("Safe content", docs.single().content)
-        assertEquals("/rest/api/content/search", server.takeRequest().requestUrl!!.encodedPath)
+        val request = server.takeRequest()
+        assertEquals("/rest/api/content/search", request.requestUrl!!.encodedPath)
+        assertEquals("type=page and space='ENG'", request.requestUrl!!.queryParameter("cql"))
+        assertEquals("Bearer token", request.getHeader("Authorization"))
     }
 
     @Test
@@ -81,6 +84,37 @@ class RemoteConnectorLoadersTest {
         assertEquals(1, docs.size)
         assertEquals("onyx/foss/pull_request/7", docs.single().id)
         assertEquals("Bearer token", server.takeRequest().getHeader("Authorization"))
+    }
+
+    @Test
+    fun acceptsConfluenceResponsesLargerThanTheWebClientDefaultBuffer() = MockWebServer().use { server ->
+        val content = "a".repeat(300_000)
+        server.enqueue(
+            MockResponse().setHeader("Content-Type", "application/json").setBody(
+                mapper.writeValueAsString(
+                    mapOf(
+                        "totalSize" to 1,
+                        "results" to listOf(
+                            mapOf(
+                                "id" to "42",
+                                "title" to "Large page",
+                                "body" to mapOf("storage" to mapOf("value" to content)),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+        server.start()
+
+        val docs = loaders().load(
+            "confluence",
+            mapper.readTree("""{"wiki_base":"${server.url("/").toString().trimEnd('/')}","space":"ENG"}"""),
+            mapper.readTree("""{"confluence_access_token":"token"}"""),
+            null,
+        )
+
+        assertEquals(content.length, docs.single().content.length)
     }
 
     private fun loaders(): RemoteConnectorLoaders =

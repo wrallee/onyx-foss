@@ -49,11 +49,10 @@ docker compose build
 docker compose up -d
 ```
 
-The default profile starts the UI, API, PostgreSQL, and OpenSearch. The worker
-and Python model-server are in the `ingestion` profile. Enable them with:
+Start the UI, API, worker, Python model-server, PostgreSQL, and OpenSearch:
 
 ```bash
-docker compose --profile ingestion up -d
+docker compose up -d
 ```
 
 Open `http://localhost:3000`. Only the Web service is published to the host.

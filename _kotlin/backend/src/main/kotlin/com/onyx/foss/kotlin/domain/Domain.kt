@@ -34,7 +34,13 @@ enum class ConnectorSource(@get:JsonValue val value: String) {
 }
 
 enum class PairStatus { SCHEDULED, INITIAL_INDEXING, ACTIVE, PAUSED, DELETING, INVALID }
-enum class AttemptStatus { NOT_STARTED, IN_PROGRESS, SUCCESS, FAILED, COMPLETED_WITH_ERRORS }
+enum class AttemptStatus(@get:JsonValue val value: String) {
+    NOT_STARTED("not_started"),
+    IN_PROGRESS("in_progress"),
+    SUCCESS("success"),
+    FAILED("failed"),
+    COMPLETED_WITH_ERRORS("completed_with_errors"),
+}
 enum class JobState { QUEUED, RUNNING, SUCCEEDED, FAILED }
 
 @Entity

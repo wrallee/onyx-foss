@@ -44,6 +44,16 @@ data class PairMetadataRequest(
 
 data class PairStatusRequest(val status: PairStatus)
 
+data class CCPropertyUpdateRequest(
+    @field:NotBlank val name: String,
+    @field:NotBlank val value: String,
+)
+
+data class DeletionAttemptRequest(
+    val connectorId: Long,
+    val credentialId: Long,
+)
+
 data class RunConnectorRequest(
     val connectorId: Long,
     @JsonAlias("credentialIds") val credentialIds: List<Long>? = null,

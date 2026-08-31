@@ -85,6 +85,9 @@ class AdminController(
     @DeleteMapping("/admin/connector/{connectorId}")
     fun deleteConnector(@PathVariable connectorId: Long): StatusResponse = admin.deleteConnector(connectorId)
 
+    @PostMapping("/admin/deletion-attempt")
+    fun deletePair(@RequestBody request: DeletionAttemptRequest): StatusResponse = admin.deletePair(request)
+
     @PutMapping("/connector/{connectorId}/credential/{credentialId}")
     fun associateCredential(
         @PathVariable connectorId: Long,
@@ -133,6 +136,12 @@ class AdminController(
         @PathVariable pairId: Long,
         @RequestParam("new_name") name: String,
     ): Map<String, Any?> = admin.renamePair(pairId, name)
+
+    @PutMapping("/admin/cc-pair/{pairId}/property")
+    fun updatePairProperty(
+        @PathVariable pairId: Long,
+        @Valid @RequestBody request: CCPropertyUpdateRequest,
+    ): StatusResponse = admin.updatePairProperty(pairId, request)
 
     @GetMapping("/admin/cc-pair/{pairId}/index-attempts")
     fun attempts(

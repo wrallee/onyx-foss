@@ -1,9 +1,23 @@
 import { runConnector } from "@/lib/connector";
-import { ValidSources } from "@/lib/types";
+import { ValidSources, ValidStatuses } from "@/lib/types";
+import { ConnectorCredentialPairStatus } from "./types";
 import { mutate } from "swr";
 
 export function buildCCPairInfoUrl(ccPairId: string | number) {
   return `/api/manage/admin/cc-pair/${ccPairId}`;
+}
+
+export function getCCPairDisplayStatus(
+  pairStatus: ConnectorCredentialPairStatus,
+  lastIndexAttemptStatus: ValidStatuses | null
+): ConnectorCredentialPairStatus {
+  if (
+    pairStatus === ConnectorCredentialPairStatus.ACTIVE &&
+    lastIndexAttemptStatus === null
+  ) {
+    return ConnectorCredentialPairStatus.INITIAL_INDEXING;
+  }
+  return pairStatus;
 }
 
 export function buildSimilarCredentialInfoURL(

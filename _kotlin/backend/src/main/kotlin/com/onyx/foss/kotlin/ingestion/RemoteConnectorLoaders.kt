@@ -6,6 +6,7 @@ import org.springframework.http.MediaType
 import org.springframework.stereotype.Service
 import org.springframework.web.reactive.function.client.WebClient
 import org.springframework.web.util.UriUtils
+import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.util.Base64
@@ -58,7 +59,7 @@ class RemoteConnectorLoaders(
         val requested = config?.text("cql_query")
         val space = config?.text("space")
         val cql = requested ?: if (space.isNullOrBlank()) "type=page" else "type=page and space='" + space + "'"
-        val headers = auth(credentials, basic = true)
+        val headers = auth(credentials, basic = config?.path("is_cloud")?.asBoolean(false) == true)
         val result = mutableListOf<SourceDocument>()
         var start = 0
         while (true) {
@@ -206,9 +207,16 @@ class RemoteConnectorLoaders(
 
 
     private fun auth(credentials: JsonNode, basic: Boolean): Map<String, String> {
-        val token = credentials.firstText("jira_api_token", "api_token", "github_access_token", "access_token", "token")
+        val token = credentials.firstText(
+            "jira_api_token",
+            "confluence_access_token",
+            "github_access_token",
+            "api_token",
+            "access_token",
+            "token",
+        )
             ?: error("Connector credential does not contain an access token")
-        val username = credentials.firstText("jira_email", "email", "username")
+        val username = credentials.firstText("jira_email", "confluence_username", "email", "username")
         val value = if (basic && !username.isNullOrBlank()) {
             "Basic " + Base64.getEncoder().encodeToString((username + ":" + token).toByteArray(StandardCharsets.UTF_8))
         } else {
@@ -242,9 +250,15 @@ class RemoteConnectorLoaders(
 class RemoteJsonClient(
     private val clientBuilder: WebClient.Builder,
 ) {
+    private companion object {
+        const val MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+    }
+
     fun get(base: String, path: String, headers: Map<String, String>): JsonNode =
-        clientBuilder.build().get()
-            .uri(base.trimEnd('/') + path)
+        clientBuilder.clone().codecs { codecs ->
+            codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
+        }.build().get()
+            .uri(URI.create(base.trimEnd('/') + path))
             .accept(MediaType.APPLICATION_JSON)
             .headers { httpHeaders -> headers.forEach { (name, value) -> httpHeaders.set(name, value) } }
             .retrieve()
