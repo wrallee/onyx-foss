@@ -1,222 +1,224 @@
-# Kotlin Backend FOSS Parity Design
+# Kotlin Backend FOSS 동작 호환 설계
 
-## Context
+## 배경
 
-The Kotlin backend copies many Onyx FOSS API shapes but omits substantial behavior.
-Current tests mostly cover response shapes and successful remote API calls.
-They do not prove database behavior, ingestion recovery, pruning, or connector parity.
+현재 Kotlin backend는 Onyx FOSS API 형태를 많이 복제했습니다.
+그러나 실제 동작은 상당 부분 빠져 있습니다.
 
-The parent Python checkout already implements and tests the required behavior.
-This design uses that implementation as the behavioral source of truth.
+현재 테스트는 주로 응답 형태와 외부 API의 정상 응답만 확인합니다.
+DB 동작, 수집 복구, pruning, 커넥터 호환성은 충분히 검증하지 않습니다.
 
-## Goal
+상위 Python checkout에는 필요한 동작과 테스트가 이미 있습니다.
+이 설계는 해당 구현을 동작 기준으로 사용합니다.
 
-Restore applicable FOSS behavior within the Kotlin backend's existing feature families.
-Add tests that detect future differences from the Python behavior.
+## 목표
 
-API similarity alone is not sufficient.
-Database state, checkpoints, errors, indexed documents, and permission metadata must also match.
+Kotlin backend에 이미 존재하는 기능군의 FOSS 동작을 복원합니다.
+Python 동작과의 차이를 감지하는 테스트를 추가합니다.
 
-## Scope
+API 모양만 같은 것은 완료로 보지 않습니다.
+DB 상태, checkpoint, 오류, 색인 문서, 권한 metadata도 같아야 합니다.
 
-### Included
+## 범위
 
-- Credential, Connector, CC Pair, Document Set, and file administration
-- File, Jira, Confluence, and GitHub connectors
-- Connector validation, pagination, checkpoints, partial failures, and rate limits
-- Ingestion jobs, attempts, status transitions, retries, and recovery
-- Embedding requests and OpenSearch writes and deletions
-- Pruning and safe handling of failed document retrieval
-- Full document permission synchronization
-- Permission synchronization attempts and API contracts
-- Existing Web contracts for these features
+### 포함
 
-### Excluded
+- Credential, Connector, CC Pair, Document Set, 파일 관리
+- File, Jira, Confluence, GitHub 커넥터
+- 커넥터 검증, pagination, checkpoint, 부분 실패, rate limit
+- 수집 job, attempt, 상태 전이, 재시도, 복구
+- Embedding 요청과 OpenSearch 쓰기 및 삭제
+- Pruning과 문서 조회 실패의 안전한 처리
+- 전체 문서 권한 동기화
+- 권한 동기화 attempt와 API 계약
+- 위 기능에 사용하는 기존 Web 계약
 
-- Connector types without a Kotlin source implementation and active entry point
-- User registration, authentication, sessions, and user-specific settings
-- Enterprise features and all Enterprise source code
+### 제외
+
+- Kotlin source와 활성 진입점이 없는 커넥터
+- 사용자 가입, 인증, session, 사용자별 설정
+- Enterprise 기능과 모든 Enterprise source code
 - Multitenancy
-- External group synchronization
-- SAML, LDAP, OIDC, and SCIM integration
+- External group sync
+- SAML, LDAP, OIDC, SCIM 연동
 
-## Source Boundary
+## Source 경계
 
-Use sources in this order:
+다음 순서로 동작 기준을 정합니다.
 
-1. Parent Python FOSS implementation behavior
-2. Parent Python FOSS test expectations
-3. Existing Web request and response contracts
-4. Current Kotlin documentation
+1. 상위 Python FOSS 구현의 실제 동작
+2. 상위 Python FOSS 테스트의 기대 결과
+3. 기존 Web 요청 및 응답 계약
+4. 현재 Kotlin 문서
 
-The Python implementation wins when the Kotlin README describes an incomplete port.
-Authentication, Enterprise, multitenancy, and external group synchronization remain excluded.
+Kotlin README가 미완성 port를 설명하면 Python 구현을 우선합니다.
+인증, Enterprise, multitenancy, external group sync는 계속 제외합니다.
 
-Do not use code from an `ee/` directory or any Enterprise-licensed source.
-Record source provenance for ported behavior and copied fixtures.
+`ee/` 디렉터리와 Enterprise license source는 사용하지 않습니다.
+Port한 동작과 복사한 fixture의 출처를 기록합니다.
 
-## Feature Boundary
+## 기능 경계
 
-Increase depth without increasing connector breadth.
+커넥터 종류를 늘리지 않고 기존 커넥터의 완성도를 높입니다.
 
-For an implemented connector, restore missing behavior from its Python implementation.
-Do not add another connector because its Python tests are available.
+구현된 커넥터에서는 Python 구현의 누락 동작을 복원합니다.
+Python 테스트가 있다는 이유로 다른 커넥터를 추가하지 않습니다.
 
-Add shared behavior only when an included connector or management flow requires it.
-Do not create speculative compatibility infrastructure.
+포함된 커넥터나 관리 흐름에 필요한 공통 동작만 추가합니다.
+추후 사용을 위한 호환 framework는 만들지 않습니다.
 
-## Architecture
+## 구조
 
-### Management Lifecycle
+### 관리 수명주기
 
-The management layer owns these operations:
+관리 계층은 다음 동작을 담당합니다.
 
-- Credential creation, masking, update, association checks, and deletion
-- Connector creation, update, association, pause, run, and deletion
-- CC Pair metadata, status, indexing summaries, and attempt history
-- Document Set membership, update, deletion, and public behavior
-- File upload, replacement, removal, metadata, and connector updates
+- Credential 생성, masking, 수정, 연결 검사, 삭제
+- Connector 생성, 수정, 연결, 일시정지, 실행, 삭제
+- CC Pair metadata, 상태, 색인 요약, attempt 기록
+- Document Set 구성원, 수정, 삭제, 공개 상태
+- 파일 upload, 교체, 제거, metadata, connector 수정
 
-Use the existing Spring controllers and services where their boundaries remain suitable.
-Change them only when an approved behavior cannot fit the current structure.
+기존 Spring controller와 service 경계가 적합하면 그대로 사용합니다.
+승인된 동작을 현재 구조에 넣을 수 없을 때만 변경합니다.
 
-### Synchronous Connector Batches
+### 동기식 Connector Batch
 
-The Python connectors use synchronous generators.
-The Kotlin equivalent will use a synchronous `Sequence`.
+Python 커넥터는 동기식 generator를 사용합니다.
+Kotlin에서는 동기식 `Sequence`를 사용합니다.
 
-Each yielded connector batch carries:
+각 connector batch는 다음 값을 전달합니다.
 
-- Documents
-- Connector failures
-- The next connector checkpoint
-- Whether more work remains
+- 문서
+- Connector failure
+- 다음 connector checkpoint
+- 남은 작업 여부
 
-File ingestion can yield one batch.
-Remote connectors yield API page or checkpoint units.
+File 수집은 batch 하나를 반환할 수 있습니다.
+원격 커넥터는 API page 또는 checkpoint 단위로 반환합니다.
 
-Do not introduce coroutine `Flow` or an asynchronous connector framework.
+Coroutine `Flow`나 비동기 connector framework는 추가하지 않습니다.
 
-### Ingestion Flow
+### 수집 흐름
 
-The ingestion worker processes one connector batch at a time.
+수집 worker는 connector batch를 한 번에 하나씩 처리합니다.
 
-1. Claim one eligible job with PostgreSQL locking.
-2. Mark its attempt in progress.
-3. Load one connector batch.
-4. Transform, chunk, embed, and index its documents.
-5. Save document failures with their identifiers and context.
-6. Save the checkpoint at the same safe boundary as Python.
-7. Continue until the connector reports completion.
-8. Apply Python-compatible pruning after complete enumeration.
-9. Set the final attempt and CC Pair states.
+1. PostgreSQL lock으로 실행 가능한 job 하나를 가져옵니다.
+2. 해당 attempt를 실행 중으로 변경합니다.
+3. Connector batch 하나를 불러옵니다.
+4. 문서를 변환하고 chunk로 나눈 뒤 embedding하고 색인합니다.
+5. 문서 실패를 식별자와 문맥 정보와 함께 저장합니다.
+6. Python과 같은 안전한 시점에 checkpoint를 저장합니다.
+7. Connector가 완료를 알릴 때까지 계속합니다.
+8. 전체 조회가 끝난 뒤 Python과 같은 pruning을 적용합니다.
+9. Attempt와 CC Pair의 최종 상태를 설정합니다.
 
-The worker must not load every remote document into memory before processing.
+Worker는 원격 문서 전체를 메모리에 적재하지 않습니다.
 
-### Error Semantics
+### 오류 처리
 
-Do not create one generic retry policy for all connectors.
-Port each included connector's Python behavior.
+모든 커넥터에 적용하는 단일 재시도 정책을 만들지 않습니다.
+각 커넥터의 Python 동작을 개별적으로 port합니다.
 
-- A document-level `ConnectorFailure` produces a partial result.
-- Partial results can finish as `COMPLETED_WITH_ERRORS`.
-- An unhandled fatal error finishes the attempt as `FAILED`.
-- Successfully processed documents resolve only their applicable prior errors.
-- Repeated-error state follows the Python consecutive-failure rule.
-- A failed retrieval preserves its document identifier during pruning.
-- Checkpoints advance only at the Python-compatible safe boundary.
-- Embedding and index failures remain document-level when Python treats them that way.
+- 문서 단위 `ConnectorFailure`는 부분 실패로 처리합니다.
+- 부분 실패 결과는 `COMPLETED_WITH_ERRORS`로 끝날 수 있습니다.
+- 처리하지 못한 치명적 오류는 attempt를 `FAILED`로 끝냅니다.
+- 성공한 문서에 해당하는 이전 오류만 해결 상태로 변경합니다.
+- 반복 오류 상태는 Python의 연속 실패 규칙을 따릅니다.
+- 조회에 실패한 문서 ID는 pruning 중에도 보존합니다.
+- Checkpoint는 Python과 같은 안전한 시점에만 전진합니다.
+- Python이 문서 실패로 처리하는 embedding과 index 오류도 동일하게 처리합니다.
 
-Rate-limit behavior also remains connector-specific.
-GitHub, Confluence, and Jira must follow their own Python policies.
+Rate limit 처리도 커넥터별로 유지합니다.
+GitHub, Confluence, Jira는 각 Python 정책을 따라야 합니다.
 
-Never expose credential values through API responses, logs, or exception messages.
+API 응답, log, 예외에 credential 값을 노출하지 않습니다.
 
-### Document Permission Synchronization
+### 문서 권한 동기화
 
-Document permission synchronization is included because it belongs to FOSS connector behavior.
+문서 권한 동기화는 FOSS 커넥터 동작이므로 포함합니다.
 
-It must collect and store supported external document access metadata.
-It must track permission synchronization attempts and failures.
-It must avoid pruning documents after a temporary permission retrieval failure.
+지원하는 외부 문서 접근 metadata를 수집하고 저장합니다.
+권한 동기화 attempt와 실패 상태도 추적합니다.
+일시적인 권한 조회 실패 때문에 문서를 pruning하지 않습니다.
 
-No current user exists to consume these access rules.
-Search-time user enforcement is deferred until identity support exists.
+현재 접근 규칙을 사용하는 내부 사용자는 없습니다.
+검색 시점의 사용자 권한 적용은 identity 기능을 추가할 때 구현합니다.
 
-External group synchronization remains excluded.
-Its Onyx execution implementation belongs to Enterprise code.
+External group sync는 제외합니다.
+Onyx의 해당 실행 구현은 Enterprise 영역입니다.
 
-## Test Strategy
+## 테스트 전략
 
-### Fast Tests
+### 빠른 테스트
 
-Use JUnit for deterministic validation, conversion, and state calculations.
-Use existing helpers and dependencies before adding new utilities.
+검증, 변환, 상태 계산에는 JUnit을 사용합니다.
+새 utility를 추가하기 전에 기존 helper와 dependency를 사용합니다.
 
-### Connector Contract Tests
+### Connector 계약 테스트
 
-Use MockWebServer for remote connector tests.
-Port every applicable Python scenario for the four included connectors.
+원격 connector 테스트에는 MockWebServer를 사용합니다.
+네 커넥터에 적용되는 Python 시나리오를 모두 port합니다.
 
-These tests cover pagination, authentication headers, validation, checkpoints, failures, and rate limits.
-They must also cover connector-specific permission retrieval.
+Pagination, 인증 header, 검증, checkpoint, 실패, rate limit을 검사합니다.
+커넥터별 문서 권한 조회도 검사합니다.
 
-Actual Jira, Confluence, and GitHub accounts are not required for normal test execution.
-Optional live smoke tests can use real credentials outside the required suite.
+일반 테스트에는 실제 Jira, Confluence, GitHub 계정이 필요하지 않습니다.
+실제 credential을 사용하는 smoke test는 선택 테스트로 분리합니다.
 
-### PostgreSQL Integration Tests
+### PostgreSQL 통합 테스트
 
-Use an isolated PostgreSQL container for database integration tests.
-Run the real Flyway migrations.
+DB 통합 테스트에는 격리된 PostgreSQL container를 사용합니다.
+실제 Flyway migration을 실행합니다.
 
-Do not use H2 for database integration tests.
-The schema uses PostgreSQL JSONB, casts, timestamps, and identity behavior.
-Job claims also require `FOR UPDATE SKIP LOCKED` semantics.
+DB 통합 테스트에 H2를 사용하지 않습니다.
+현재 schema는 PostgreSQL JSONB, cast, timestamp, identity 동작을 사용합니다.
+Job 선점에는 `FOR UPDATE SKIP LOCKED` 동작도 필요합니다.
 
-The integration suite covers CRUD, foreign keys, uniqueness, transactions, pagination, and concurrent job claims.
+CRUD, foreign key, unique 제약, transaction, pagination, 동시 선점을 검증합니다.
 
-### Full Ingestion Tests
+### 전체 수집 테스트
 
-Use Docker Compose for a representative full File ingestion flow.
-The flow includes PostgreSQL, the model server, and OpenSearch.
+대표 File 전체 수집 흐름에는 Docker Compose를 사용합니다.
+이 흐름은 PostgreSQL, model server, OpenSearch를 포함합니다.
 
-Send backend requests through the Web service.
-Verify the final API state, database rows, and OpenSearch documents.
+Backend 요청은 Web service를 통해 전송합니다.
+최종 API 상태, DB row, OpenSearch 문서를 확인합니다.
 
-Add more full-stack cases only when smaller tests cannot prove the behavior.
+작은 테스트로 증명할 수 없는 동작에만 전체 수집 테스트를 추가합니다.
 
-## Scenario Inventory
+## 시나리오 목록
 
-| Area | Required scenario groups |
+| 영역 | 필수 시나리오 그룹 |
 | --- | --- |
-| Administration | Create, update, associate, reject invalid association, pause, run, and delete |
-| File | Multiple files, metadata, replacement, removal, parsing, checkpoint completion, and pruning |
-| Jira | Project scope, JQL, pagination, checkpoints, skipped issues, typed errors, rates, and permissions |
-| Confluence | Cloud and Server behavior, pages, attachments, comments, HTML, checkpoints, rates, and permissions |
-| GitHub | Public and private repositories, branches, issues, pull requests, files, checkpoints, rates, and permissions |
-| Ingestion | Claiming, state transitions, partial failures, fatal failures, recovery, checkpoints, and repeated errors |
-| Pruning | Missing documents, retrieval failures, index deletion failures, and database consistency |
-| Permission sync | Attempt states, partial failures, stored ACL data, and safe retries |
-| API contracts | Response fields, status values, pagination, validation errors, and Web compatibility |
+| 관리 | 생성, 수정, 연결, 잘못된 연결 거부, 일시정지, 실행, 삭제 |
+| File | 다중 파일, metadata, 교체, 제거, parsing, checkpoint 완료, pruning |
+| Jira | Project 범위, JQL, pagination, checkpoint, 건너뛴 issue, typed error, rate limit, 권한 |
+| Confluence | Cloud와 Server, page, attachment, comment, HTML, checkpoint, rate limit, 권한 |
+| GitHub | Public·private repository, branch, issue, pull request, file, checkpoint, rate limit, 권한 |
+| 수집 | 선점, 상태 전이, 부분 실패, 전체 실패, 복구, checkpoint, 반복 오류 |
+| Pruning | 누락 문서, 조회 실패, index 삭제 실패, DB 일관성 |
+| 권한 동기화 | Attempt 상태, 부분 실패, 저장된 ACL, 안전한 재시도 |
+| API 계약 | 응답 field, 상태 값, pagination, 검증 오류, Web 호환성 |
 
-Before implementation, map each Kotlin scenario to its Python source test or implementation path.
-Remove only scenarios that depend on an explicitly excluded feature.
+구현 전에 각 Kotlin 시나리오를 Python source test 또는 구현 경로와 연결합니다.
+명시적으로 제외한 기능에 의존하는 시나리오만 제거합니다.
 
-## Acceptance Criteria
+## 완료 기준
 
-- Every applicable Python FOSS scenario has a Kotlin test or documented equivalent coverage.
-- Tests expose missing Kotlin behavior before implementation changes.
-- All fast and connector contract tests pass.
-- All PostgreSQL integration tests pass against real PostgreSQL.
-- The representative Docker File ingestion test passes through the Web service.
-- Checkpoints, partial failures, recovery, and pruning match Python behavior.
-- Supported connectors collect and store document ACLs with complete attempt tracking.
-- No new connector type is added.
-- No Enterprise code or fixture is copied or translated.
-- Existing supported Web administration flows continue to work.
+- 적용 가능한 각 Python FOSS 시나리오에 Kotlin 테스트 또는 동등한 검증이 있습니다.
+- 테스트가 구현 변경 전에 누락 동작을 재현합니다.
+- 빠른 테스트와 connector 계약 테스트가 모두 통과합니다.
+- PostgreSQL 통합 테스트가 실제 PostgreSQL에서 통과합니다.
+- 대표 Docker File 수집 테스트가 Web service를 통해 통과합니다.
+- Checkpoint, 부분 실패, 복구, pruning이 Python 동작과 일치합니다.
+- 지원 커넥터가 문서 ACL을 수집하고 attempt 상태와 함께 저장합니다.
+- 새 connector 종류를 추가하지 않습니다.
+- Enterprise code와 fixture를 복사하거나 번역하지 않습니다.
+- 기존 Web 관리 흐름이 계속 동작합니다.
 
-## Deferred Work
+## 후속 작업
 
-User identity and search-time ACL enforcement remain deferred.
-Future SAML or LDAP work must use MIT FOSS code and public standards only.
-It must not derive from Onyx Enterprise source code.
+사용자 identity와 검색 시점 ACL 적용은 후속 작업으로 남깁니다.
+향후 SAML 또는 LDAP는 MIT FOSS code와 공개 표준만 사용해야 합니다.
+Onyx Enterprise source code에서 파생하면 안 됩니다.
