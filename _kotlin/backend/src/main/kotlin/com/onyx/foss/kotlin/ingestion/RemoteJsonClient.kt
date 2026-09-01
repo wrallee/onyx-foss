@@ -6,6 +6,7 @@ import org.springframework.http.MediaType
 import org.springframework.stereotype.Service
 import org.springframework.web.reactive.function.client.WebClient
 import java.net.URI
+import java.time.Duration
 
 data class RemoteTextResponse(
     val statusCode: Int,
@@ -42,7 +43,7 @@ class RemoteJsonClient(
                     response.headers,
                 )
             }
-            .block() ?: error("Remote connector returned an empty response")
+            .block(REMOTE_CONNECTOR_TIMEOUT) ?: error("Remote connector returned an empty response")
 
     fun post(base: String, path: String, headers: Map<String, String>, body: Any): JsonNode =
         clientBuilder.clone().codecs { codecs ->
@@ -55,7 +56,7 @@ class RemoteJsonClient(
             .bodyValue(body)
             .retrieve()
             .bodyToMono(JsonNode::class.java)
-            .block() ?: error("Remote connector returned an empty response")
+            .block(REMOTE_CONNECTOR_TIMEOUT) ?: error("Remote connector returned an empty response")
 
     fun getBytes(base: String, path: String, headers: Map<String, String>): ByteArray =
         configuredClient().get()
@@ -63,7 +64,7 @@ class RemoteJsonClient(
             .headers { httpHeaders -> headers.forEach { (name, value) -> httpHeaders.set(name, value) } }
             .retrieve()
             .bodyToMono(ByteArray::class.java)
-            .block() ?: error("Remote connector returned an empty response")
+            .block(REMOTE_CONNECTOR_TIMEOUT) ?: error("Remote connector returned an empty response")
 
     fun postText(base: String, path: String, headers: Map<String, String>, body: Any): RemoteTextResponse =
         configuredClient().post()
@@ -81,9 +82,11 @@ class RemoteJsonClient(
                     )
                 }
             }
-            .block() ?: error("Remote connector returned an empty response")
+            .block(REMOTE_CONNECTOR_TIMEOUT) ?: error("Remote connector returned an empty response")
 
     private fun configuredClient() = clientBuilder.clone().codecs { codecs ->
         codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
     }.build()
 }
+
+internal val REMOTE_CONNECTOR_TIMEOUT: Duration = Duration.ofSeconds(30)

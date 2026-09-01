@@ -732,6 +732,30 @@ class GithubConnectorLoaderTest {
         val failure = batches.flatMap { it.failures }.single()
         assertIs<FailureTarget.Entity>(failure.target)
         assertContains(failure.message.lowercase(), "truncated")
+        assertFalse(batches.first { it.failures.isNotEmpty() }.enumerationComplete)
+    }
+
+    @Test
+    fun truncatedTreeAlsoFailsSlimEnumeration() = MockWebServer().use { server ->
+        server.dispatcher = fileRoutes(mapOf("README.md" to "# Hi".toByteArray()), truncated = true)
+
+        val failures = loader().retrieveAllSlimDocuments(fileConfig(server), credentials()).flatMap { it.failures }.toList()
+
+        assertEquals(listOf("github_tree_truncated"), failures.map { it.errorType })
+        assertIs<FailureTarget.Entity>(failures.single().target)
+        Unit
+    }
+
+    @Test
+    fun collectionFailureUsesCanonicalDocumentUrl() = MockWebServer().use { server ->
+        val url = "https://github.test/test-org/test-repo/pull/99"
+        server.dispatcher = routes(
+            pulls = listOf("""{"id":99,"number":0,"html_url":"$url","updated_at":"2026-01-01T00:00:00Z"}"""),
+        )
+
+        val failure = loader().load(config(server), credentials(), null).flatMap { it.failures }.single()
+
+        assertEquals(url, (failure.target as FailureTarget.Document).id)
     }
 
     @Test

@@ -10,6 +10,8 @@ import com.onyx.foss.kotlin.domain.CredentialEntity
 import com.onyx.foss.kotlin.domain.CredentialRepository
 import com.onyx.foss.kotlin.domain.IndexedDocumentEntity
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
+import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
+import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
 import com.onyx.foss.kotlin.security.CredentialCipher
 import com.onyx.foss.kotlin.support.PostgresIntegrationTest
 import org.assertj.core.api.Assertions.assertThat
@@ -17,6 +19,7 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.mockito.Mockito.doThrow
+import org.mockito.Mockito.mockingDetails
 import org.mockito.Mockito.verify
 import org.mockito.Mockito.verifyNoInteractions
 import org.springframework.beans.factory.annotation.Autowired
@@ -31,6 +34,7 @@ class PruningServiceTest : PostgresIntegrationTest() {
     @Autowired private lateinit var credentials: CredentialRepository
     @Autowired private lateinit var pairs: ConnectorCredentialPairRepository
     @Autowired private lateinit var documents: IndexedDocumentRepository
+    @Autowired private lateinit var attempts: IngestionAttemptRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
     @MockitoBean private lateinit var indexer: OpenSearchIndexer
 
@@ -46,7 +50,7 @@ class PruningServiceTest : PostgresIntegrationTest() {
     fun deletesDocumentsMissingFromCompleteEnumeration() {
         val pairId = createPairWithDocuments("seen", "removed")
 
-        val removed = pruning.prune(pairId, setOf("seen"), emptySet(), fromBeginning = true, completeEnumeration = true)
+        val removed = prune(pairId, setOf("seen"), emptySet(), fromBeginning = true, completeEnumeration = true)
 
         assertThat(removed).isEqualTo(1)
         assertThat(documents.findAll().map { it.sourceDocumentId }).containsExactly("seen")
@@ -57,7 +61,7 @@ class PruningServiceTest : PostgresIntegrationTest() {
     fun keepsDocumentWhoseRetrievalReturnedFailure() {
         val pairId = createPairWithDocuments("seen", "failed")
 
-        val removed = pruning.prune(
+        val removed = prune(
             pairId,
             seenDocumentIds = setOf("seen"),
             failedDocumentIds = setOf("failed"),
@@ -76,7 +80,7 @@ class PruningServiceTest : PostgresIntegrationTest() {
         doThrow(IllegalStateException("OpenSearch failed")).`when`(indexer).deleteDocuments(pairId, setOf("removed"))
 
         assertThrows<IllegalStateException> {
-            pruning.prune(pairId, emptySet(), emptySet(), fromBeginning = true, completeEnumeration = true)
+            prune(pairId, emptySet(), emptySet(), fromBeginning = true, completeEnumeration = true)
         }
 
         assertThat(documents.findAll().map { it.sourceDocumentId }).containsExactly("removed")
@@ -86,7 +90,7 @@ class PruningServiceTest : PostgresIntegrationTest() {
     fun doesNotPruneAfterIncrementalCheckpointRun() {
         val pairId = createPairWithDocuments("existing")
 
-        val removed = pruning.prune(
+        val removed = prune(
             pairId,
             emptySet(),
             emptySet(),
@@ -97,6 +101,20 @@ class PruningServiceTest : PostgresIntegrationTest() {
         assertThat(removed).isZero()
         assertThat(documents.findAll().map { it.sourceDocumentId }).containsExactly("existing")
         verifyNoInteractions(indexer)
+    }
+
+    @Test
+    fun deletesInBoundedPages() {
+        val pairId = createPairWithDocuments(*(1..1001).map { "document-${it.toString().padStart(4, '0')}" }.toTypedArray())
+
+        val removed = prune(pairId, emptySet(), emptySet(), fromBeginning = true, completeEnumeration = true)
+
+        assertThat(removed).isEqualTo(1001)
+        val pageSizes = mockingDetails(indexer).invocations
+            .filter { it.method.name == "deleteDocuments" }
+            .map { (it.arguments[1] as Set<*>).size }
+        assertThat(pageSizes).containsExactly(500, 500, 1)
+        assertThat(documents.countByCcPairId(pairId)).isZero()
     }
 
     private fun createPairWithDocuments(vararg sourceDocumentIds: String): Long {
@@ -132,5 +150,23 @@ class PruningServiceTest : PostgresIntegrationTest() {
             )
         }
         return requireNotNull(pair.id)
+    }
+
+    private fun prune(
+        pairId: Long,
+        seenDocumentIds: Set<String>,
+        failedDocumentIds: Set<String>,
+        fromBeginning: Boolean,
+        completeEnumeration: Boolean,
+    ): Int {
+        val attemptId = requireNotNull(attempts.save(IngestionAttemptEntity(ccPairId = pairId)).id)
+        (seenDocumentIds + failedDocumentIds).forEach { sourceDocumentId ->
+            jdbc.update(
+                "INSERT INTO ingestion_enumerated_documents(attempt_id, source_document_id) VALUES (?, ?)",
+                attemptId,
+                sourceDocumentId,
+            )
+        }
+        return pruning.prune(pairId, attemptId, fromBeginning, completeEnumeration)
     }
 }

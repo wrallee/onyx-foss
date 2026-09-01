@@ -42,10 +42,12 @@ import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 @AutoConfigureMockMvc
 class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var worker: PermissionSyncWorker
+    @Autowired private lateinit var claims: PermissionSyncClaimService
     @Autowired private lateinit var mvc: MockMvc
     @Autowired private lateinit var mapper: ObjectMapper
     @Autowired private lateinit var admin: AdminService
@@ -168,6 +170,86 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun durablePermissionWorkWaitsForScheduledWorker() {
+        val pairId = createPair()
+        saveDocument(pairId, "one")
+
+        worker.enqueue(pairId)
+
+        val attempt = attempts.findAllByCcPairIdOrderByIdDesc(pairId).single()
+        assertThat(attempt.status).isEqualTo(AttemptStatus.NOT_STARTED)
+        assertThat(documents.findByCcPairIdAndSourceDocumentId(pairId, "one")?.externalAccess).isNull()
+        verifyNoInteractions(indexer, remoteLoaders)
+    }
+
+    @Test
+    fun crashedPermissionAttemptIsReclaimedWithFreshToken() {
+        val pairId = createPair()
+        val now = Instant.parse("2026-09-01T00:00:00Z")
+        worker.enqueue(pairId)
+        val first = requireNotNull(claims.claimNext(now))
+        jdbc.update(
+            "UPDATE permission_sync_attempts SET lease_expires_at = ? WHERE id = ?",
+            java.sql.Timestamp.from(now.minusSeconds(1)),
+            first.attemptId,
+        )
+
+        val reclaimed = requireNotNull(claims.claimNext(now.plusSeconds(1)))
+
+        assertThat(reclaimed.attemptId).isEqualTo(first.attemptId)
+        assertThat(reclaimed.token).isNotEqualTo(first.token)
+        assertThat(attempts.findAllByCcPairIdOrderByIdDesc(pairId)).hasSize(1)
+    }
+
+    @Test
+    fun reclaimedAttemptStopsStaleWorkerBeforeAnotherOpenSearchWrite() {
+        val pairId = createPair()
+        saveDocument(pairId, "one")
+        permissionLoad(
+            ConnectorBatch(
+                documents = listOf(permissionDocument("one", ExternalAccess(isPublic = true))),
+                checkpoint = checkpoint(),
+            ),
+        )
+        worker.enqueue(pairId)
+        val oldClaim = requireNotNull(claims.claimNext())
+        val firstWriteStarted = CountDownLatch(1)
+        val releaseFirstWrite = CountDownLatch(1)
+        val writes = AtomicInteger()
+        doAnswer {
+            if (writes.incrementAndGet() == 1) {
+                firstWriteStarted.countDown()
+                check(releaseFirstWrite.await(10, TimeUnit.SECONDS))
+            }
+            Unit
+        }.`when`(indexer).updateAccess(org.mockito.ArgumentMatchers.eq(pairId), org.mockito.ArgumentMatchers.anyMap())
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val staleWorker = executor.submit { worker.process(oldClaim) }
+            assertThat(firstWriteStarted.await(10, TimeUnit.SECONDS)).isTrue()
+            jdbc.update(
+                "UPDATE permission_sync_attempts SET lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE id = ?",
+                oldClaim.attemptId,
+            )
+            val reclaimed = requireNotNull(claims.claimNext())
+            assertThat(reclaimed.token).isNotEqualTo(oldClaim.token)
+            releaseFirstWrite.countDown()
+            staleWorker.get(10, TimeUnit.SECONDS)
+        } finally {
+            releaseFirstWrite.countDown()
+            executor.shutdownNow()
+        }
+
+        assertThat(writes.get()).isEqualTo(1)
+        assertThat(attempts.findById(oldClaim.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.IN_PROGRESS)
+    }
+
+    @Test
+    fun externalTimeoutIsBelowPermissionLease() {
+        assertThat(OPENSEARCH_TIMEOUT).isLessThan(PERMISSION_SYNC_LEASE)
+    }
+
+    @Test
     fun fileAclUsesThePairPublicAccessFlag() {
         val publicPairId = createPair(source = ConnectorSource.FILE, accessType = "public")
         val privatePairId = createPair(source = ConnectorSource.FILE, accessType = "sync")
@@ -254,6 +336,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
                 checkpoint = checkpoint(),
             ),
         )
+        enqueueKeywordMapping(server)
         server.enqueue(successfulOpenSearchUpdate())
         server.enqueue(
             MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(
@@ -290,6 +373,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
                 checkpoint = checkpoint(),
             ),
         )
+        enqueueKeywordMapping(server)
         repeat(3) { server.enqueue(successfulOpenSearchUpdate()) }
         jdbc.execute(
             """
@@ -389,7 +473,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
-    fun staleActiveAttemptsAreFailedBeforeRetry() {
+    fun staleActiveAttemptsAreReclaimedInPlace() {
         listOf(AttemptStatus.NOT_STARTED, AttemptStatus.IN_PROGRESS).forEach { status ->
             val pairId = createPair()
             saveDocument(pairId, "${status.value}-document")
@@ -410,11 +494,8 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
             worker.process(pairId)
 
             val saved = attempts.findAllByCcPairIdOrderByIdDesc(pairId)
-            assertThat(saved).hasSize(2)
-            assertThat(saved.first().status).isEqualTo(AttemptStatus.SUCCESS)
-            assertThat(saved.last().status).isEqualTo(AttemptStatus.FAILED)
-            assertThat(saved.last().errorMessage).contains("stale")
-            assertThat(saved.last().fullExceptionTrace).contains("stale")
+            assertThat(saved).hasSize(1)
+            assertThat(saved.single().status).isEqualTo(AttemptStatus.SUCCESS)
         }
     }
 
@@ -527,6 +608,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         admin,
         pairs,
         attempts,
+        claims,
         documents,
         staging,
         remoteLoaders,
@@ -548,9 +630,21 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         .setHeader("Content-Type", "application/json")
         .setBody("""{"timed_out":false,"total":1,"updated":1,"noops":0,"version_conflicts":0,"failures":[]}""")
 
-    private fun openSearchAclBodies(server: MockWebServer, count: Int): List<JsonNode> = (1..count).map {
+    private fun enqueueKeywordMapping(server: MockWebServer) {
+        server.enqueue(MockResponse().setResponseCode(200))
+        server.enqueue(
+            MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
+                .setBody("""{"documents":{"mappings":{"properties":{"source_document_id":{"type":"keyword"}}}}}"""),
+        )
+    }
+
+    private fun openSearchAclBodies(server: MockWebServer, count: Int): List<JsonNode> {
+        server.takeRequest()
+        server.takeRequest()
+        return (1..count).map {
         mapper.readTree(server.takeRequest().body.readUtf8())
             .path("script").path("params").path("access_by_document").path("one")
+        }
     }
 
     private fun aclBody(access: ExternalAccess): JsonNode = mapper.valueToTree(

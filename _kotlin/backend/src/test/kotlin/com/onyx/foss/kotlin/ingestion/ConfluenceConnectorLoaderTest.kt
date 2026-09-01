@@ -933,7 +933,10 @@ class ConfluenceConnectorLoaderTest {
         val batch = loader().load(config(server), credentials(), null).single()
 
         assertEquals(listOf("1"), batch.documents.map { it.metadata["confluence_page_id"] })
-        assertEquals("2", (batch.failures.single().target as FailureTarget.Document).id)
+        assertEquals(
+            server.url("/").toString().trimEnd('/') + "/spaces/ENG/pages/2/Runbook",
+            (batch.failures.single().target as FailureTarget.Document).id,
+        )
     }
 
     @Test

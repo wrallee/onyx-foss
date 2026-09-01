@@ -215,11 +215,16 @@ class JiraConnectorLoader(
         if (context.slim) return processSlimIssues(context, issues, seenHierarchyNodeIds)
         val documents = mutableListOf<SourceDocument>()
         val failures = mutableListOf<ConnectorFailure>()
+        var enumerationComplete = true
         val permissionCache = mutableMapOf<String, ExternalAccess>()
         issues.forEach { issue ->
             val key = issue.path("key").asText().ifBlank { issue.path("id").asText().ifBlank { "unknown" } }
             try {
-                val document = convertIssue(context, issue, seenHierarchyNodeIds) ?: return@forEach
+                val document = convertIssue(context, issue, seenHierarchyNodeIds)
+                if (document == null) {
+                    enumerationComplete = false
+                    return@forEach
+                }
                 val projectKey = document.metadata["project"]?.toString()
                 val access = if (context.config?.path("include_permissions")?.asBoolean(false) == true && projectKey != null) {
                     permissionCache.getOrPut(projectKey) { projectAccess(context, projectKey) }
@@ -228,14 +233,15 @@ class JiraConnectorLoader(
                 }
                 documents += document.copy(externalAccess = access)
             } catch (error: Exception) {
+                val link = context.jiraBase + "/browse/" + segment(key)
                 failures += ConnectorFailure(
-                    target = FailureTarget.Document(key, context.jiraBase + "/browse/" + segment(key)),
+                    target = if (key == "unknown") FailureTarget.Entity("jira-issue:unknown") else FailureTarget.Document(link, link),
                     message = "Failed to process Jira issue: ${error.message ?: error::class.simpleName}",
                     errorType = "jira_issue_processing",
                 )
             }
         }
-        return ProcessResult(documents, failures)
+        return ProcessResult(documents, failures, enumerationComplete)
     }
 
     private fun processSlimIssues(
@@ -279,8 +285,9 @@ class JiraConnectorLoader(
                     source = ConnectorSource.JIRA,
                 )
             } catch (error: Exception) {
+                val link = context.jiraBase + "/browse/" + segment(key)
                 failures += ConnectorFailure(
-                    target = FailureTarget.Document(key, context.jiraBase + "/browse/" + segment(key)),
+                    target = if (key == "unknown") FailureTarget.Entity("jira-issue:unknown") else FailureTarget.Document(link, link),
                     message = "Failed to process Jira issue: ${error.message ?: error::class.simpleName}",
                     errorType = "jira_issue_processing",
                 )
@@ -555,6 +562,7 @@ class JiraConnectorLoader(
     private data class ProcessResult(
         val documents: List<SourceDocument> = emptyList(),
         val failures: List<ConnectorFailure> = emptyList(),
+        val enumerationComplete: Boolean = true,
     )
 
     private fun ProcessResult.toBatch(checkpoint: JiraCheckpoint): ConnectorBatch = ConnectorBatch(
@@ -564,5 +572,6 @@ class JiraConnectorLoader(
             value = mapper.valueToTree(checkpoint),
             hasMore = checkpoint.hasMore,
         ),
+        enumerationComplete = enumerationComplete && failures.all { it.target is FailureTarget.Document },
     )
 }

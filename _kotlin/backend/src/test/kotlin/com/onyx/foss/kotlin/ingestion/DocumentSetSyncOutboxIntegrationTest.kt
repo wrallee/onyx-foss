@@ -39,6 +39,7 @@ class DocumentSetSyncOutboxIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var admin: AdminService
     @Autowired private lateinit var worker: DocumentSetSyncWorker
     @Autowired private lateinit var claims: DocumentSetSyncClaimService
+    @Autowired private lateinit var indexer: OpenSearchIndexer
     @Autowired private lateinit var mapper: ObjectMapper
     @Autowired private lateinit var cipher: CredentialCipher
     @Autowired private lateinit var connectors: ConnectorRepository
@@ -58,6 +59,29 @@ class DocumentSetSyncOutboxIntegrationTest : PostgresIntegrationTest() {
                 "ingestion_checkpoints, indexed_documents, document_set_cc_pairs, document_sets, " +
                 "connector_credential_pairs, connectors, credentials RESTART IDENTITY CASCADE",
         )
+        primeOpenSearchIndex()
+    }
+
+    private fun primeOpenSearchIndex() {
+        if (!indexPrimed.compareAndSet(false, true)) return
+        try {
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.enqueue(
+                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
+                    .setBody(
+                        """{"documents":{"mappings":{"properties":{"source_document_id":{"type":"keyword"}}}}}""",
+                    ),
+            )
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.enqueue(success(1))
+            indexer.updateDocumentSets(0, setOf("index-probe"), emptyList())
+            while (server.takeRequest(1, TimeUnit.MILLISECONDS) != null) {
+                // Keep index initialization outside outbox request assertions.
+            }
+        } catch (error: Exception) {
+            indexPrimed.set(false)
+            throw error
+        }
     }
 
     @Test
@@ -397,6 +421,7 @@ class DocumentSetSyncOutboxIntegrationTest : PostgresIntegrationTest() {
 
     companion object {
         private val server = MockWebServer().apply { start() }
+        private val indexPrimed = AtomicBoolean()
 
         @JvmStatic
         @DynamicPropertySource

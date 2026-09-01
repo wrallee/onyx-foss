@@ -103,7 +103,7 @@ postgres_count="$("${compose[@]}" exec -T postgres psql -U onyx -d onyx -Atc \
 }
 
 search_payload="$(jq -cn --argjson pair "$pair_id" --arg document "$source_document_id" \
-  '{query:{bool:{filter:[{term:{cc_pair_id:$pair}},{term:{"source_document_id.keyword":$document}}]}}}')"
+  '{query:{bool:{filter:[{term:{cc_pair_id:$pair}},{term:{source_document_id:$document}}]}}}')"
 opensearch_count="$("${compose[@]}" exec -T opensearch curl -fsS \
   -H 'Content-Type: application/json' \
   "http://localhost:9200/$opensearch_index/_search" \

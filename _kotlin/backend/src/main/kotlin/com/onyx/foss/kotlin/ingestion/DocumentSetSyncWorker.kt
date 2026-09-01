@@ -5,6 +5,7 @@ import com.onyx.foss.kotlin.config.OnyxProperties
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxEntity
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxRepository
 import com.onyx.foss.kotlin.domain.DocumentSetSyncStatus
+import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.scheduling.annotation.Scheduled
@@ -80,8 +81,8 @@ class DocumentSetSyncWorker(
     private val properties: OnyxProperties,
     private val claims: DocumentSetSyncClaimService,
     private val documents: IndexedDocumentRepository,
+    private val documentSets: DocumentSetRepository,
     private val indexer: OpenSearchIndexer,
-    private val jdbc: JdbcTemplate,
 ) {
     @Scheduled(fixedDelayString = "\${onyx.worker.poll-delay-ms:1000}")
     fun work() {
@@ -107,17 +108,7 @@ class DocumentSetSyncWorker(
     }
 
     private fun syncPair(claim: DocumentSetSyncClaim, pairId: Long): Boolean {
-        val names = jdbc.queryForList(
-            """
-                SELECT document_set.name
-                FROM document_sets document_set
-                JOIN document_set_cc_pairs membership ON membership.document_set_id = document_set.id
-                WHERE membership.cc_pair_id = ?
-                ORDER BY document_set.name
-            """.trimIndent(),
-            String::class.java,
-            pairId,
-        )
+        val names = documentSets.findNamesByCcPairId(pairId)
         var afterSourceDocumentId = ""
         while (true) {
             val page = documents.findPageByCcPairId(pairId, afterSourceDocumentId, DOCUMENT_PAGE_SIZE)

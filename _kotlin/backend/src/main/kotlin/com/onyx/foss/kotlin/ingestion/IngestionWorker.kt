@@ -6,6 +6,7 @@ import com.onyx.foss.kotlin.config.OnyxProperties
 import com.onyx.foss.kotlin.domain.AttemptStatus
 import com.onyx.foss.kotlin.domain.ConnectorCredentialPairRepository
 import com.onyx.foss.kotlin.domain.ConnectorSource
+import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.domain.IndexedDocumentEntity
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
@@ -14,6 +15,7 @@ import com.onyx.foss.kotlin.domain.IngestionCheckpointEntity
 import com.onyx.foss.kotlin.domain.IngestionCheckpointRepository
 import com.onyx.foss.kotlin.domain.IngestionErrorEntity
 import com.onyx.foss.kotlin.domain.IngestionErrorRepository
+import com.onyx.foss.kotlin.domain.IngestionEnumerationRepository
 import com.onyx.foss.kotlin.domain.IngestionJobEntity
 import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.domain.JobState
@@ -31,6 +33,8 @@ import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
 import java.util.Base64
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 
 @Component
 class IngestionWorker(
@@ -48,28 +52,171 @@ class IngestionWorker(
 @Service
 class JobClaimService(
     private val jobs: IngestionJobRepository,
+    private val pairs: ConnectorCredentialPairRepository,
+    private val attempts: IngestionAttemptRepository,
+    private val errors: IngestionErrorRepository,
 ) {
     @Transactional
-    fun claimNext(): Long? {
-        val job = jobs.lockNextQueued(Instant.now()) ?: return null
+    fun claimNext(now: Instant = Instant.now()): IngestionClaim? =
+        jobs.lockNextClaimable(now)?.let { claim(it, now) }
+
+    @Transactional
+    fun claimJob(jobId: Long, now: Instant = Instant.now()): IngestionClaim? =
+        jobs.lockClaimableById(jobId, now)?.let { claim(it, now) }
+
+    private fun claim(job: IngestionJobEntity, now: Instant): IngestionClaim? {
+        val pair = pairs.lockById(job.ccPairId) ?: return null
+        if (pair.status == PairStatus.DELETING || pair.ingestionLeaseExpiresAt?.isAfter(now) == true) return null
+        val token = UUID.randomUUID()
+        val leaseExpiresAt = now.plus(INGESTION_LEASE)
         job.state = JobState.RUNNING
-        job.lockedAt = Instant.now()
+        job.lockedAt = now
         job.lockedBy = "spring-worker"
         job.attempts += 1
-        jobs.save(job)
-        return requireNotNull(job.id)
+        job.claimToken = token
+        job.leaseExpiresAt = leaseExpiresAt
+        pair.ingestionClaimToken = token
+        pair.ingestionLeaseExpiresAt = leaseExpiresAt
+        jobs.saveAndFlush(job)
+        pairs.saveAndFlush(pair)
+        return IngestionClaim(requireNotNull(job.id), job.ccPairId, job.attemptId, token)
+    }
+
+    @Transactional
+    fun start(claim: IngestionClaim, now: Instant = Instant.now()): Boolean {
+        val ownership = ownership(claim) ?: return false
+        val attempt = attempts.findById(claim.attemptId).orElse(null) ?: return false
+        attempt.status = AttemptStatus.IN_PROGRESS
+        attempt.timeStarted = attempt.timeStarted ?: now
+        attempts.save(attempt)
+        if (ownership.pair.status == PairStatus.SCHEDULED) {
+            ownership.pair.status = PairStatus.INITIAL_INDEXING
+            pairs.save(ownership.pair)
+        }
+        return true
+    }
+
+    @Transactional
+    fun renew(claim: IngestionClaim, now: Instant = Instant.now()): Boolean {
+        val ownership = ownership(claim) ?: return false
+        val leaseExpiresAt = now.plus(INGESTION_LEASE)
+        ownership.job.leaseExpiresAt = leaseExpiresAt
+        ownership.pair.ingestionLeaseExpiresAt = leaseExpiresAt
+        jobs.save(ownership.job)
+        pairs.save(ownership.pair)
+        return true
+    }
+
+    @Transactional
+    fun complete(
+        claim: IngestionClaim,
+        status: AttemptStatus,
+        newDocuments: Int,
+        totalDocuments: Int,
+        removedDocuments: Int,
+        updateLastPrunedAt: Boolean,
+    ): Boolean {
+        val ownership = ownership(claim) ?: return false
+        val attempt = attempts.findById(claim.attemptId).orElse(null) ?: return false
+        attempt.status = status
+        attempt.newDocsIndexed = newDocuments
+        attempt.totalDocsIndexed = totalDocuments
+        attempt.docsRemovedFromIndex = removedDocuments
+        attempts.save(attempt)
+        ownership.pair.inRepeatedErrorState = false
+        ownership.pair.status = PairStatus.ACTIVE
+        if (updateLastPrunedAt) ownership.pair.lastPrunedAt = Instant.now()
+        releasePair(ownership.pair)
+        pairs.save(ownership.pair)
+        ownership.job.state = JobState.SUCCEEDED
+        releaseJob(ownership.job)
+        jobs.save(ownership.job)
+        return true
+    }
+
+    @Transactional
+    fun cancel(claim: IngestionClaim): Boolean {
+        val ownership = ownership(claim) ?: return false
+        val attempt = attempts.findById(claim.attemptId).orElse(null) ?: return false
+        attempt.status = AttemptStatus.CANCELED
+        attempts.save(attempt)
+        releasePair(ownership.pair)
+        pairs.save(ownership.pair)
+        ownership.job.state = JobState.SUCCEEDED
+        releaseJob(ownership.job)
+        jobs.save(ownership.job)
+        return true
+    }
+
+    @Transactional
+    fun fail(claim: IngestionClaim, error: Exception, refreshFreq: Long?): Boolean {
+        val ownership = ownership(claim) ?: return false
+        val attempt = attempts.findById(claim.attemptId).orElse(null) ?: return false
+        attempt.status = AttemptStatus.FAILED
+        attempt.errorMessage = error.message?.take(1000) ?: "Ingestion failed"
+        attempt.fullExceptionTrace = error.stackTraceToString().take(16000)
+        attempts.saveAndFlush(attempt)
+        errors.save(
+            IngestionErrorEntity(
+                attemptId = claim.attemptId,
+                failureMessage = attempt.errorMessage ?: "Ingestion failed",
+                errorType = error::class.simpleName,
+            ),
+        )
+        ownership.pair.inRepeatedErrorState = isRepeatedError(
+            refreshFreq,
+            attempts.findAllByCcPairIdOrderByIdDesc(claim.pairId),
+        )
+        releasePair(ownership.pair)
+        pairs.save(ownership.pair)
+        ownership.job.state = JobState.FAILED
+        ownership.job.lastError = attempt.errorMessage
+        releaseJob(ownership.job)
+        jobs.save(ownership.job)
+        return true
+    }
+
+    private fun ownership(claim: IngestionClaim): IngestionOwnership? {
+        val job = jobs.lockById(claim.jobId) ?: return null
+        if (job.state != JobState.RUNNING || job.claimToken != claim.token || job.ccPairId != claim.pairId) return null
+        val pair = pairs.lockById(claim.pairId) ?: return null
+        if (pair.status == PairStatus.DELETING || pair.ingestionClaimToken != claim.token) return null
+        return IngestionOwnership(job, pair)
+    }
+
+    private fun releaseJob(job: IngestionJobEntity) {
+        job.claimToken = null
+        job.leaseExpiresAt = null
+    }
+
+    private fun releasePair(pair: com.onyx.foss.kotlin.domain.ConnectorCredentialPairEntity) {
+        pair.ingestionClaimToken = null
+        pair.ingestionLeaseExpiresAt = null
     }
 }
+
+data class IngestionClaim(
+    val jobId: Long,
+    val pairId: Long,
+    val attemptId: Long,
+    val token: UUID,
+)
+
+private data class IngestionOwnership(
+    val job: IngestionJobEntity,
+    val pair: com.onyx.foss.kotlin.domain.ConnectorCredentialPairEntity,
+)
 
 @Service
 class IngestionProcessor(
     private val admin: AdminService,
     private val pairs: ConnectorCredentialPairRepository,
     private val attempts: IngestionAttemptRepository,
-    private val jobs: IngestionJobRepository,
     private val checkpoints: IngestionCheckpointRepository,
     private val errors: IngestionErrorRepository,
+    private val enumeration: IngestionEnumerationRepository,
     private val documents: IndexedDocumentRepository,
+    private val documentSets: DocumentSetRepository,
     private val fileLoader: FileConnectorLoader,
     private val remoteLoaders: RemoteConnectorLoaders,
     private val embedder: ModelServerClient,
@@ -77,20 +224,17 @@ class IngestionProcessor(
     private val pruning: PruningService,
     private val permissionSync: PermissionSyncWorker,
     private val mapper: ObjectMapper,
+    private val claims: JobClaimService,
 ) {
     fun process(jobId: Long) {
-        val job = jobs.findById(jobId).orElse(null) ?: return
-        val attempt = attempts.findById(job.attemptId).orElse(null) ?: return
-        val pair = pairs.findById(attempt.ccPairId).orElse(null) ?: return
-        attempt.status = AttemptStatus.IN_PROGRESS
-        attempt.timeStarted = Instant.now()
-        attempts.save(attempt)
-        if (pair.status == PairStatus.SCHEDULED) {
-            pair.status = PairStatus.INITIAL_INDEXING
-            pairs.save(pair)
-        }
+        claims.claimJob(jobId)?.let(::process)
+    }
+
+    fun process(claim: IngestionClaim) {
+        if (!claims.start(claim)) return
+        val attempt = attempts.findById(claim.attemptId).orElse(null) ?: return
+        val pair = pairs.findById(claim.pairId).orElse(null) ?: return
         var refreshFreq: Long? = null
-        var runPermissionSync = false
         try {
             val connector = admin.connector(pair.connectorId)
             refreshFreq = connector.refreshFreq
@@ -115,43 +259,53 @@ class IngestionProcessor(
                 when (connector.source) {
                     ConnectorSource.FILE -> fileLoader.load(connector.connectorSpecificConfig)
                     else -> remoteLoaders.load(
-                    connector.source,
-                    connector.connectorSpecificConfig,
-                    credentials,
-                    checkpoint,
-                    attempt.pollRangeStart,
-                    attempt.pollRangeEnd,
-                )
+                        connector.source,
+                        connector.connectorSpecificConfig,
+                        credentials,
+                        checkpoint,
+                        attempt.pollRangeStart,
+                        attempt.pollRangeEnd,
+                    )
                 }
             }
-            var newDocuments = 0
-            var totalDocuments = 0
+            var newDocuments = attempt.newDocsIndexed
+            var totalDocuments = attempt.totalDocsIndexed
             var hasFailures = false
             var completeEnumeration = false
-            val seenDocumentIds = mutableSetOf<String>()
-            val failedDocumentIds = mutableSetOf<String>()
+            var enumerationSafe = true
+            val attemptId = requireNotNull(attempt.id)
             val batchIterator = batches.iterator()
             while (true) {
-                stopIfPaused(requireNotNull(pair.id))
+                stopIfStopped(claim)
                 if (!batchIterator.hasNext()) break
                 val batch = batchIterator.next()
-                stopIfPaused(requireNotNull(pair.id))
+                stopIfStopped(claim)
                 val batchFailedDocumentIds = batch.failures.mapNotNull { failure ->
                     (failure.target as? FailureTarget.Document)?.id
                 }.toSet()
-                failedDocumentIds += batchFailedDocumentIds
+                enumeration.protectFailures(attemptId, batchFailedDocumentIds)
+                if (!batch.enumerationComplete || batch.failures.any { it.target !is FailureTarget.Document }) {
+                    enumerationSafe = false
+                }
+                val newDocumentIds = enumeration.registerDocuments(attemptId, batch.documents.map(SourceDocument::id))
+                val processedInBatch = mutableSetOf<String>()
                 batch.documents.forEach { document ->
-                    if (!seenDocumentIds.add(document.id)) {
-                        return@forEach
-                    }
+                    if (document.id !in newDocumentIds || !processedInBatch.add(document.id)) return@forEach
                     if (attempt.pruneOnly) return@forEach
                     if (document.title.isBlank() && document.content.isBlank()) {
+                        enumerationSafe = false
                         return@forEach
                     }
                     val indexableContent = document.content.ifBlank { document.title }
                     val chunks = indexableContent.chunked(1500).filter { it.isNotBlank() }
-                    if (chunks.isEmpty()) return@forEach
+                    if (chunks.isEmpty()) {
+                        enumerationSafe = false
+                        return@forEach
+                    }
+                    renew(claim)
                     val vectors = embedder.embed(chunks)
+                    renew(claim)
+                    val documentSetNames = documentSets.findNamesByCcPairId(requireNotNull(pair.id))
                     chunks.zip(vectors).forEachIndexed { index, item ->
                         indexer.upsert(
                             pairId = requireNotNull(pair.id),
@@ -162,8 +316,16 @@ class IngestionProcessor(
                             link = document.link,
                             metadata = document.metadata,
                             embedding = item.second,
+                            documentSets = documentSetNames,
+                            updatedAt = document.updatedAt,
+                            primaryOwners = document.primaryOwners,
+                            secondaryOwners = document.secondaryOwners,
                         )
+                        renew(claim)
                     }
+                    renew(claim)
+                    indexer.deleteStaleChunks(requireNotNull(pair.id), document.id, chunks.size)
+                    renew(claim)
                     val existing = documents.findByCcPairIdAndSourceDocumentId(requireNotNull(pair.id), document.id)
                     if (existing == null) newDocuments += 1
                     val indexedDocument = existing ?: IndexedDocumentEntity(
@@ -176,6 +338,9 @@ class IngestionProcessor(
                         contentHash = hash(document.content)
                         metadata = mapper.valueToTree(document.metadata)
                         externalAccess = document.externalAccess?.let(mapper::valueToTree)
+                        lastModified = document.updatedAt
+                        primaryOwners = document.primaryOwners
+                        secondaryOwners = document.secondaryOwners
                         lastSynced = Instant.now()
                     }
                     documents.save(indexedDocument)
@@ -189,6 +354,7 @@ class IngestionProcessor(
                             .onEach { it.isResolved = true }
                         errors.saveAll(resolvedErrors)
                     }
+                    enumeration.markProcessed(attemptId, document.id)
                 }
                 if (batch.failures.isNotEmpty()) {
                     hasFailures = true
@@ -202,63 +368,49 @@ class IngestionProcessor(
                         ),
                     )
                 }
-                completeEnumeration = !batch.checkpoint.hasMore
+                completeEnumeration = enumerationSafe && !batch.checkpoint.hasMore
+                attempt.enumerationComplete = completeEnumeration
+                attempts.save(attempt)
             }
-            stopIfPaused(requireNotNull(pair.id))
+            stopIfStopped(claim)
             attempt.docsRemovedFromIndex = pruning.prune(
                 requireNotNull(pair.id),
-                seenDocumentIds,
-                failedDocumentIds,
+                attemptId,
                 attempt.fromBeginning || attempt.pruneOnly,
                 completeEnumeration,
+                beforeDelete = { renew(claim) },
             )
-            if ((attempt.fromBeginning || attempt.pruneOnly) && completeEnumeration) pair.lastPrunedAt = Instant.now()
             if (!hasFailures) {
                 val resolvedEntityErrors = errors.findUnresolvedEntityErrorsByCcPairId(requireNotNull(pair.id))
                     .onEach { it.isResolved = true }
                 errors.saveAll(resolvedEntityErrors)
             }
-            attempt.status = if (hasFailures) AttemptStatus.COMPLETED_WITH_ERRORS else AttemptStatus.SUCCESS
-            attempt.newDocsIndexed = newDocuments
-            attempt.totalDocsIndexed = totalDocuments
-            attempts.save(attempt)
-            pair.inRepeatedErrorState = false
-            pair.status = PairStatus.ACTIVE
-            pairs.save(pair)
-            job.state = JobState.SUCCEEDED
-            jobs.save(job)
-            runPermissionSync = !attempt.pruneOnly
+            renew(claim)
+            if (!attempt.pruneOnly) permissionSync.enqueue(requireNotNull(pair.id))
+            claims.complete(
+                claim = claim,
+                status = if (hasFailures) AttemptStatus.COMPLETED_WITH_ERRORS else AttemptStatus.SUCCESS,
+                newDocuments = newDocuments,
+                totalDocuments = totalDocuments,
+                removedDocuments = attempt.docsRemovedFromIndex,
+                updateLastPrunedAt = (attempt.fromBeginning || attempt.pruneOnly) && completeEnumeration,
+            )
         } catch (_: ConnectorPausedException) {
-            attempt.status = AttemptStatus.CANCELED
-            attempts.save(attempt)
-            job.state = JobState.SUCCEEDED
-            jobs.save(job)
+            claims.cancel(claim)
+        } catch (_: StaleIngestionClaimException) {
+            return
         } catch (error: Exception) {
-            attempt.status = AttemptStatus.FAILED
-            attempt.errorMessage = error.message?.take(1000) ?: "Ingestion failed"
-            attempt.fullExceptionTrace = error.stackTraceToString().take(16000)
-            attempts.save(attempt)
-            errors.save(
-                IngestionErrorEntity(
-                    attemptId = requireNotNull(attempt.id),
-                    failureMessage = attempt.errorMessage ?: "Ingestion failed",
-                    errorType = error::class.simpleName,
-                ),
-            )
-            pair.inRepeatedErrorState = isRepeatedError(
-                refreshFreq,
-                attempts.findAllByCcPairIdOrderByIdDesc(requireNotNull(pair.id)),
-            )
-            pairs.save(pair)
-            job.state = JobState.FAILED
-            job.lastError = attempt.errorMessage
-            jobs.save(job)
+            claims.fail(claim, error, refreshFreq)
         }
-        if (runPermissionSync) permissionSync.process(requireNotNull(pair.id))
     }
 
-    private fun stopIfPaused(pairId: Long) {
-        if (pairs.findById(pairId).orElseThrow().status == PairStatus.PAUSED) throw ConnectorPausedException()
+    private fun stopIfStopped(claim: IngestionClaim) {
+        if (pairs.findById(claim.pairId).orElse(null)?.status == PairStatus.PAUSED) throw ConnectorPausedException()
+        renew(claim)
+    }
+
+    private fun renew(claim: IngestionClaim) {
+        if (!claims.renew(claim)) throw StaleIngestionClaimException()
     }
 
     private fun hash(value: String): String =
@@ -289,6 +441,7 @@ class IngestionProcessor(
 }
 
 private class ConnectorPausedException : RuntimeException()
+private class StaleIngestionClaimException : RuntimeException()
 
 internal fun isRepeatedError(refreshFreq: Long?, recent: List<IngestionAttemptEntity>): Boolean {
     val required = if (refreshFreq == null) 1 else 5
@@ -343,7 +496,7 @@ class ModelServerClient(
             )
             .retrieve()
             .bodyToMono(JsonNode::class.java)
-            .block() ?: error("Model server returned no embedding response")
+            .block(MODEL_SERVER_TIMEOUT) ?: error("Model server returned no embedding response")
         return response.path("embeddings").map { vector -> vector.map { it.asDouble() } }
     }
 }
@@ -354,6 +507,8 @@ class OpenSearchIndexer(
     private val clientBuilder: WebClient.Builder,
     private val mapper: ObjectMapper,
 ) {
+    private val indexReady = AtomicBoolean(false)
+
     fun deletePair(pairId: Long) {
         deleteByQuery(mapOf("term" to mapOf("cc_pair_id" to pairId)), "pair deletion")
     }
@@ -369,6 +524,21 @@ class OpenSearchIndexer(
                 ),
             ),
             "document deletion",
+        )
+    }
+
+    fun deleteStaleChunks(pairId: Long, sourceDocumentId: String, newChunkCount: Int) {
+        deleteByQuery(
+            mapOf(
+                "bool" to mapOf(
+                    "filter" to listOf(
+                        mapOf("term" to mapOf("cc_pair_id" to pairId)),
+                        mapOf("term" to mapOf(EXACT_DOCUMENT_ID_FIELD to sourceDocumentId)),
+                        mapOf("range" to mapOf("chunk_id" to mapOf("gte" to newChunkCount))),
+                    ),
+                ),
+            ),
+            "stale chunk deletion",
         )
     }
 
@@ -423,6 +593,7 @@ class OpenSearchIndexer(
     }
 
     private fun updateByQuery(body: Map<String, Any>, operation: String, minimumTotal: Int) {
+        ensureIndex()
         val response = clientBuilder.build()
             .post()
             .uri(
@@ -453,6 +624,7 @@ class OpenSearchIndexer(
     }
 
     private fun deleteByQuery(query: Map<String, Any>, operation: String) {
+        ensureIndex()
         val response = clientBuilder.build()
             .post()
             .uri(
@@ -462,13 +634,21 @@ class OpenSearchIndexer(
             .contentType(MediaType.APPLICATION_JSON)
             .bodyValue(mapOf("query" to query))
             .exchangeToMono { result ->
-                if (result.statusCode().is2xxSuccessful) result.releaseBody().thenReturn(true)
+                if (result.statusCode().is2xxSuccessful) {
+                    result.bodyToMono(JsonNode::class.java).defaultIfEmpty(mapper.createObjectNode())
+                }
                 else result.bodyToMono(String::class.java).flatMap {
                     Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
                 }
             }
-            .block()
-        check(response == true) { "OpenSearch did not confirm $operation" }
+            .block(OPENSEARCH_TIMEOUT)
+        val total = response?.path("total")?.asInt(-1) ?: -1
+        val deleted = response?.path("deleted")?.asInt(-1) ?: -1
+        check(
+            response != null && !response.path("timed_out").asBoolean(true) &&
+                response.path("failures").isArray && response.path("failures").isEmpty &&
+                response.path("version_conflicts").asInt(-1) == 0 && total >= 0 && deleted == total,
+        ) { "OpenSearch did not fully apply the $operation" }
     }
 
     fun upsert(
@@ -480,7 +660,12 @@ class OpenSearchIndexer(
         link: String?,
         metadata: Map<String, Any?>,
         embedding: List<Double>,
+        documentSets: List<String> = emptyList(),
+        updatedAt: Instant? = null,
+        primaryOwners: List<String> = emptyList(),
+        secondaryOwners: List<String> = emptyList(),
     ) {
+        ensureIndex()
         val documentId = Base64.getUrlEncoder().withoutPadding().encodeToString(
             (pairId.toString() + ":" + sourceDocumentId + ":" + chunkId).toByteArray(StandardCharsets.UTF_8),
         )
@@ -493,6 +678,13 @@ class OpenSearchIndexer(
             "link" to link,
             "metadata" to metadata,
             "embedding" to embedding,
+            "document_sets" to documentSets,
+            "doc_updated_at" to updatedAt,
+            "primary_owners" to primaryOwners,
+            "secondary_owners" to secondaryOwners,
+            "external_user_emails" to emptyList<String>(),
+            "external_user_group_ids" to emptyList<String>(),
+            "is_public" to false,
         )
         val response = clientBuilder.build()
             .put()
@@ -503,9 +695,90 @@ class OpenSearchIndexer(
                 if (result.statusCode().is2xxSuccessful) result.releaseBody().thenReturn(true)
                 else result.bodyToMono(String::class.java).flatMap { Mono.error(IllegalStateException("OpenSearch index write failed: " + it)) }
             }
-            .block()
+            .block(OPENSEARCH_TIMEOUT)
         check(response == true) { "OpenSearch did not confirm the index write" }
+    }
+
+    private fun ensureIndex() {
+        if (indexReady.get()) return
+        synchronized(indexReady) {
+            if (indexReady.get()) return
+            val indexUrl = properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index
+            val exists = clientBuilder.build().head().uri(indexUrl).exchangeToMono { response ->
+                when {
+                    response.statusCode().is2xxSuccessful -> response.releaseBody().thenReturn(true)
+                    response.statusCode().value() == 404 -> response.releaseBody().thenReturn(false)
+                    else -> response.bodyToMono(String::class.java).flatMap {
+                        Mono.error(IllegalStateException("OpenSearch index check failed: $it"))
+                    }
+                }
+            }.block(OPENSEARCH_TIMEOUT) == true
+            if (!exists) {
+                putJson(indexUrl, INDEX_DEFINITION, "index creation")
+            } else {
+                val mapping = getJson("$indexUrl/_mapping", "mapping check")
+                val propertiesNode = mapping.path(properties.opensearch.index).path("mappings").path("properties")
+                val missingFields = linkedMapOf<String, Any>()
+                EXACT_FIELDS.forEach { (field, definition) ->
+                    val expectedType = (definition as Map<*, *>)["type"].toString()
+                    val actualType = propertiesNode.path(field).path("type").asText()
+                    if (actualType.isBlank()) {
+                        missingFields[field] = definition
+                    } else {
+                        check(actualType == expectedType) {
+                            "OpenSearch field $field must use $expectedType mapping, but found $actualType"
+                        }
+                    }
+                }
+                if (missingFields.isNotEmpty()) {
+                    putJson("$indexUrl/_mapping", mapOf("properties" to missingFields), "exact mapping creation")
+                }
+            }
+            indexReady.set(true)
+        }
+    }
+
+    private fun getJson(uri: String, operation: String): JsonNode = requireNotNull(
+        clientBuilder.build().get().uri(uri).exchangeToMono { response ->
+            if (response.statusCode().is2xxSuccessful) response.bodyToMono(JsonNode::class.java)
+            else response.bodyToMono(String::class.java).flatMap {
+                Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
+            }
+        }.block(OPENSEARCH_TIMEOUT),
+    )
+
+    private fun putJson(uri: String, body: Map<String, Any>, operation: String) {
+        val confirmed = clientBuilder.build().put().uri(uri)
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue(mapper.valueToTree<JsonNode>(body))
+            .exchangeToMono { response ->
+                if (response.statusCode().is2xxSuccessful) response.releaseBody().thenReturn(true)
+                else response.bodyToMono(String::class.java).flatMap {
+                    Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
+                }
+            }.block(OPENSEARCH_TIMEOUT)
+        check(confirmed == true) { "OpenSearch did not confirm $operation" }
+    }
+
+    private companion object {
+        const val EXACT_DOCUMENT_ID_FIELD = "source_document_id"
+        val EXACT_FIELDS: Map<String, Any> = mapOf(
+            "cc_pair_id" to mapOf("type" to "long"),
+            EXACT_DOCUMENT_ID_FIELD to mapOf("type" to "keyword"),
+            "chunk_id" to mapOf("type" to "integer"),
+            "external_user_emails" to mapOf("type" to "keyword"),
+            "external_user_group_ids" to mapOf("type" to "keyword"),
+            "is_public" to mapOf("type" to "boolean"),
+            "document_sets" to mapOf("type" to "keyword"),
+            "doc_updated_at" to mapOf("type" to "date"),
+            "primary_owners" to mapOf("type" to "keyword"),
+            "secondary_owners" to mapOf("type" to "keyword"),
+        )
+        val INDEX_DEFINITION: Map<String, Any> = mapOf("mappings" to mapOf("properties" to EXACT_FIELDS))
     }
 }
 
 internal val DOCUMENT_SET_UPDATE_TIMEOUT: Duration = Duration.ofSeconds(30)
+internal val OPENSEARCH_TIMEOUT: Duration = Duration.ofSeconds(30)
+internal val MODEL_SERVER_TIMEOUT: Duration = Duration.ofSeconds(30)
+internal val INGESTION_LEASE: Duration = Duration.ofMinutes(1)

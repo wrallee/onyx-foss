@@ -7,12 +7,18 @@ import com.onyx.foss.kotlin.domain.ConnectorRepository
 import com.onyx.foss.kotlin.domain.CredentialRepository
 import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxRepository
+import com.onyx.foss.kotlin.domain.DocumentSetSyncStatus
 import com.onyx.foss.kotlin.domain.AttemptStatus
 import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
 import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
+import com.onyx.foss.kotlin.domain.IngestionErrorEntity
+import com.onyx.foss.kotlin.domain.IngestionErrorRepository
 import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.domain.IndexedDocumentEntity
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
+import com.onyx.foss.kotlin.domain.JobState
+import com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity
+import com.onyx.foss.kotlin.domain.PermissionSyncAttemptRepository
 import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
 import com.onyx.foss.kotlin.service.AdminService
 import com.onyx.foss.kotlin.service.FileStorageService
@@ -52,7 +58,9 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var documentSetSyncOutbox: DocumentSetSyncOutboxRepository
     @Autowired private lateinit var jobs: IngestionJobRepository
     @Autowired private lateinit var attempts: IngestionAttemptRepository
+    @Autowired private lateinit var errors: IngestionErrorRepository
     @Autowired private lateinit var documents: IndexedDocumentRepository
+    @Autowired private lateinit var permissionAttempts: PermissionSyncAttemptRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
     @Autowired private lateinit var storedFiles: FileStorageService
     @MockitoBean private lateinit var indexer: OpenSearchIndexer
@@ -60,8 +68,9 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
     @BeforeEach
     fun resetDatabase() {
         jdbc.execute(
-            "TRUNCATE document_set_sync_outbox, ingestion_errors, ingestion_jobs, ingestion_attempts, ingestion_checkpoints, " +
-                "indexed_documents, document_set_cc_pairs, document_sets, connector_credential_pairs, " +
+            "TRUNCATE permission_sync_staging, permission_sync_attempts, document_set_sync_outbox, ingestion_errors, " +
+                "ingestion_jobs, ingestion_attempts, ingestion_checkpoints, indexed_documents, document_set_cc_pairs, " +
+                "document_sets, connector_credential_pairs, " +
                 "connectors, credentials RESTART IDENTITY CASCADE",
         )
     }
@@ -188,7 +197,7 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
         assertThat(pairs.findById(secondPairId).orElseThrow().status.name).isEqualTo("SCHEDULED")
         assertThat(connectors.count()).isEqualTo(2)
         assertThat(pairs.count()).isEqualTo(2)
-        assertThat(queuedJobs()).isEqualTo(3)
+        assertThat(queuedJobs()).isEqualTo(2)
     }
 
     @Test
@@ -337,6 +346,10 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
         val connectorId = createConnector("github")
         val credentialId = createCredential("github", "secret-token")
         val pairId = associate(connectorId, credentialId)
+        jobs.saveAndFlush(jobs.findAll().single().apply { state = JobState.SUCCEEDED })
+        attempts.saveAndFlush(
+            attempts.findAllByCcPairIdOrderByIdDesc(pairId).single().apply { status = AttemptStatus.SUCCESS },
+        )
         postJson("/manage/admin/connector/run-once", mapOf("connector_id" to connectorId))
 
         val pageZero = request(get("/manage/admin/cc-pair/$pairId/index-attempts?page_num=0&page_size=1"))
@@ -428,6 +441,92 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun entityErrorsReturnStoredFailureContext() {
+        val pairId = createPairWithoutQueuedAttempt()
+        val attempt = attempts.save(IngestionAttemptEntity(ccPairId = pairId, status = AttemptStatus.COMPLETED_WITH_ERRORS))
+        val missedStart = Instant.parse("2026-08-01T00:00:00Z")
+        val missedEnd = Instant.parse("2026-08-02T00:00:00Z")
+        errors.save(
+            IngestionErrorEntity(
+                attemptId = requireNotNull(attempt.id),
+                entityId = "repository:test/project",
+                failedTimeRangeStart = missedStart,
+                failedTimeRangeEnd = missedEnd,
+                failureMessage = "Repository enumeration failed",
+            ),
+        )
+
+        val response = request(get("/manage/admin/cc-pair/$pairId/errors?page_num=0&page_size=10"))
+
+        val item = response.body.path("items").single()
+        assertThat(item.path("entity_id").asText()).isEqualTo("repository:test/project")
+        assertThat(Instant.parse(item.path("failed_time_range_start").asText())).isEqualTo(missedStart)
+        assertThat(Instant.parse(item.path("failed_time_range_end").asText())).isEqualTo(missedEnd)
+    }
+
+    @Test
+    fun pairDetailDerivesPruneAndPermissionStatusFromDurableRows() {
+        val pairId = createPairWithoutQueuedAttempt()
+        val prunedAt = Instant.parse("2026-08-01T00:00:00Z")
+        val successfulAt = Instant.parse("2026-08-02T00:00:00Z")
+        val failedAt = Instant.parse("2026-08-03T00:00:00Z")
+        pairs.findById(pairId).orElseThrow().also {
+            it.lastPrunedAt = prunedAt
+            pairs.saveAndFlush(it)
+        }
+        permissionAttempts.save(
+            PermissionSyncAttemptEntity(
+                ccPairId = pairId,
+                status = AttemptStatus.SUCCESS,
+                timeFinished = successfulAt,
+            ),
+        )
+        permissionAttempts.save(
+            PermissionSyncAttemptEntity(
+                ccPairId = pairId,
+                status = AttemptStatus.FAILED,
+                errorMessage = "permission lookup failed",
+                timeFinished = failedAt,
+            ),
+        )
+
+        val terminal = request(get("/manage/admin/cc-pair/$pairId")).body
+
+        assertThat(Instant.parse(terminal.path("last_pruned").asText())).isEqualTo(prunedAt)
+        assertThat(Instant.parse(terminal.path("last_full_permission_sync").asText())).isEqualTo(successfulAt)
+        assertThat(terminal.path("last_permission_sync_attempt_status").asText()).isEqualTo("failed")
+        assertThat(terminal.path("permission_syncing").asBoolean()).isFalse()
+        assertThat(Instant.parse(terminal.path("last_permission_sync_attempt_finished").asText())).isEqualTo(failedAt)
+        assertThat(terminal.path("last_permission_sync_attempt_error_message").asText())
+            .isEqualTo("permission lookup failed")
+
+        permissionAttempts.save(PermissionSyncAttemptEntity(ccPairId = pairId))
+
+        val pending = request(get("/manage/admin/cc-pair/$pairId")).body
+        assertThat(pending.path("last_permission_sync_attempt_status").asText()).isEqualTo("not_started")
+        assertThat(pending.path("permission_syncing").asBoolean()).isTrue()
+        assertThat(Instant.parse(pending.path("last_full_permission_sync").asText())).isEqualTo(successfulAt)
+    }
+
+    @Test
+    fun documentSetDetailIsCurrentOnlyAfterDurableOutboxCompletes() {
+        val connectorId = createConnector("file")
+        val credentialId = createCredential("file", "file-secret")
+        val pairId = associate(connectorId, credentialId)
+        val setId = postJson("/manage/admin/document-set", documentSet("Engineering", listOf(pairId))).body.asLong()
+
+        val pending = request(get("/manage/admin/document-set/$setId")).body
+
+        assertThat(pending.path("is_up_to_date").asBoolean()).isFalse()
+        documentSetSyncOutbox.saveAllAndFlush(
+            documentSetSyncOutbox.findAll().onEach { it.status = DocumentSetSyncStatus.DONE },
+        )
+
+        val completed = request(get("/manage/admin/document-set/$setId")).body
+        assertThat(completed.path("is_up_to_date").asBoolean()).isTrue()
+    }
+
+    @Test
     fun fileMetadataKeepsNamesAlignedWithLocations() {
         val connectorId = createConnector("file")
         val credentialId = createCredential("file", "file-secret")
@@ -458,7 +557,7 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
         assertThat(config.path("file_locations").map(JsonNode::asText)).containsExactly(bId, response.body.path("file_paths").first().asText())
         assertThat(config.path("file_names").map(JsonNode::asText)).containsExactly("b.txt", "c.txt")
         assertThat(connectors.count()).isEqualTo(1)
-        assertThat(queuedJobs()).isEqualTo(2)
+        assertThat(queuedJobs()).isEqualTo(1)
     }
 
     @Test

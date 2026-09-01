@@ -26,6 +26,7 @@ import com.onyx.foss.kotlin.domain.DocumentSetEntity
 import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxEntity
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxRepository
+import com.onyx.foss.kotlin.domain.DocumentSetSyncStatus
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
 import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
@@ -33,6 +34,7 @@ import com.onyx.foss.kotlin.domain.IngestionJobEntity
 import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.domain.JobState
 import com.onyx.foss.kotlin.domain.PairStatus
+import com.onyx.foss.kotlin.domain.PermissionSyncAttemptRepository
 import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
 import com.onyx.foss.kotlin.security.CredentialCipher
 import org.springframework.http.HttpStatus
@@ -50,6 +52,7 @@ class AdminService(
     private val sets: DocumentSetRepository,
     private val documentSetSyncOutbox: DocumentSetSyncOutboxRepository,
     private val attempts: IngestionAttemptRepository,
+    private val permissionAttempts: PermissionSyncAttemptRepository,
     private val jobs: IngestionJobRepository,
     private val documents: IndexedDocumentRepository,
     private val indexer: OpenSearchIndexer,
@@ -186,26 +189,43 @@ class AdminService(
 
     @Transactional
     fun deleteConnector(connectorId: Long): StatusResponse {
-        val pairIds = pairs.findAllByConnectorId(connectorId).map(::id)
-        pairIds.forEach { pairId ->
+        val connector = connectors.lockById(connectorId)
+            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
+        val lockedPairs = pairs.findAllByConnectorId(connectorId).map { pair ->
+            pairs.lockById(id(pair)) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+        }
+        lockedPairs.forEach(::markDeleting)
+        pairs.flush()
+        lockedPairs.map(::id).forEach { pairId ->
             indexer.deletePair(pairId)
             documents.deleteAllByCcPairId(pairId)
         }
-        connectors.delete(connector(connectorId))
+        connectors.delete(connector)
         return StatusResponse(true, "Connector deleted successfully", connectorId)
     }
 
     @Transactional
     fun deletePair(request: DeletionAttemptRequest): StatusResponse {
-        val pair = pairs.findByConnectorIdAndCredentialId(request.connectorId, request.credentialId)
+        val existing = pairs.findByConnectorIdAndCredentialId(request.connectorId, request.credentialId)
+            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
+        val pair = pairs.lockById(id(existing))
             ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
         val pairId = id(pair)
         val hasOtherPairs = pairs.findAllByConnectorId(request.connectorId).any { id(it) != pairId }
+        markDeleting(pair)
+        pairs.flush()
         indexer.deletePair(pairId)
         documents.deleteAllByCcPairId(pairId)
         pairs.delete(pair)
         if (!hasOtherPairs) connectors.delete(connector(request.connectorId))
         return StatusResponse(true, "Connector deletion completed", pairId)
+    }
+
+    private fun markDeleting(pair: ConnectorCredentialPairEntity) {
+        pair.status = PairStatus.DELETING
+        pair.ingestionClaimToken = null
+        pair.ingestionLeaseExpiresAt = null
+        pairs.save(pair)
     }
 
     @Transactional
@@ -231,6 +251,11 @@ class AdminService(
         val pair = pair(pairId)
         val latest = attempts.findFirstByCcPairIdOrderByIdDesc(pairId)
         val lastSuccessful = lastSuccessfulAttempt(pairId)
+        val latestPermission = permissionAttempts.findFirstByCcPairIdOrderByIdDesc(pairId)
+        val lastFullPermission = permissionAttempts.findFirstByCcPairIdAndStatusInOrderByTimeFinishedDescIdDesc(
+            pairId,
+            listOf(AttemptStatus.SUCCESS, AttemptStatus.COMPLETED_WITH_ERRORS),
+        )
         return mapOf(
             "id" to pairId,
             "name" to pair.name,
@@ -250,14 +275,14 @@ class AdminService(
             "creator" to null,
             "creator_email" to null,
             "last_indexed" to lastSuccessful?.timeStarted,
-            "last_pruned" to null,
-            "last_full_permission_sync" to null,
+            "last_pruned" to pair.lastPrunedAt,
+            "last_full_permission_sync" to lastFullPermission?.timeFinished,
             "overall_indexing_speed" to null,
             "latest_checkpoint_description" to null,
-            "last_permission_sync_attempt_status" to null,
-            "permission_syncing" to false,
-            "last_permission_sync_attempt_finished" to null,
-            "last_permission_sync_attempt_error_message" to null,
+            "last_permission_sync_attempt_status" to latestPermission?.status?.value,
+            "permission_syncing" to (latestPermission?.status in setOf(AttemptStatus.NOT_STARTED, AttemptStatus.IN_PROGRESS)),
+            "last_permission_sync_attempt_finished" to latestPermission?.timeFinished,
+            "last_permission_sync_attempt_error_message" to latestPermission?.errorMessage,
             "supports_targeted_reindex" to false,
         )
     }
@@ -286,6 +311,12 @@ class AdminService(
 
     @Transactional
     fun enqueuePair(pairId: Long, fromBeginning: Boolean, pruneOnly: Boolean = false): Long {
+        val pair = pairs.lockById(pairId) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+        if (pair.status == PairStatus.DELETING) {
+            throw ApiException(HttpStatus.CONFLICT, "CC Pair is being deleted")
+        }
+        jobs.findFirstByCcPairIdAndStateInOrderById(pairId, listOf(JobState.QUEUED, JobState.RUNNING))
+            ?.let { return id(it) }
         val attempt = attempts.save(
             IngestionAttemptEntity(
                 ccPairId = pairId,
@@ -293,7 +324,11 @@ class AdminService(
                 pruneOnly = pruneOnly,
             ),
         )
-        return id(jobs.save(IngestionJobEntity(attemptId = id(attempt), state = JobState.QUEUED)))
+        return id(
+            jobs.save(
+                IngestionJobEntity(attemptId = id(attempt), ccPairId = pairId, state = JobState.QUEUED),
+            ),
+        )
     }
 
     fun indexingStatus(source: ConnectorSource?, filter: String?): List<Map<String, Any?>> =
@@ -399,7 +434,9 @@ class AdminService(
             "description" to set.description,
             "cc_pair_summaries" to pairIds.map(::pairSummary),
             "cc_pair_descriptors" to pairIds.map(::pairDescriptor),
-            "is_up_to_date" to true,
+            "is_up_to_date" to !documentSetSyncOutbox.existsByStatusIn(
+                listOf(DocumentSetSyncStatus.PENDING, DocumentSetSyncStatus.IN_PROGRESS),
+            ),
             "is_public" to true,
             "users" to emptyList<String>(),
             "groups" to emptyList<Long>(),

@@ -17,12 +17,18 @@ interface CredentialRepository : JpaRepository<CredentialEntity, Long> {
     fun findAllBySource(source: ConnectorSource): List<CredentialEntity>
 }
 
-interface ConnectorRepository : JpaRepository<ConnectorEntity, Long>
+interface ConnectorRepository : JpaRepository<ConnectorEntity, Long> {
+    @Query(value = "SELECT * FROM connectors WHERE id = :id FOR UPDATE", nativeQuery = true)
+    fun lockById(@Param("id") id: Long): ConnectorEntity?
+}
 
 interface ConnectorCredentialPairRepository : JpaRepository<ConnectorCredentialPairEntity, Long> {
     fun findAllByConnectorId(connectorId: Long): List<ConnectorCredentialPairEntity>
     fun findAllByCredentialId(credentialId: Long): List<ConnectorCredentialPairEntity>
     fun findByConnectorIdAndCredentialId(connectorId: Long, credentialId: Long): ConnectorCredentialPairEntity?
+
+    @Query(value = "SELECT * FROM connector_credential_pairs WHERE id = :id FOR UPDATE", nativeQuery = true)
+    fun lockById(@Param("id") id: Long): ConnectorCredentialPairEntity?
 
     @Query(
         value = """
@@ -64,9 +70,23 @@ interface IngestionScheduleCandidate {
 interface DocumentSetRepository : JpaRepository<DocumentSetEntity, Long> {
     fun existsByName(name: String): Boolean
     fun existsByNameAndIdNot(name: String, id: Long): Boolean
+
+    @Query(
+        value = """
+            SELECT document_set.name
+            FROM document_sets document_set
+            JOIN document_set_cc_pairs membership ON membership.document_set_id = document_set.id
+            WHERE membership.cc_pair_id = :ccPairId
+            ORDER BY document_set.name
+        """,
+        nativeQuery = true,
+    )
+    fun findNamesByCcPairId(@Param("ccPairId") ccPairId: Long): List<String>
 }
 
 interface DocumentSetSyncOutboxRepository : JpaRepository<DocumentSetSyncOutboxEntity, Long> {
+    fun existsByStatusIn(statuses: Collection<DocumentSetSyncStatus>): Boolean
+
     @Query(
         value = """
             SELECT * FROM document_set_sync_outbox
@@ -165,17 +185,46 @@ interface IngestionAttemptRepository : JpaRepository<IngestionAttemptEntity, Lon
 interface IngestionCheckpointRepository : JpaRepository<IngestionCheckpointEntity, Long>
 
 interface IngestionJobRepository : JpaRepository<IngestionJobEntity, Long> {
+    fun findFirstByCcPairIdAndStateInOrderById(
+        ccPairId: Long,
+        states: Collection<JobState>,
+    ): IngestionJobEntity?
+
     @Query(
         value = """
-            SELECT * FROM ingestion_jobs
-            WHERE state = 'QUEUED' AND run_after <= :now
-            ORDER BY run_after, id
-            FOR UPDATE SKIP LOCKED
+            SELECT job.*
+            FROM ingestion_jobs job
+            JOIN connector_credential_pairs pair ON pair.id = job.cc_pair_id
+            WHERE pair.status <> 'DELETING'
+              AND (pair.ingestion_lease_expires_at IS NULL OR pair.ingestion_lease_expires_at < :now)
+              AND (
+                  (job.state = 'QUEUED' AND job.run_after <= :now)
+                  OR (job.state = 'RUNNING' AND (job.lease_expires_at IS NULL OR job.lease_expires_at < :now))
+              )
+            ORDER BY job.run_after, job.id
+            FOR UPDATE OF job SKIP LOCKED
             LIMIT 1
         """,
         nativeQuery = true,
     )
-    fun lockNextQueued(@Param("now") now: Instant): IngestionJobEntity?
+    fun lockNextClaimable(@Param("now") now: Instant): IngestionJobEntity?
+
+    @Query(
+        value = """
+            SELECT * FROM ingestion_jobs
+            WHERE id = :id
+              AND (
+                  (state = 'QUEUED' AND run_after <= :now)
+                  OR (state = 'RUNNING' AND (lease_expires_at IS NULL OR lease_expires_at < :now))
+              )
+            FOR UPDATE
+        """,
+        nativeQuery = true,
+    )
+    fun lockClaimableById(@Param("id") id: Long, @Param("now") now: Instant): IngestionJobEntity?
+
+    @Query(value = "SELECT * FROM ingestion_jobs WHERE id = :id FOR UPDATE", nativeQuery = true)
+    fun lockById(@Param("id") id: Long): IngestionJobEntity?
 }
 
 interface IndexedDocumentRepository : JpaRepository<IndexedDocumentEntity, Long> {
@@ -200,10 +249,9 @@ interface IndexedDocumentRepository : JpaRepository<IndexedDocumentEntity, Long>
         @Param("afterSourceDocumentId") afterSourceDocumentId: String,
         @Param("limit") limit: Int,
     ): List<IndexedDocumentEntity>
-    @Query("SELECT document.sourceDocumentId FROM IndexedDocumentEntity document WHERE document.ccPairId = :ccPairId")
-    fun findSourceIdsByCcPairId(@Param("ccPairId") ccPairId: Long): List<String>
     fun countByCcPairId(ccPairId: Long): Long
     fun deleteAllByCcPairId(ccPairId: Long)
+    @Transactional
     fun deleteByCcPairIdAndSourceDocumentIdIn(ccPairId: Long, sourceDocumentIds: Collection<String>): Long
 }
 
@@ -241,29 +289,42 @@ interface IngestionErrorRepository : JpaRepository<IngestionErrorEntity, Long> {
 interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptEntity, Long> {
     fun findAllByCcPairIdOrderByIdDesc(ccPairId: Long): List<PermissionSyncAttemptEntity>
     fun findFirstByCcPairIdOrderByIdDesc(ccPairId: Long): PermissionSyncAttemptEntity?
+    fun findFirstByCcPairIdAndStatusInOrderByTimeFinishedDescIdDesc(
+        ccPairId: Long,
+        statuses: Collection<AttemptStatus>,
+    ): PermissionSyncAttemptEntity?
 
-    @Transactional
-    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query(
         value = """
-            UPDATE permission_sync_attempts
-            SET status = 'FAILED',
-                error_msg = :message,
-                full_exception_trace = :trace,
-                time_finished = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE cc_pair_id = :ccPairId
-              AND status IN ('NOT_STARTED', 'IN_PROGRESS')
-              AND COALESCE(time_started, created_at) < :cutoff
+            SELECT * FROM permission_sync_attempts
+            WHERE status = 'NOT_STARTED'
+               OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at < :now))
+            ORDER BY created_at, id
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
         """,
         nativeQuery = true,
     )
-    fun failStaleActive(
+    fun lockNextClaimable(@Param("now") now: Instant): PermissionSyncAttemptEntity?
+
+    @Query(
+        value = """
+            SELECT * FROM permission_sync_attempts
+            WHERE cc_pair_id = :ccPairId
+              AND (
+                  status = 'NOT_STARTED'
+                  OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at < :now))
+              )
+            ORDER BY created_at, id
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+        """,
+        nativeQuery = true,
+    )
+    fun lockClaimableForPair(
         @Param("ccPairId") ccPairId: Long,
-        @Param("cutoff") cutoff: Instant,
-        @Param("message") message: String,
-        @Param("trace") trace: String,
-    ): Int
+        @Param("now") now: Instant,
+    ): PermissionSyncAttemptEntity?
 
     @Transactional
     @Modifying
@@ -276,6 +337,93 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
         nativeQuery = true,
     )
     fun createIfNoActive(@Param("ccPairId") ccPairId: Long): Int
+
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(
+        value = """
+            UPDATE permission_sync_attempts
+            SET lease_expires_at = :leaseExpiresAt,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :id
+              AND claim_token = :token
+              AND status = 'IN_PROGRESS'
+        """,
+        nativeQuery = true,
+    )
+    fun renewOwned(
+        @Param("id") id: Long,
+        @Param("token") token: UUID,
+        @Param("leaseExpiresAt") leaseExpiresAt: Instant,
+    ): Int
+
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(
+        value = """
+            UPDATE permission_sync_attempts
+            SET total_docs_synced = :total,
+                docs_with_permission_errors = :errors,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :id
+              AND claim_token = :token
+              AND status = 'IN_PROGRESS'
+        """,
+        nativeQuery = true,
+    )
+    fun updateCountsOwned(
+        @Param("id") id: Long,
+        @Param("token") token: UUID,
+        @Param("total") total: Int,
+        @Param("errors") errors: Int,
+    ): Int
+
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(
+        value = """
+            UPDATE permission_sync_attempts
+            SET status = :status,
+                claim_token = NULL,
+                lease_expires_at = NULL,
+                time_finished = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :id
+              AND claim_token = :token
+              AND status = 'IN_PROGRESS'
+        """,
+        nativeQuery = true,
+    )
+    fun completeOwned(
+        @Param("id") id: Long,
+        @Param("token") token: UUID,
+        @Param("status") status: String,
+    ): Int
+
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query(
+        value = """
+            UPDATE permission_sync_attempts
+            SET status = 'FAILED',
+                error_msg = :message,
+                full_exception_trace = :trace,
+                claim_token = NULL,
+                lease_expires_at = NULL,
+                time_finished = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = :id
+              AND claim_token = :token
+              AND status = 'IN_PROGRESS'
+        """,
+        nativeQuery = true,
+    )
+    fun failOwned(
+        @Param("id") id: Long,
+        @Param("token") token: UUID,
+        @Param("message") message: String,
+        @Param("trace") trace: String,
+    ): Int
 }
 
 data class PermissionSyncStageRow(
@@ -364,5 +512,101 @@ class PermissionSyncStageRepository(
             """.trimIndent(),
             pairId,
         )
+    }
+}
+
+@Repository
+class IngestionEnumerationRepository(
+    private val jdbc: JdbcTemplate,
+) {
+    @Transactional
+    fun registerDocuments(attemptId: Long, sourceDocumentIds: Collection<String>): Set<String> {
+        val ids = sourceDocumentIds.filter(String::isNotBlank).distinct()
+        jdbc.batchUpdate(
+            """
+                INSERT INTO ingestion_enumerated_documents(attempt_id, source_document_id)
+                VALUES (?, ?)
+                ON CONFLICT DO NOTHING
+            """.trimIndent(),
+            ids,
+            ENUMERATION_PAGE_SIZE,
+        ) { statement, sourceDocumentId ->
+            statement.setLong(1, attemptId)
+            statement.setString(2, sourceDocumentId)
+        }
+        return ids.chunked(ENUMERATION_PAGE_SIZE).flatMapTo(mutableSetOf()) { page ->
+            val placeholders = List(page.size) { "?" }.joinToString()
+            val parameters: Array<Any> = arrayOf(attemptId, *page.toTypedArray())
+            jdbc.queryForList(
+                """
+                    SELECT source_document_id
+                    FROM ingestion_enumerated_documents
+                    WHERE attempt_id = ?
+                      AND processed = FALSE
+                      AND source_document_id IN ($placeholders)
+                """.trimIndent(),
+                String::class.java,
+                *parameters,
+            )
+        }
+    }
+
+    @Transactional
+    fun markProcessed(attemptId: Long, sourceDocumentId: String) {
+        check(
+            jdbc.update(
+                """
+                    UPDATE ingestion_enumerated_documents
+                    SET processed = TRUE
+                    WHERE attempt_id = ? AND source_document_id = ?
+                """.trimIndent(),
+                attemptId,
+                sourceDocumentId,
+            ) == 1,
+        ) { "Enumerated document disappeared before processing completed" }
+    }
+
+    @Transactional
+    fun protectFailures(attemptId: Long, sourceDocumentIds: Collection<String>) {
+        val ids = sourceDocumentIds.filter(String::isNotBlank).distinct()
+        jdbc.batchUpdate(
+            """
+                INSERT INTO ingestion_enumerated_documents(attempt_id, source_document_id)
+                VALUES (?, ?)
+                ON CONFLICT DO NOTHING
+            """.trimIndent(),
+            ids,
+            ENUMERATION_PAGE_SIZE,
+        ) { statement, sourceDocumentId ->
+            statement.setLong(1, attemptId)
+            statement.setString(2, sourceDocumentId)
+        }
+    }
+
+    fun findMissingPage(pairId: Long, attemptId: Long, afterSourceDocumentId: String, limit: Int): List<String> =
+        jdbc.queryForList(
+            """
+                SELECT document.source_document_id
+                FROM indexed_documents document
+                WHERE document.cc_pair_id = ?
+                  AND document.source_document_id > ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM ingestion_enumerated_documents enumerated
+                      WHERE enumerated.attempt_id = ?
+                        AND enumerated.source_document_id = document.source_document_id
+                  )
+                ORDER BY document.source_document_id
+                LIMIT ?
+            """.trimIndent(),
+            String::class.java,
+            pairId,
+            afterSourceDocumentId,
+            attemptId,
+            limit,
+        )
+
+    private companion object {
+        const val ENUMERATION_PAGE_SIZE = 500
     }
 }

@@ -264,6 +264,7 @@ class ConfluenceConnectorLoader(
                     documents,
                     failures,
                     ConnectorCheckpoint(mapper.valueToTree(checkpoint), checkpoint.hasMore),
+                    failures.all { it.target is FailureTarget.Document },
                 ),
             )
             if (!checkpoint.hasMore) break
@@ -454,7 +455,8 @@ class ConfluenceConnectorLoader(
             return ProcessResult(
                 failures = listOf(
                     ConnectorFailure(
-                        FailureTarget.Document(pageId, pageUrl),
+                        pageUrl?.let { FailureTarget.Document(it, it) }
+                            ?: FailureTarget.Entity("confluence-page:$pageId"),
                         "Error converting Confluence page $pageId: ${error.message ?: error::class.simpleName}",
                         "confluence_page_processing",
                     ),
@@ -704,6 +706,7 @@ class ConfluenceConnectorLoader(
                     documents,
                     failures,
                     ConnectorCheckpoint(mapper.valueToTree(checkpoint), checkpoint.hasMore),
+                    failures.all { it.target is FailureTarget.Document },
                 ),
             )
             path = result.nextPath
@@ -1226,6 +1229,7 @@ class ConfluenceConnectorLoader(
         documents,
         failures,
         ConnectorCheckpoint(mapper.valueToTree(ConfluenceCheckpoint(hasMore = false)), hasMore = false),
+        failures.all { it.target is FailureTarget.Document },
     )
 
     private fun retryAfterMillis(error: WebClientResponseException, attempt: Int): Long {

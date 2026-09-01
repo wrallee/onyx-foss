@@ -254,6 +254,7 @@ class JiraConnectorLoaderTest {
         )
         val checkpoint = mapper.treeToValue(batch.checkpoint.value, JiraCheckpoint::class.java)
         assertEquals(setOf("ENG", "ENG-EPIC"), checkpoint.seenHierarchyNodeIds)
+        assertFalse(batch.enumerationComplete)
     }
 
     @Test
@@ -344,6 +345,7 @@ class JiraConnectorLoaderTest {
 
         assertEquals(listOf("ENG-1"), batch.documents.map { it.metadata["key"] })
         assertTrue(batch.failures.isEmpty())
+        assertFalse(batch.enumerationComplete)
     }
 
     @Test
@@ -353,7 +355,10 @@ class JiraConnectorLoaderTest {
         val batch = loader().load(config(server, "\"project_key\":\"ENG\""), tokenCredentials(), null).single()
 
         assertEquals(listOf("ENG-1"), batch.documents.map { it.metadata["key"] })
-        assertEquals("ENG-2", (batch.failures.single().target as FailureTarget.Document).id)
+        assertEquals(
+            server.url("/").toString().trimEnd('/') + "/browse/ENG-2",
+            (batch.failures.single().target as FailureTarget.Document).id,
+        )
         assertEquals("jira_issue_processing", batch.failures.single().errorType)
     }
 

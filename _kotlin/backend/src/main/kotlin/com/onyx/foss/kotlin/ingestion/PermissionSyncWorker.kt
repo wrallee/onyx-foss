@@ -2,6 +2,7 @@ package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.onyx.foss.kotlin.config.OnyxProperties
 import com.onyx.foss.kotlin.domain.AttemptStatus
 import com.onyx.foss.kotlin.domain.ConnectorCredentialPairRepository
 import com.onyx.foss.kotlin.domain.ConnectorSource
@@ -11,38 +12,114 @@ import com.onyx.foss.kotlin.domain.PermissionSyncAttemptRepository
 import com.onyx.foss.kotlin.domain.PermissionSyncStageRepository
 import com.onyx.foss.kotlin.domain.PermissionSyncStageRow
 import com.onyx.foss.kotlin.service.AdminService
+import org.springframework.scheduling.annotation.Scheduled
+import org.springframework.stereotype.Component
 import org.springframework.stereotype.Service
+import org.springframework.transaction.annotation.Transactional
+import java.time.Duration
 import java.time.Instant
+import java.util.UUID
+
+data class PermissionSyncClaim(
+    val attemptId: Long,
+    val pairId: Long,
+    val token: UUID,
+)
+
+@Service
+class PermissionSyncClaimService(
+    private val attempts: PermissionSyncAttemptRepository,
+) {
+    @Transactional
+    fun enqueue(pairId: Long): Boolean = attempts.createIfNoActive(pairId) == 1
+
+    @Transactional
+    fun claimNext(now: Instant = Instant.now()): PermissionSyncClaim? =
+        attempts.lockNextClaimable(now)?.let { claim(it, now) }
+
+    @Transactional
+    fun claimForPair(pairId: Long, now: Instant = Instant.now()): PermissionSyncClaim? =
+        attempts.lockClaimableForPair(pairId, now)?.let { claim(it, now) }
+
+    private fun claim(attempt: com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity, now: Instant): PermissionSyncClaim {
+        val token = UUID.randomUUID()
+        attempt.status = AttemptStatus.IN_PROGRESS
+        attempt.timeStarted = attempt.timeStarted ?: now
+        attempt.timeFinished = null
+        attempt.claimToken = token
+        attempt.leaseExpiresAt = now.plus(PERMISSION_SYNC_LEASE)
+        attempts.saveAndFlush(attempt)
+        return PermissionSyncClaim(requireNotNull(attempt.id), attempt.ccPairId, token)
+    }
+
+    fun renew(claim: PermissionSyncClaim, now: Instant = Instant.now()): Boolean =
+        attempts.renewOwned(claim.attemptId, claim.token, now.plus(PERMISSION_SYNC_LEASE)) == 1
+
+    fun updateCounts(claim: PermissionSyncClaim, total: Int, errors: Int): Boolean =
+        attempts.updateCountsOwned(claim.attemptId, claim.token, total, errors) == 1
+
+    fun complete(claim: PermissionSyncClaim, status: AttemptStatus): Boolean =
+        attempts.completeOwned(claim.attemptId, claim.token, status.name) == 1
+
+    fun fail(claim: PermissionSyncClaim, error: Exception): Boolean = attempts.failOwned(
+        claim.attemptId,
+        claim.token,
+        (error.message ?: "Permission sync failed").take(1000),
+        error.stackTraceToString().take(16000),
+    ) == 1
+}
+
+@Component
+class PermissionSyncScheduledWorker(
+    private val properties: OnyxProperties,
+    private val worker: PermissionSyncWorker,
+) {
+    @Scheduled(fixedDelayString = "\${onyx.worker.poll-delay-ms:1000}")
+    fun work() {
+        if (properties.worker.enabled) worker.processNext()
+    }
+}
 
 @Service
 class PermissionSyncWorker(
     private val admin: AdminService,
     private val pairs: ConnectorCredentialPairRepository,
     private val attempts: PermissionSyncAttemptRepository,
+    private val claims: PermissionSyncClaimService,
     private val documents: IndexedDocumentRepository,
     private val staging: PermissionSyncStageRepository,
     private val remoteLoaders: RemoteConnectorLoaders,
     private val indexer: OpenSearchIndexer,
     private val mapper: ObjectMapper,
 ) {
+    fun enqueue(pairId: Long) {
+        claims.enqueue(pairId)
+    }
+
+    fun processNext(): Boolean {
+        val claim = claims.claimNext() ?: return false
+        process(claim)
+        return true
+    }
+
     fun process(pairId: Long) {
+        enqueue(pairId)
+        claims.claimForPair(pairId)?.let(::process)
+    }
+
+    fun process(claim: PermissionSyncClaim) {
+        val pairId = claim.pairId
         val pair = pairs.findById(pairId).orElse(null) ?: return
-        recoverStaleAttempt(pairId)
         staging.deleteTerminalForPair(pairId)
-        if (attempts.createIfNoActive(pairId) == 0) return
-        val attempt = requireNotNull(attempts.findFirstByCcPairIdOrderByIdDesc(pairId))
-        val attemptId = requireNotNull(attempt.id)
-        attempt.status = AttemptStatus.IN_PROGRESS
-        attempt.timeStarted = Instant.now()
-        attempts.save(attempt)
+        renew(claim)
         try {
             val connector = admin.connector(pair.connectorId)
             val unboundErrors = if (connector.source == ConnectorSource.FILE) {
-                stageFile(attemptId, pairId, pair.accessType.equals("public", ignoreCase = true))
+                stageFile(claim, pairId, pair.accessType.equals("public", ignoreCase = true))
                 0
             } else {
                 stageRemote(
-                    attemptId,
+                    claim,
                     remoteLoaders.loadSlim(
                         connector.source,
                         connector.connectorSpecificConfig,
@@ -52,57 +129,50 @@ class PermissionSyncWorker(
                     ),
                 )
             }
-            attempt.totalDocsSynced = Math.toIntExact(staging.countForAttempt(attemptId))
-            attempt.docsWithPermissionErrors = Math.toIntExact(staging.countErrorsForAttempt(attemptId)) + unboundErrors
-            attempts.save(attempt)
-            publish(attemptId, pairId)
-            staging.deleteAllForAttempt(attemptId)
-            attempt.status = if (attempt.docsWithPermissionErrors > 0) {
+            val total = Math.toIntExact(staging.countForAttempt(claim.attemptId))
+            val errorCount = Math.toIntExact(staging.countErrorsForAttempt(claim.attemptId)) + unboundErrors
+            if (!claims.updateCounts(claim, total, errorCount)) throw StalePermissionClaimException()
+            publish(claim, pairId)
+            val status = if (errorCount > 0) {
                 AttemptStatus.COMPLETED_WITH_ERRORS
             } else {
                 AttemptStatus.SUCCESS
             }
-            attempt.timeFinished = Instant.now()
-            attempts.save(attempt)
+            if (claims.complete(claim, status)) staging.deleteAllForAttempt(claim.attemptId)
+        } catch (_: StalePermissionClaimException) {
+            return
         } catch (error: Exception) {
-            staging.deleteAllForAttempt(attemptId)
-            attempt.status = AttemptStatus.FAILED
-            attempt.errorMessage = error.message?.take(1000) ?: "Permission sync failed"
-            attempt.fullExceptionTrace = error.stackTraceToString().take(16000)
-            attempt.timeFinished = Instant.now()
-            attempts.save(attempt)
+            if (claims.fail(claim, error)) staging.deleteAllForAttempt(claim.attemptId)
         }
     }
 
-    private fun recoverStaleAttempt(pairId: Long) {
-        attempts.failStaleActive(
-            ccPairId = pairId,
-            cutoff = Instant.now().minusSeconds(STALE_AFTER_SECONDS),
-            message = STALE_MESSAGE,
-            trace = STALE_MESSAGE,
-        )
-    }
-
-    private fun stageFile(attemptId: Long, pairId: Long, isPublic: Boolean) {
+    private fun stageFile(claim: PermissionSyncClaim, pairId: Long, isPublic: Boolean) {
         var afterSourceDocumentId = ""
         val access = mapper.valueToTree<JsonNode>(ExternalAccess(isPublic = isPublic))
         while (true) {
+            renew(claim)
             val page = documents.findPageByCcPairId(pairId, afterSourceDocumentId, PAGE_SIZE)
             if (page.isEmpty()) return
             staging.upsert(
-                attemptId,
+                claim.attemptId,
                 page.map { PermissionSyncStageRow(it.sourceDocumentId, access, hasError = false) },
             )
             afterSourceDocumentId = page.last().sourceDocumentId
         }
     }
 
-    private fun stageRemote(attemptId: Long, batches: Sequence<ConnectorBatch>): Int {
+    private fun stageRemote(claim: PermissionSyncClaim, batches: Sequence<ConnectorBatch>): Int {
         var unboundErrors = 0
-        batches.forEach { batch ->
+        val iterator = batches.iterator()
+        while (true) {
+            renew(claim)
+            if (!iterator.hasNext()) return unboundErrors
+            val batch = iterator.next()
+            renew(claim)
             batch.documents.asSequence().chunked(PAGE_SIZE).forEach { page ->
+                renew(claim)
                 staging.upsert(
-                    attemptId,
+                    claim.attemptId,
                     page.map { document ->
                         val access = document.externalAccess
                         PermissionSyncStageRow(
@@ -114,6 +184,7 @@ class PermissionSyncWorker(
                 )
             }
             batch.failures.asSequence().chunked(PAGE_SIZE).forEach { page ->
+                renew(claim)
                 val documentFailures = page.mapNotNull { failure ->
                     val target = failure.target as? FailureTarget.Document
                     if (target == null) {
@@ -121,31 +192,32 @@ class PermissionSyncWorker(
                         null
                     } else {
                         PermissionSyncStageRow(
-                            target.link ?: target.id,
+                            target.id,
                             mapper.valueToTree(PRIVATE_ACCESS),
                             hasError = true,
                         )
                     }
                 }
-                staging.upsert(attemptId, documentFailures)
+                staging.upsert(claim.attemptId, documentFailures)
             }
         }
-        return unboundErrors
     }
 
-    private fun publish(attemptId: Long, pairId: Long) {
+    private fun publish(claim: PermissionSyncClaim, pairId: Long) {
         var afterSourceDocumentId = ""
         while (true) {
-            val page = staging.findPage(attemptId, afterSourceDocumentId, PAGE_SIZE)
+            renew(claim)
+            val page = staging.findPage(claim.attemptId, afterSourceDocumentId, PAGE_SIZE)
             if (page.isEmpty()) return
             val rowsById = page.associateBy(PermissionSyncStageRow::sourceDocumentId)
             val storedDocuments = documents.findAllByCcPairIdAndSourceDocumentIdIn(pairId, rowsById.keys)
-            if (storedDocuments.isNotEmpty()) publishPage(pairId, storedDocuments, rowsById)
+            if (storedDocuments.isNotEmpty()) publishPage(claim, pairId, storedDocuments, rowsById)
             afterSourceDocumentId = page.last().sourceDocumentId
         }
     }
 
     private fun publishPage(
+        claim: PermissionSyncClaim,
         pairId: Long,
         storedDocuments: List<IndexedDocumentEntity>,
         rowsById: Map<String, PermissionSyncStageRow>,
@@ -161,46 +233,60 @@ class PermissionSyncWorker(
             )
         }
         val privateFence = targetAccess.keys.associateWith { PRIVATE_ACCESS }
+        renew(claim)
         indexer.updateAccess(pairId, privateFence)
+        renew(claim)
         storedDocuments.forEach { document ->
             document.externalAccess = requireNotNull(rowsById[document.sourceDocumentId]).externalAccess
         }
         try {
             documents.saveAllAndFlush(storedDocuments)
         } catch (error: Exception) {
-            restoreAfterDatabaseFailure(pairId, storedDocuments, previousJson, previousAccess, privateFence)
+            restoreAfterDatabaseFailure(claim, pairId, storedDocuments, previousJson, previousAccess, privateFence)
             throw error
         }
         try {
+            renew(claim)
             indexer.updateAccess(pairId, targetAccess)
         } catch (error: Exception) {
-            runCatching { indexer.updateAccess(pairId, privateFence) }
+            if (claims.renew(claim)) runCatching { indexer.updateAccess(pairId, privateFence) }
             throw error
         }
+        renew(claim)
     }
 
     private fun restoreAfterDatabaseFailure(
+        claim: PermissionSyncClaim,
         pairId: Long,
         storedDocuments: List<IndexedDocumentEntity>,
         previousJson: Map<String, JsonNode?>,
         previousAccess: Map<String, ExternalAccess>,
         privateFence: Map<String, ExternalAccess>,
     ) {
+        if (!claims.renew(claim)) return
         runCatching { indexer.updateAccess(pairId, privateFence) }
+        if (!claims.renew(claim)) return
         val databaseRestored = runCatching {
             storedDocuments.forEach { document -> document.externalAccess = previousJson[document.sourceDocumentId] }
             documents.saveAllAndFlush(storedDocuments)
         }.isSuccess
         if (!databaseRestored || previousAccess.isEmpty()) return
+        if (!claims.renew(claim)) return
         if (runCatching { indexer.updateAccess(pairId, previousAccess) }.isFailure) {
-            runCatching { indexer.updateAccess(pairId, privateFence) }
+            if (claims.renew(claim)) runCatching { indexer.updateAccess(pairId, privateFence) }
         }
+    }
+
+    private fun renew(claim: PermissionSyncClaim) {
+        if (!claims.renew(claim)) throw StalePermissionClaimException()
     }
 
     private companion object {
         const val PAGE_SIZE = 500
-        const val STALE_AFTER_SECONDS = 60 * 60L
-        const val STALE_MESSAGE = "Recovered stale permission sync attempt older than one hour"
         val PRIVATE_ACCESS = ExternalAccess(isPublic = false)
     }
 }
+
+private class StalePermissionClaimException : RuntimeException()
+
+internal val PERMISSION_SYNC_LEASE: Duration = Duration.ofMinutes(1)

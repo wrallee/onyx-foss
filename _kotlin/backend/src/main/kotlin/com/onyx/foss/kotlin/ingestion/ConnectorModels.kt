@@ -25,6 +25,7 @@ data class ConnectorBatch(
     val documents: List<SourceDocument> = emptyList(),
     val failures: List<ConnectorFailure> = emptyList(),
     val checkpoint: ConnectorCheckpoint,
+    val enumerationComplete: Boolean = true,
 )
 
 data class SourceDocument(

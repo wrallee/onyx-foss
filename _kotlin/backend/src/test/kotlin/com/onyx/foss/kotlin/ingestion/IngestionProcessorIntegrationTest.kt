@@ -22,6 +22,8 @@ import com.onyx.foss.kotlin.domain.JobState
 import com.onyx.foss.kotlin.domain.PairStatus
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.security.CredentialCipher
+import com.onyx.foss.kotlin.service.AdminService
+import com.onyx.foss.kotlin.api.DeletionAttemptRequest
 import com.onyx.foss.kotlin.support.PostgresIntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
@@ -34,6 +36,8 @@ import org.mockito.Mockito.doThrow
 import org.mockito.Mockito.verify
 import org.mockito.Mockito.verifyNoInteractions
 import org.mockito.Mockito.verifyNoMoreInteractions
+import org.mockito.Mockito.never
+import org.mockito.Mockito.mockingDetails
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
@@ -45,6 +49,7 @@ import java.util.concurrent.TimeUnit
 
 class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var processor: IngestionProcessor
+    @Autowired private lateinit var admin: AdminService
     @Autowired private lateinit var claims: JobClaimService
     @Autowired private lateinit var scheduler: IngestionScheduler
     @Autowired private lateinit var mapper: ObjectMapper
@@ -67,8 +72,9 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     @BeforeEach
     fun resetDatabase() {
         jdbc.execute(
-            "TRUNCATE ingestion_errors, ingestion_jobs, ingestion_attempts, ingestion_checkpoints, " +
-                "indexed_documents, connector_credential_pairs, connectors, credentials RESTART IDENTITY CASCADE",
+            "TRUNCATE document_set_sync_outbox, document_set_cc_pairs, document_sets, ingestion_errors, ingestion_jobs, " +
+                "ingestion_attempts, ingestion_checkpoints, indexed_documents, connector_credential_pairs, connectors, " +
+                "credentials RESTART IDENTITY CASCADE",
         )
         doAnswer { invocation ->
             invocation.getArgument<List<String>>(0).map { listOf(0.1) }
@@ -92,7 +98,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.SUCCESS)
         assertThat(jobs.findById(run.jobId).orElseThrow().state).isEqualTo(JobState.SUCCEEDED)
         assertThat(pairs.findById(run.pairId).orElseThrow().status).isEqualTo(PairStatus.ACTIVE)
-        verify(permissionSync).process(run.pairId)
+        verify(permissionSync).enqueue(run.pairId)
     }
 
     @Test
@@ -184,7 +190,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         assertThat(firstAttempt.pollRangeEnd).isBetween(beforeFirst, afterFirst)
 
         val secondAttempt = attempts.save(IngestionAttemptEntity(ccPairId = first.pairId))
-        val secondJob = jobs.save(IngestionJobEntity(attemptId = requireNotNull(secondAttempt.id)))
+        val secondJob = jobs.save(IngestionJobEntity(attemptId = requireNotNull(secondAttempt.id), ccPairId = first.pairId))
         load(sequenceOf(batch(2, false)))
         val beforeSecond = Instant.now()
 
@@ -244,7 +250,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         assertThat(documents.findByCcPairIdAndSourceDocumentId(run.pairId, "missing")).isNotNull()
         assertThat(pairs.findById(run.pairId).orElseThrow().lastPrunedAt).isNotNull()
         assertThat(pairs.findById(run.pairId).orElseThrow().inRepeatedErrorState).isFalse()
-        verify(permissionSync).process(run.pairId)
+        verify(permissionSync).enqueue(run.pairId)
     }
 
     @Test
@@ -357,6 +363,36 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun persistsCanonicalEnumerationAndDoesNotPruneAfterIncompleteBatch() {
+        val run = createRun(fromBeginning = true)
+        val canonicalId = "https://example.test/wiki/page?id=ABC-123"
+        saveDocument(run.pairId, "obsolete")
+        load(
+            sequenceOf(
+                ConnectorBatch(
+                    documents = listOf(SourceDocument(canonicalId, "page", "content")),
+                    failures = listOf(
+                        ConnectorFailure(FailureTarget.Entity("unknown-page"), "Page identifier was unavailable"),
+                    ),
+                    checkpoint = checkpoint(1, false),
+                    enumerationComplete = false,
+                ),
+            ),
+        )
+
+        processor.process(run.jobId)
+
+        assertThat(documents.findByCcPairIdAndSourceDocumentId(run.pairId, "obsolete")).isNotNull()
+        assertThat(
+            jdbc.queryForList(
+                "SELECT source_document_id FROM ingestion_enumerated_documents WHERE attempt_id = ?",
+                String::class.java,
+                run.attemptId,
+            ),
+        ).containsExactly(canonicalId)
+    }
+
+    @Test
     fun pruningFailureDoesNotSetLastPrunedAt() {
         val run = createRun(fromBeginning = true)
         saveDocument(run.pairId, "obsolete")
@@ -372,23 +408,294 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun staleChunkCleanupFailureDoesNotCommitDocumentOrSuccessfulAttempt() {
+        val run = createRun()
+        load(sequenceOf(batch(1, false, document("one"))))
+        doThrow(IllegalStateException("tail cleanup failed"))
+            .`when`(indexer).deleteStaleChunks(run.pairId, "one", 1)
+
+        processor.process(run.jobId)
+
+        assertThat(documents.findByCcPairIdAndSourceDocumentId(run.pairId, "one")).isNull()
+        assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.FAILED)
+        assertThat(jobs.findById(run.jobId).orElseThrow().state).isEqualTo(JobState.FAILED)
+        verifyNoInteractions(permissionSync)
+    }
+
+    @Test
+    fun newAndReindexedDocumentsKeepCurrentDocumentSetMembership() {
+        val run = createRun()
+        saveDocument(run.pairId, "reindexed")
+        val setId = jdbc.queryForObject(
+            "INSERT INTO document_sets(name) VALUES ('Engineering') RETURNING id",
+            Long::class.java,
+        )
+        jdbc.update(
+            "INSERT INTO document_set_cc_pairs(document_set_id, cc_pair_id) VALUES (?, ?)",
+            setId,
+            run.pairId,
+        )
+        load(sequenceOf(batch(1, false, document("new"), document("reindexed"))))
+
+        processor.process(run.jobId)
+
+        val indexedMemberships = mockingDetails(indexer).invocations
+            .filter { it.method.name == "upsert" }
+            .map { it.arguments.getOrNull(8) }
+        assertThat(indexedMemberships).containsExactly(listOf("Engineering"), listOf("Engineering"))
+    }
+
+    @Test
+    fun fileAndRemoteSourceMetadataReachPostgresAndOpenSearch() {
+        val fileUpdatedAt = Instant.parse("2026-08-01T00:00:00Z")
+        val fileRun = createRun()
+        load(
+            sequenceOf(
+                batch(
+                    1,
+                    false,
+                    SourceDocument(
+                        id = "file",
+                        title = "file",
+                        content = "file content",
+                        updatedAt = fileUpdatedAt,
+                        primaryOwners = listOf("file-owner@example.com"),
+                        secondaryOwners = listOf("file-reviewer@example.com"),
+                    ),
+                ),
+            ),
+        )
+        processor.process(fileRun.jobId)
+
+        val remoteUpdatedAt = Instant.parse("2026-08-02T00:00:00Z")
+        val pollStart = Instant.parse("2026-07-01T00:00:00Z")
+        val pollEnd = Instant.parse("2026-09-01T00:00:00Z")
+        val remoteRun = createRun(source = ConnectorSource.JIRA, pollRangeStart = pollStart, pollRangeEnd = pollEnd)
+        doReturn(
+            sequenceOf(
+                batch(
+                    1,
+                    false,
+                    SourceDocument(
+                        id = "remote",
+                        title = "remote",
+                        content = "remote content",
+                        updatedAt = remoteUpdatedAt,
+                        primaryOwners = listOf("remote-owner@example.com"),
+                        secondaryOwners = listOf("remote-reviewer@example.com"),
+                    ),
+                ),
+            ),
+        ).`when`(remoteLoaders).load(
+            ConnectorSource.JIRA,
+            mapper.createObjectNode(),
+            mapper.createObjectNode(),
+            null,
+            pollStart,
+            pollEnd,
+        )
+        processor.process(remoteRun.jobId)
+
+        assertThat(documents.findByCcPairIdAndSourceDocumentId(fileRun.pairId, "file")?.lastModified)
+            .isEqualTo(fileUpdatedAt)
+        assertThat(documents.findByCcPairIdAndSourceDocumentId(remoteRun.pairId, "remote")?.lastModified)
+            .isEqualTo(remoteUpdatedAt)
+        val storedOwners = jdbc.queryForList(
+            "SELECT primary_owners::text, secondary_owners::text FROM indexed_documents ORDER BY source_document_id",
+        )
+        assertThat(storedOwners.map { it["primary_owners"] }).containsExactly(
+            "[\"file-owner@example.com\"]",
+            "[\"remote-owner@example.com\"]",
+        )
+        assertThat(storedOwners.map { it["secondary_owners"] }).containsExactly(
+            "[\"file-reviewer@example.com\"]",
+            "[\"remote-reviewer@example.com\"]",
+        )
+        val indexedMetadata = mockingDetails(indexer).invocations
+            .filter { it.method.name == "upsert" }
+            .map { listOf(it.arguments.getOrNull(9), it.arguments.getOrNull(10), it.arguments.getOrNull(11)) }
+        assertThat(indexedMetadata).containsExactly(
+            listOf(fileUpdatedAt, listOf("file-owner@example.com"), listOf("file-reviewer@example.com")),
+            listOf(remoteUpdatedAt, listOf("remote-owner@example.com"), listOf("remote-reviewer@example.com")),
+        )
+    }
+
+    @Test
+    fun enqueuesDurablePermissionWorkBeforeIngestionBecomesSuccessful() {
+        val run = createRun()
+        load(sequenceOf(batch(1, false, document("one"))))
+        doAnswer {
+            assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.IN_PROGRESS)
+            null
+        }.`when`(permissionSync).enqueue(run.pairId)
+
+        processor.process(run.jobId)
+
+        verify(permissionSync).enqueue(run.pairId)
+        verify(permissionSync, never()).process(run.pairId)
+        assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.SUCCESS)
+    }
+
+    @Test
     fun concurrentClaimsReturnOneJobId() {
         val run = createRun()
         val start = CountDownLatch(1)
         val executor = Executors.newFixedThreadPool(2)
         try {
             val results = List(2) {
-                executor.submit<Long?> {
+                executor.submit<IngestionClaim?> {
                     start.await()
                     claims.claimNext()
                 }
             }
             start.countDown()
 
-            assertThat(results.map { it.get() }.filterNotNull()).containsExactly(run.jobId)
+            assertThat(results.mapNotNull { it.get()?.jobId }).containsExactly(run.jobId)
         } finally {
             executor.shutdownNow()
         }
+    }
+
+    @Test
+    fun crashedIngestionJobIsReclaimedWithFreshPairToken() {
+        val run = createRun()
+        val now = jobs.findById(run.jobId).orElseThrow().runAfter.plusSeconds(1)
+        val first = requireNotNull(claims.claimNext(now))
+        jdbc.update(
+            "UPDATE ingestion_jobs SET lease_expires_at = ? WHERE id = ?",
+            Timestamp.from(now.minusSeconds(1)),
+            first.jobId,
+        )
+        jdbc.update(
+            "UPDATE connector_credential_pairs SET ingestion_lease_expires_at = ? WHERE id = ?",
+            Timestamp.from(now.minusSeconds(1)),
+            run.pairId,
+        )
+
+        val reclaimed = requireNotNull(claims.claimNext(now.plusSeconds(1)))
+
+        assertThat(reclaimed.jobId).isEqualTo(first.jobId)
+        assertThat(reclaimed.pairId).isEqualTo(run.pairId)
+        assertThat(reclaimed.token).isNotEqualTo(first.token)
+    }
+
+    @Test
+    fun reclaimedJobStopsStaleWorkerBeforeOpenSearchWriteOrCompletion() {
+        val run = createRun()
+        load(sequenceOf(batch(1, false, document("one"))))
+        val oldClaim = requireNotNull(claims.claimNext())
+        val embeddingStarted = CountDownLatch(1)
+        val releaseEmbedding = CountDownLatch(1)
+        doAnswer {
+            embeddingStarted.countDown()
+            check(releaseEmbedding.await(10, TimeUnit.SECONDS))
+            listOf(listOf(0.1))
+        }.`when`(embedder).embed(anyList<String>())
+        val executor = Executors.newSingleThreadExecutor()
+        lateinit var reclaimed: IngestionClaim
+        try {
+            val staleWorker = executor.submit { processor.process(oldClaim) }
+            assertThat(embeddingStarted.await(10, TimeUnit.SECONDS)).isTrue()
+            jdbc.update(
+                "UPDATE ingestion_jobs SET lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE id = ?",
+                run.jobId,
+            )
+            jdbc.update(
+                "UPDATE connector_credential_pairs SET ingestion_lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE id = ?",
+                run.pairId,
+            )
+            reclaimed = requireNotNull(claims.claimNext())
+            assertThat(reclaimed.token).isNotEqualTo(oldClaim.token)
+            releaseEmbedding.countDown()
+            staleWorker.get(10, TimeUnit.SECONDS)
+        } finally {
+            releaseEmbedding.countDown()
+            executor.shutdownNow()
+        }
+
+        assertThat(mockingDetails(indexer).invocations.none { it.method.name == "upsert" }).isTrue()
+        assertThat(jobs.findById(run.jobId).orElseThrow().state).isEqualTo(JobState.RUNNING)
+        assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.IN_PROGRESS)
+
+        processor.process(reclaimed)
+
+        assertThat(documents.findByCcPairIdAndSourceDocumentId(run.pairId, "one")).isNotNull()
+        assertThat(jobs.findById(run.jobId).orElseThrow().state).isEqualTo(JobState.SUCCEEDED)
+        assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.SUCCESS)
+    }
+
+    @Test
+    fun reclaimedAttemptPreservesPreviouslyCommittedCounts() {
+        val run = createRun()
+        saveDocument(run.pairId, "one")
+        attempts.saveAndFlush(
+            attempts.findById(run.attemptId).orElseThrow().apply {
+                newDocsIndexed = 1
+                totalDocsIndexed = 1
+            },
+        )
+        jdbc.update(
+            "INSERT INTO ingestion_enumerated_documents(attempt_id, source_document_id, processed) VALUES (?, ?, TRUE)",
+            run.attemptId,
+            "one",
+        )
+        load(sequenceOf(batch(1, false, document("one"), document("two"))))
+
+        processor.process(run.jobId)
+
+        val completed = attempts.findById(run.attemptId).orElseThrow()
+        assertThat(completed.newDocsIndexed).isEqualTo(2)
+        assertThat(completed.totalDocsIndexed).isEqualTo(2)
+    }
+
+    @Test
+    fun deletionFenceStopsClaimedWorkerBeforeLateWrite() {
+        val run = createRun(status = PairStatus.ACTIVE)
+        val pair = pairs.findById(run.pairId).orElseThrow()
+        load(sequenceOf(batch(1, false, document("one"))))
+        val claim = requireNotNull(claims.claimNext())
+        val embeddingStarted = CountDownLatch(1)
+        val releaseEmbedding = CountDownLatch(1)
+        doAnswer {
+            embeddingStarted.countDown()
+            check(releaseEmbedding.await(10, TimeUnit.SECONDS))
+            listOf(listOf(0.1))
+        }.`when`(embedder).embed(anyList<String>())
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val staleWorker = executor.submit { processor.process(claim) }
+            assertThat(embeddingStarted.await(10, TimeUnit.SECONDS)).isTrue()
+
+            admin.deletePair(DeletionAttemptRequest(pair.connectorId, pair.credentialId))
+            releaseEmbedding.countDown()
+            staleWorker.get(10, TimeUnit.SECONDS)
+        } finally {
+            releaseEmbedding.countDown()
+            executor.shutdownNow()
+        }
+
+        assertThat(mockingDetails(indexer).invocations.none { it.method.name == "upsert" }).isTrue()
+        assertThat(pairs.findById(run.pairId)).isEmpty()
+        assertThat(jobs.findById(run.jobId)).isEmpty()
+        assertThat(attempts.findById(run.attemptId)).isEmpty()
+    }
+
+    @Test
+    fun ingestionExternalTimeoutsAreBelowThePairLease() {
+        assertThat(MODEL_SERVER_TIMEOUT).isLessThan(INGESTION_LEASE)
+        assertThat(OPENSEARCH_TIMEOUT).isLessThan(INGESTION_LEASE)
+    }
+
+    @Test
+    fun manualDuplicateEnqueueReturnsExistingActiveJob() {
+        val pairId = createPair(status = PairStatus.ACTIVE)
+
+        val first = admin.enqueuePair(pairId, fromBeginning = false)
+        val duplicate = admin.enqueuePair(pairId, fromBeginning = true)
+
+        assertThat(duplicate).isEqualTo(first)
+        assertThat(attempts.count()).isEqualTo(1)
+        assertThat(jobs.count()).isEqualTo(1)
     }
 
     @Test
@@ -518,10 +825,16 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         fromBeginning: Boolean = false,
         inRepeatedErrorState: Boolean = false,
         source: ConnectorSource = ConnectorSource.FILE,
+        status: PairStatus = PairStatus.SCHEDULED,
         pollRangeStart: Instant? = null,
         pollRangeEnd: Instant? = null,
     ): Run {
-        val pairId = createPair(refreshFreq = refreshFreq, inRepeatedErrorState = inRepeatedErrorState, source = source)
+        val pairId = createPair(
+            refreshFreq = refreshFreq,
+            inRepeatedErrorState = inRepeatedErrorState,
+            source = source,
+            status = status,
+        )
         val attempt = attempts.save(
             IngestionAttemptEntity(
                 ccPairId = pairId,
@@ -530,7 +843,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
                 pollRangeEnd = pollRangeEnd,
             ),
         )
-        val job = jobs.save(IngestionJobEntity(attemptId = requireNotNull(attempt.id)))
+        val job = jobs.save(IngestionJobEntity(attemptId = requireNotNull(attempt.id), ccPairId = pairId))
         return Run(pairId, requireNotNull(attempt.id), requireNotNull(job.id))
     }
 

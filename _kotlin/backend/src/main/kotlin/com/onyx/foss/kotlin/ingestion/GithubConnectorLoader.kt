@@ -484,7 +484,8 @@ class GithubConnectorLoader(
             } catch (error: Exception) {
                 val link = item.text("html_url")
                 failures += ConnectorFailure(
-                    FailureTarget.Document(item.path("id").asText("unknown"), link),
+                    link?.let { FailureTarget.Document(it, it) }
+                        ?: FailureTarget.Entity("${repository.fullName}:${type.label}:${item.path("id").asText("unknown")}"),
                     "Failed to convert GitHub ${type.label}: ${error.message ?: error::class.simpleName}",
                     "github_${type.label}_processing",
                 )
@@ -619,7 +620,7 @@ class GithubConnectorLoader(
                     }
                     paths.sort()
                 }
-                if (tree.path("truncated").asBoolean(false) && !slim) {
+                if (tree.path("truncated").asBoolean(false)) {
                     failures += ConnectorFailure(
                         FailureTarget.Entity("${repository.fullName}:files"),
                         "GitHub truncated the file tree for ${repository.fullName}; some files were not indexed.",
@@ -843,6 +844,7 @@ class GithubConnectorLoader(
             documents = documents,
             failures = failures,
             checkpoint = ConnectorCheckpoint(value, checkpoint.hasMore),
+            enumerationComplete = failures.all { it.target is FailureTarget.Document },
         )
     }
 

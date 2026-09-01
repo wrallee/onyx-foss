@@ -117,6 +117,10 @@ class ConnectorCredentialPairEntity(
     var inRepeatedErrorState: Boolean = false,
     @Column(name = "last_pruned_at")
     var lastPrunedAt: Instant? = null,
+    @Column(name = "ingestion_claim_token")
+    var ingestionClaimToken: UUID? = null,
+    @Column(name = "ingestion_lease_expires_at")
+    var ingestionLeaseExpiresAt: Instant? = null,
     @CreationTimestamp @Column(name = "created_at", updatable = false)
     var createdAt: Instant? = null,
     @UpdateTimestamp @Column(name = "updated_at")
@@ -202,6 +206,8 @@ class IngestionAttemptEntity(
     var fromBeginning: Boolean = false,
     @Column(name = "prune_only", nullable = false)
     var pruneOnly: Boolean = false,
+    @Column(name = "enumeration_complete", nullable = false)
+    var enumerationComplete: Boolean = false,
     @Column(name = "new_docs_indexed", nullable = false)
     var newDocsIndexed: Int = 0,
     @Column(name = "total_docs_indexed", nullable = false)
@@ -241,6 +247,8 @@ class IngestionJobEntity(
     var id: Long? = null,
     @Column(name = "attempt_id", nullable = false)
     var attemptId: Long = 0,
+    @Column(name = "cc_pair_id", nullable = false)
+    var ccPairId: Long = 0,
     @Enumerated(EnumType.STRING)
     var state: JobState = JobState.QUEUED,
     @Column(name = "run_after", nullable = false)
@@ -249,6 +257,10 @@ class IngestionJobEntity(
     var lockedAt: Instant? = null,
     @Column(name = "locked_by")
     var lockedBy: String? = null,
+    @Column(name = "claim_token")
+    var claimToken: UUID? = null,
+    @Column(name = "lease_expires_at")
+    var leaseExpiresAt: Instant? = null,
     var attempts: Int = 0,
     @Column(name = "last_error")
     var lastError: String? = null,
@@ -281,6 +293,12 @@ class IndexedDocumentEntity(
     var lastSynced: Instant = Instant.now(),
     @Column(name = "last_modified")
     var lastModified: Instant? = null,
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "primary_owners", nullable = false, columnDefinition = "jsonb")
+    var primaryOwners: List<String> = emptyList(),
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "secondary_owners", nullable = false, columnDefinition = "jsonb")
+    var secondaryOwners: List<String> = emptyList(),
 )
 
 @Entity
@@ -331,6 +349,10 @@ class PermissionSyncAttemptEntity(
     var timeStarted: Instant? = null,
     @Column(name = "time_finished")
     var timeFinished: Instant? = null,
+    @Column(name = "claim_token")
+    var claimToken: UUID? = null,
+    @Column(name = "lease_expires_at")
+    var leaseExpiresAt: Instant? = null,
     @CreationTimestamp @Column(name = "created_at", updatable = false)
     var createdAt: Instant? = null,
     @UpdateTimestamp @Column(name = "updated_at")
