@@ -43,11 +43,34 @@ cd _kotlin
 python3 scripts/download_models.py --with-rerankers
 cp .env.example .env
 openssl rand -base64 32
-# Paste the result into ONYX_CREDENTIAL_ENCRYPTION_KEY in .env.
+# Set ONYX_CREDENTIAL_ENCRYPTION_KEY and a strong OPENSEARCH_ADMIN_PASSWORD in .env.
 docker compose config -q
 docker compose build
 docker compose up -d
 ```
+
+For an isolated stack, use a separate project, port, subnet, and read-only model path:
+
+```bash
+COMPOSE_PROJECT_NAME=onyx-kotlin-isolated \
+WEB_PORT=13300 \
+COMPOSE_SUBNET=192.168.241.0/24 \
+MODEL_DIR=/absolute/path/to/models \
+docker compose up -d --build
+
+COMPOSE_PROJECT_NAME=onyx-kotlin-isolated \
+WEB_PORT=13300 \
+./scripts/test-kotlin-file-ingestion.sh
+
+COMPOSE_PROJECT_NAME=onyx-kotlin-isolated \
+WEB_PORT=13300 \
+COMPOSE_SUBNET=192.168.241.0/24 \
+MODEL_DIR=/absolute/path/to/models \
+docker compose down -v --remove-orphans
+```
+
+The script derives `http://localhost:13300` from `WEB_PORT`. Set
+`WEB_BASE_URL` only when the Web service uses another address.
 
 Start the UI, API, worker, Python model-server, PostgreSQL, and OpenSearch:
 
@@ -61,11 +84,18 @@ Open `http://localhost:3000`. Only the Web service is published to the host.
 
 ```bash
 # Backend
-docker run --rm -v "$PWD/backend:/workspace" -w /workspace \
-  gradle:8.14.3-jdk21 gradle test --no-daemon
+cd backend
+JAVA_HOME="$HOME/.sdkman/candidates/java/21-zulu" ./gradlew test
+
+# OpenSearch integration profile (starts one shared container)
+JAVA_HOME="$HOME/.sdkman/candidates/java/21-zulu" ./gradlew opensearchIntegrationTest
+cd ..
+
+# Web-to-PostgreSQL-to-OpenSearch File ingestion
+./scripts/test-kotlin-file-ingestion.sh
 
 # Python model-server
-cd python-model-server
+cd model-server
 python3.13 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest -q
@@ -80,12 +110,11 @@ npm run types:check
 npm run build
 ```
 
-## Current connector limits
+The File, Jira, Confluence, and GitHub loaders support bounded batches,
+checkpoints, poll windows, pruning, document failures, and permission sync.
+Document Set changes update existing OpenSearch chunks.
 
-- Jira uses the REST v2 search endpoint.
-- Confluence collects pages but not attachments or comments.
-- GitHub private organization repositories must be listed explicitly.
-- Remote Connector rate-limit retry and backoff are not implemented yet.
+Image-specific vector embedding is not complete. It remains WATCHLIST work.
 
 See `SOURCE_PROVENANCE.md` for source and license boundaries and
 `docs/model-server-spike.md` for the model compatibility gate.

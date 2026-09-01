@@ -23,6 +23,12 @@ data class OnyxProperties(
         val rerankerTimeoutMs: Long = 30_000,
         val rerankerFallbackOnError: Boolean = true,
     )
-    data class OpenSearch(val baseUrl: String = "http://opensearch:9200", val index: String = "onyx-kotlin-chunks")
+    data class OpenSearch(
+        val baseUrl: String = "http://opensearch:9200",
+        val index: String = "onyx-kotlin-chunks",
+        val username: String = "",
+        val password: String = "",
+        val verifyCerts: Boolean = false,
+    )
     data class Worker(val enabled: Boolean = false, val pollDelayMs: Long = 1000)
 }

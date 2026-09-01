@@ -10,13 +10,16 @@ import jakarta.persistence.Enumerated
 import jakarta.persistence.GeneratedValue
 import jakarta.persistence.GenerationType
 import jakarta.persistence.Id
+import jakarta.persistence.IdClass
 import jakarta.persistence.Index
 import jakarta.persistence.Table
 import org.hibernate.annotations.CreationTimestamp
 import org.hibernate.annotations.JdbcTypeCode
 import org.hibernate.annotations.UpdateTimestamp
 import org.hibernate.type.SqlTypes
+import java.io.Serializable
 import java.time.Instant
+import java.util.UUID
 
 enum class ConnectorSource(@get:JsonValue val value: String) {
     FILE("file"),
@@ -40,8 +43,10 @@ enum class AttemptStatus(@get:JsonValue val value: String) {
     SUCCESS("success"),
     FAILED("failed"),
     COMPLETED_WITH_ERRORS("completed_with_errors"),
+    CANCELED("canceled"),
 }
 enum class JobState { QUEUED, RUNNING, SUCCEEDED, FAILED }
+enum class DocumentSetSyncStatus { PENDING, IN_PROGRESS, DONE }
 
 @Entity
 @Table(name = "credentials")
@@ -74,7 +79,7 @@ class ConnectorEntity(
     @Column(name = "input_type", nullable = false)
     var inputType: String = "load_state",
     @JdbcTypeCode(SqlTypes.JSON)
-    @Column(name = "connector_specific_config", nullable = false, columnDefinition = "jsonb")
+    @Column(name = "connector_specific_config", nullable = false, columnDefinition = "varchar")
     var connectorSpecificConfig: JsonNode? = null,
     @Column(name = "refresh_freq")
     var refreshFreq: Long? = null,
@@ -82,6 +87,8 @@ class ConnectorEntity(
     var pruneFreq: Long? = null,
     @Column(name = "indexing_start")
     var indexingStart: Instant? = null,
+    @Column(nullable = false)
+    var deleting: Boolean = false,
     @CreationTimestamp @Column(name = "created_at", updatable = false)
     var createdAt: Instant? = null,
     @UpdateTimestamp @Column(name = "updated_at")
@@ -106,12 +113,18 @@ class ConnectorCredentialPairEntity(
     @Enumerated(EnumType.STRING)
     var status: PairStatus = PairStatus.ACTIVE,
     @JdbcTypeCode(SqlTypes.JSON)
-    @Column(name = "auto_sync_options", columnDefinition = "jsonb")
+    @Column(name = "auto_sync_options", columnDefinition = "varchar")
     var autoSyncOptions: JsonNode? = null,
     @Column(name = "processing_mode", nullable = false)
     var processingMode: String = "REGULAR",
     @Column(name = "in_repeated_error_state", nullable = false)
     var inRepeatedErrorState: Boolean = false,
+    @Column(name = "last_pruned_at")
+    var lastPrunedAt: Instant? = null,
+    @Column(name = "ingestion_claim_token")
+    var ingestionClaimToken: UUID? = null,
+    @Column(name = "ingestion_lease_expires_at")
+    var ingestionLeaseExpiresAt: Instant? = null,
     @CreationTimestamp @Column(name = "created_at", updatable = false)
     var createdAt: Instant? = null,
     @UpdateTimestamp @Column(name = "updated_at")
@@ -135,12 +148,60 @@ class DocumentSetEntity(
 
 @Entity
 @Table(name = "document_set_cc_pairs")
+@IdClass(DocumentSetPairId::class)
 class DocumentSetPairEntity(
     @Id
     @Column(name = "document_set_id")
     var documentSetId: Long = 0,
+    @Id
     @Column(name = "cc_pair_id")
     var ccPairId: Long = 0,
+)
+
+data class DocumentSetPairId(
+    var documentSetId: Long = 0,
+    var ccPairId: Long = 0,
+) : Serializable
+
+@Entity
+@Table(name = "document_set_sync_claim_lock")
+class DocumentSetSyncClaimLockEntity(
+    @Id
+    var id: Short = 1,
+)
+
+@Entity
+@Table(name = "opensearch_index_migration_lock")
+class OpenSearchIndexMigrationLockEntity(
+    @Id
+    var id: Short = 1,
+)
+
+@Entity
+@Table(name = "document_set_sync_outbox")
+class DocumentSetSyncOutboxEntity(
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    var id: Long? = null,
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "cc_pair_ids", nullable = false, columnDefinition = "varchar")
+    var ccPairIds: JsonNode? = null,
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "document_set_ids", columnDefinition = "varchar")
+    var documentSetIds: JsonNode? = null,
+    @Enumerated(EnumType.STRING)
+    var status: DocumentSetSyncStatus = DocumentSetSyncStatus.PENDING,
+    @Column(name = "attempt_count", nullable = false)
+    var attemptCount: Int = 0,
+    @Column(name = "last_error")
+    var lastError: String? = null,
+    @Column(name = "locked_at")
+    var lockedAt: Instant? = null,
+    @Column(name = "claim_token")
+    var claimToken: UUID? = null,
+    @CreationTimestamp @Column(name = "created_at", updatable = false)
+    var createdAt: Instant? = null,
+    @UpdateTimestamp @Column(name = "updated_at")
+    var updatedAt: Instant? = null,
 )
 
 @Entity
@@ -171,6 +232,10 @@ class IngestionAttemptEntity(
     var status: AttemptStatus = AttemptStatus.NOT_STARTED,
     @Column(name = "from_beginning", nullable = false)
     var fromBeginning: Boolean = false,
+    @Column(name = "prune_only", nullable = false)
+    var pruneOnly: Boolean = false,
+    @Column(name = "enumeration_complete", nullable = false)
+    var enumerationComplete: Boolean = false,
     @Column(name = "new_docs_indexed", nullable = false)
     var newDocsIndexed: Int = 0,
     @Column(name = "total_docs_indexed", nullable = false)
@@ -197,7 +262,7 @@ class IngestionCheckpointEntity(
     @Id @Column(name = "cc_pair_id")
     var ccPairId: Long = 0,
     @JdbcTypeCode(SqlTypes.JSON)
-    @Column(name = "checkpoint_json", nullable = false, columnDefinition = "jsonb")
+    @Column(name = "checkpoint_json", nullable = false, columnDefinition = "varchar")
     var checkpointJson: JsonNode? = null,
     @UpdateTimestamp @Column(name = "updated_at")
     var updatedAt: Instant? = null,
@@ -210,14 +275,22 @@ class IngestionJobEntity(
     var id: Long? = null,
     @Column(name = "attempt_id", nullable = false)
     var attemptId: Long = 0,
+    @Column(name = "cc_pair_id", nullable = false)
+    var ccPairId: Long = 0,
     @Enumerated(EnumType.STRING)
     var state: JobState = JobState.QUEUED,
+    @Column(name = "active_marker")
+    var activeMarker: Short? = if (state == JobState.QUEUED || state == JobState.RUNNING) 1 else null,
     @Column(name = "run_after", nullable = false)
     var runAfter: Instant = Instant.now(),
     @Column(name = "locked_at")
     var lockedAt: Instant? = null,
     @Column(name = "locked_by")
     var lockedBy: String? = null,
+    @Column(name = "claim_token")
+    var claimToken: UUID? = null,
+    @Column(name = "lease_expires_at")
+    var leaseExpiresAt: Instant? = null,
     var attempts: Int = 0,
     @Column(name = "last_error")
     var lastError: String? = null,
@@ -241,12 +314,21 @@ class IndexedDocumentEntity(
     @Column(name = "content_hash", nullable = false)
     var contentHash: String = "",
     @JdbcTypeCode(SqlTypes.JSON)
-    @Column(columnDefinition = "jsonb", nullable = false)
+    @Column(columnDefinition = "varchar", nullable = false)
     var metadata: JsonNode? = null,
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "external_access", columnDefinition = "varchar")
+    var externalAccess: JsonNode? = null,
     @Column(name = "last_synced", nullable = false)
     var lastSynced: Instant = Instant.now(),
     @Column(name = "last_modified")
     var lastModified: Instant? = null,
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "primary_owners", nullable = false, columnDefinition = "varchar")
+    var primaryOwners: List<String> = emptyList(),
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "secondary_owners", nullable = false, columnDefinition = "varchar")
+    var secondaryOwners: List<String> = emptyList(),
 )
 
 @Entity
@@ -260,6 +342,12 @@ class IngestionErrorEntity(
     var sourceDocumentId: String? = null,
     @Column(name = "document_link")
     var documentLink: String? = null,
+    @Column(name = "entity_id")
+    var entityId: String? = null,
+    @Column(name = "failed_time_range_start")
+    var failedTimeRangeStart: Instant? = null,
+    @Column(name = "failed_time_range_end")
+    var failedTimeRangeEnd: Instant? = null,
     @Column(name = "failure_message", nullable = false)
     var failureMessage: String = "",
     @Column(name = "error_type")
@@ -269,3 +357,79 @@ class IngestionErrorEntity(
     @CreationTimestamp @Column(name = "created_at", updatable = false)
     var createdAt: Instant? = null,
 )
+
+@Entity
+@Table(name = "permission_sync_attempts")
+class PermissionSyncAttemptEntity(
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    var id: Long? = null,
+    @Column(name = "cc_pair_id", nullable = false)
+    var ccPairId: Long = 0,
+    @Enumerated(EnumType.STRING)
+    var status: AttemptStatus = AttemptStatus.NOT_STARTED,
+    @Column(name = "active_marker")
+    var activeMarker: Short? = if (status == AttemptStatus.NOT_STARTED || status == AttemptStatus.IN_PROGRESS) 1 else null,
+    @Column(name = "error_msg")
+    var errorMessage: String? = null,
+    @Column(name = "full_exception_trace")
+    var fullExceptionTrace: String? = null,
+    @Column(name = "total_docs_synced", nullable = false)
+    var totalDocsSynced: Int = 0,
+    @Column(name = "docs_with_permission_errors", nullable = false)
+    var docsWithPermissionErrors: Int = 0,
+    @Column(name = "time_started")
+    var timeStarted: Instant? = null,
+    @Column(name = "time_finished")
+    var timeFinished: Instant? = null,
+    @Column(name = "claim_token")
+    var claimToken: UUID? = null,
+    @Column(name = "lease_expires_at")
+    var leaseExpiresAt: Instant? = null,
+    @Column(name = "follow_up_requested", nullable = false)
+    var followUpRequested: Boolean = false,
+    @CreationTimestamp @Column(name = "created_at", updatable = false)
+    var createdAt: Instant? = null,
+    @UpdateTimestamp @Column(name = "updated_at")
+    var updatedAt: Instant? = null,
+)
+
+@Entity
+@Table(name = "permission_sync_staging")
+@IdClass(PermissionSyncStageId::class)
+class PermissionSyncStageEntity(
+    @Id
+    @Column(name = "attempt_id")
+    var attemptId: Long = 0,
+    @Id
+    @Column(name = "source_document_id")
+    var sourceDocumentId: String = "",
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "external_access", nullable = false, columnDefinition = "varchar")
+    var externalAccess: JsonNode? = null,
+    @Column(name = "has_error", nullable = false)
+    var hasError: Boolean = false,
+)
+
+data class PermissionSyncStageId(
+    var attemptId: Long = 0,
+    var sourceDocumentId: String = "",
+) : Serializable
+
+@Entity
+@Table(name = "ingestion_enumerated_documents")
+@IdClass(IngestionEnumeratedDocumentId::class)
+class IngestionEnumeratedDocumentEntity(
+    @Id
+    @Column(name = "attempt_id")
+    var attemptId: Long = 0,
+    @Id
+    @Column(name = "source_document_id")
+    var sourceDocumentId: String = "",
+    @Column(nullable = false)
+    var processed: Boolean = false,
+)
+
+data class IngestionEnumeratedDocumentId(
+    var attemptId: Long = 0,
+    var sourceDocumentId: String = "",
+) : Serializable

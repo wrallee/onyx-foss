@@ -1,0 +1,2 @@
+ALTER TABLE ingestion_attempts
+    ADD COLUMN prune_only BOOLEAN NOT NULL DEFAULT FALSE;

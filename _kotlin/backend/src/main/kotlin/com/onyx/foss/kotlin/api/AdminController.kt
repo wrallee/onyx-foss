@@ -158,8 +158,11 @@ class AdminController(
     ): Map<String, Any?> = ingestion.errors(pairId, page, pageSize)
 
     @GetMapping("/admin/cc-pair/{pairId}/permission-sync-attempts")
-    fun permissionSync(@PathVariable pairId: Long): Map<String, Any?> =
-        mapOf("applicable" to false, "items" to emptyList<Any>(), "total_items" to 0)
+    fun permissionSync(
+        @PathVariable pairId: Long,
+        @RequestParam("page_num", defaultValue = "0") page: Int,
+        @RequestParam("page_size", defaultValue = "10") pageSize: Int,
+    ): Map<String, Any?> = ingestion.permissionAttempts(pairId, page, pageSize)
 
     @GetMapping("/admin/cc-pair/{pairId}/external-group-sync-attempts")
     fun groupSync(@PathVariable pairId: Long): Map<String, Any?> =

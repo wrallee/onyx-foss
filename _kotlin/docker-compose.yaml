@@ -11,8 +11,11 @@ x-backend-environment: &backend-environment
   ONYX_RERANKER_ENABLED: ${ONYX_RERANKER_ENABLED:-true}
   ONYX_RERANKER_MODEL_NAME: ${RERANKER_MODEL:-Alibaba-NLP/gte-multilingual-reranker-base}
   ONYX_RERANKER_MAX_DOCUMENTS: ${RERANKER_MAX_DOCUMENTS:-100}
-  OPENSEARCH_URL: http://opensearch:9200
+  OPENSEARCH_URL: https://opensearch:9200
   OPENSEARCH_INDEX: ${OPENSEARCH_INDEX:-onyx-kotlin-chunks}
+  OPENSEARCH_ADMIN_USERNAME: admin
+  OPENSEARCH_ADMIN_PASSWORD: ${OPENSEARCH_ADMIN_PASSWORD:?Set a strong OpenSearch admin password}
+  OPENSEARCH_VERIFY_CERTS: "false"
 
 services:
   web:
@@ -28,6 +31,10 @@ services:
       api:
         condition: service_started
     restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
 
   api:
     build:
@@ -43,6 +50,10 @@ services:
       opensearch:
         condition: service_healthy
     restart: unless-stopped
+    cpus: 0.75
+    mem_limit: 768m
+    memswap_limit: 768m
+    pids_limit: 256
 
   worker:
     build:
@@ -61,6 +72,10 @@ services:
       model-server:
         condition: service_healthy
     restart: unless-stopped
+    cpus: 1
+    mem_limit: 1g
+    memswap_limit: 1g
+    pids_limit: 256
 
   model-server:
     build:
@@ -74,16 +89,20 @@ services:
       RERANKER_MAX_DOCUMENTS: ${RERANKER_MAX_DOCUMENTS:-100}
       RERANKER_MAX_LENGTH: ${RERANKER_MAX_LENGTH:-512}
       MODEL_INFERENCE_CONCURRENCY: ${MODEL_INFERENCE_CONCURRENCY:-1}
-      TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-4}
-    shm_size: 1gb
+      TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-1}
+    shm_size: 512m
     volumes:
-      - ./models:/models:ro
+      - ${MODEL_DIR:-./models}:/models:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:9000/actuator/health/readiness"]
       interval: 30s
       timeout: 10s
       retries: 3
     restart: unless-stopped
+    cpus: 1
+    mem_limit: 3g
+    memswap_limit: 3g
+    pids_limit: 512
 
   postgres:
     image: postgres:15.2-alpine
@@ -99,13 +118,17 @@ services:
       timeout: 5s
       retries: 20
     restart: unless-stopped
+    cpus: 0.5
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
 
   opensearch:
     image: opensearchproject/opensearch:3.6.0
     environment:
       discovery.type: single-node
-      DISABLE_SECURITY_PLUGIN: "true"
-      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${OPENSEARCH_ADMIN_PASSWORD:?Set a strong OpenSearch admin password}
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
     ulimits:
       memlock:
         soft: -1
@@ -116,17 +139,21 @@ services:
     volumes:
       - opensearch_data:/usr/share/opensearch/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health >/dev/null"]
+      test: ["CMD-SHELL", "curl -fkSs -u admin:$${OPENSEARCH_INITIAL_ADMIN_PASSWORD} https://localhost:9200/_cluster/health >/dev/null"]
       interval: 10s
       timeout: 5s
       retries: 30
     restart: unless-stopped
+    cpus: 1
+    mem_limit: 1536m
+    memswap_limit: 1536m
+    pids_limit: 512
 
 networks:
   default:
     ipam:
       config:
-        - subnet: 192.168.240.0/24
+        - subnet: ${COMPOSE_SUBNET:-192.168.240.0/24}
 
 volumes:
   connector_files:

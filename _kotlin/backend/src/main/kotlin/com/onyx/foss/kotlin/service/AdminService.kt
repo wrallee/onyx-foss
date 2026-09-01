@@ -1,6 +1,8 @@
 package com.onyx.foss.kotlin.service
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.onyx.foss.kotlin.api.ApiException
 import com.onyx.foss.kotlin.api.CCPropertyUpdateRequest
 import com.onyx.foss.kotlin.api.ConnectorRequest
@@ -21,7 +23,12 @@ import com.onyx.foss.kotlin.domain.ConnectorSource
 import com.onyx.foss.kotlin.domain.CredentialEntity
 import com.onyx.foss.kotlin.domain.CredentialRepository
 import com.onyx.foss.kotlin.domain.DocumentSetEntity
+import com.onyx.foss.kotlin.domain.DocumentSetPairEntity
+import com.onyx.foss.kotlin.domain.DocumentSetPairRepository
 import com.onyx.foss.kotlin.domain.DocumentSetRepository
+import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxEntity
+import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxRepository
+import com.onyx.foss.kotlin.domain.DocumentSetSyncStatus
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
 import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
@@ -29,13 +36,14 @@ import com.onyx.foss.kotlin.domain.IngestionJobEntity
 import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.domain.JobState
 import com.onyx.foss.kotlin.domain.PairStatus
+import com.onyx.foss.kotlin.domain.PermissionSyncAttemptRepository
 import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
+import com.onyx.foss.kotlin.ingestion.PairExternalWriteFence
 import com.onyx.foss.kotlin.security.CredentialCipher
 import org.springframework.http.HttpStatus
-import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
-import java.time.Instant
+import org.springframework.transaction.support.TransactionTemplate
 
 @Service
 class AdminService(
@@ -45,11 +53,15 @@ class AdminService(
     private val connectors: ConnectorRepository,
     private val pairs: ConnectorCredentialPairRepository,
     private val sets: DocumentSetRepository,
+    private val setPairs: DocumentSetPairRepository,
+    private val documentSetSyncOutbox: DocumentSetSyncOutboxRepository,
     private val attempts: IngestionAttemptRepository,
+    private val permissionAttempts: PermissionSyncAttemptRepository,
     private val jobs: IngestionJobRepository,
     private val documents: IndexedDocumentRepository,
     private val indexer: OpenSearchIndexer,
-    private val jdbc: JdbcTemplate,
+    private val externalWrites: PairExternalWriteFence,
+    private val transactions: TransactionTemplate,
 ) {
     @Transactional
     fun createCredential(request: CredentialRequest): ObjectCreationResponse {
@@ -86,7 +98,7 @@ class AdminService(
     fun updateCredential(credentialId: Long, request: CredentialUpdateRequest): Map<String, Any?> {
         val value = credential(credentialId)
         value.name = request.name.trim()
-        value.secretJson = cipher.encrypt(request.credentialJson)
+        value.secretJson = cipher.encrypt(mergeMaskedCredential(cipher.decrypt(value.secretJson), request.credentialJson))
         return credentialSnapshot(credentials.save(value))
     }
 
@@ -169,7 +181,7 @@ class AdminService(
 
     @Transactional
     fun updateConnector(connectorId: Long, request: ConnectorRequest): Map<String, Any?> {
-        val value = connector(connectorId)
+        val value = lockConnectorForMutation(connectorId)
         value.name = request.name.trim()
         value.source = request.source
         value.inputType = request.inputType
@@ -180,39 +192,90 @@ class AdminService(
         return connectorSnapshot(connectors.save(value))
     }
 
-    @Transactional
     fun deleteConnector(connectorId: Long): StatusResponse {
-        val pairIds = pairs.findAllByConnectorId(connectorId).map(::id)
-        pairIds.forEach { pairId ->
-            indexer.deletePair(pairId)
-            documents.deleteAllByCcPairId(pairId)
+        val pairIds = requireNotNull(
+            transactions.execute {
+                val connector = connectors.lockById(connectorId)
+                    ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
+                connector.deleting = true
+                connectors.save(connector)
+                val lockedPairs = pairs.findAllByConnectorId(connectorId).map { pair ->
+                    pairs.lockById(id(pair)) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+                }
+                lockedPairs.forEach(::markDeleting)
+                connectors.flush()
+                pairs.flush()
+                lockedPairs.map(::id)
+            },
+        )
+        externalWrites.withPairs(pairIds) {
+            pairIds.forEach(indexer::deletePair)
+            transactions.executeWithoutResult {
+                pairIds.forEach(documents::deleteAllByCcPairId)
+                connectors.lockById(connectorId)?.let(connectors::delete)
+            }
         }
-        connectors.delete(connector(connectorId))
         return StatusResponse(true, "Connector deleted successfully", connectorId)
     }
 
-    @Transactional
     fun deletePair(request: DeletionAttemptRequest): StatusResponse {
-        val pair = pairs.findByConnectorIdAndCredentialId(request.connectorId, request.credentialId)
-            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
-        val pairId = id(pair)
-        val hasOtherPairs = pairs.findAllByConnectorId(request.connectorId).any { id(it) != pairId }
-        indexer.deletePair(pairId)
-        documents.deleteAllByCcPairId(pairId)
-        pairs.delete(pair)
-        if (!hasOtherPairs) connectors.delete(connector(request.connectorId))
-        return StatusResponse(true, "Connector deletion completed", pairId)
+        val plan = requireNotNull(
+            transactions.execute {
+                val connector = connectors.lockById(request.connectorId)
+                    ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
+                val existing = pairs.findByConnectorIdAndCredentialId(request.connectorId, request.credentialId)
+                    ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
+                val pair = pairs.lockById(id(existing))
+                    ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
+                val pairId = id(pair)
+                val hasOtherPairs = pairs.findAllByConnectorId(request.connectorId).any { id(it) != pairId }
+                if (connector.deleting && hasOtherPairs) {
+                    throw ApiException(HttpStatus.CONFLICT, "Connector is being deleted")
+                }
+                if (!hasOtherPairs) {
+                    connector.deleting = true
+                    connectors.save(connector)
+                }
+                markDeleting(pair)
+                connectors.flush()
+                pairs.flush()
+                PairDeletionPlan(pairId, hasOtherPairs)
+            },
+        )
+        externalWrites.withPair(plan.pairId) {
+            indexer.deletePair(plan.pairId)
+            transactions.executeWithoutResult {
+                documents.deleteAllByCcPairId(plan.pairId)
+                pairs.lockById(plan.pairId)?.let(pairs::delete)
+                if (!plan.hasOtherPairs) connectors.lockById(request.connectorId)?.let(connectors::delete)
+            }
+        }
+        return StatusResponse(true, "Connector deletion completed", plan.pairId)
+    }
+
+    private fun markDeleting(pair: ConnectorCredentialPairEntity) {
+        pair.status = PairStatus.DELETING
+        pair.ingestionClaimToken = null
+        pair.ingestionLeaseExpiresAt = null
+        pairs.save(pair)
     }
 
     @Transactional
     fun associate(connectorId: Long, credentialId: Long, request: PairMetadataRequest): StatusResponse {
-        val connector = connector(connectorId)
+        val connector = connectors.lockById(connectorId)
+            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
+        requireNotDeleting(connector)
         val credential = credential(credentialId)
         if (connector.source != credential.source) {
             throw ApiException(HttpStatus.BAD_REQUEST, "Connector and credential source do not match")
         }
         val existingPair = pairs.findByConnectorIdAndCredentialId(connectorId, credentialId)
-        val pair = existingPair ?: ConnectorCredentialPairEntity(connectorId = connectorId, credentialId = credentialId)
+        val pair = existingPair?.let { existing ->
+            val locked = pairs.lockById(id(existing))
+                ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+            requireNotDeleting(locked)
+            locked
+        } ?: ConnectorCredentialPairEntity(connectorId = connectorId, credentialId = credentialId)
         pair.name = request.name.trim()
         pair.accessType = request.accessType
         pair.autoSyncOptions = request.autoSyncOptions
@@ -226,6 +289,12 @@ class AdminService(
     fun pairDetail(pairId: Long): Map<String, Any?> {
         val pair = pair(pairId)
         val latest = attempts.findFirstByCcPairIdOrderByIdDesc(pairId)
+        val lastSuccessful = lastSuccessfulAttempt(pairId)
+        val latestPermission = permissionAttempts.findFirstByCcPairIdOrderByIdDesc(pairId)
+        val lastFullPermission = permissionAttempts.findFirstByCcPairIdAndStatusInOrderByTimeFinishedDescIdDesc(
+            pairId,
+            listOf(AttemptStatus.SUCCESS, AttemptStatus.COMPLETED_WITH_ERRORS),
+        )
         return mapOf(
             "id" to pairId,
             "name" to pair.name,
@@ -244,22 +313,22 @@ class AdminService(
             "indexing" to (latest?.status == AttemptStatus.IN_PROGRESS),
             "creator" to null,
             "creator_email" to null,
-            "last_indexed" to latest?.takeIf { it.status == AttemptStatus.SUCCESS }?.timeUpdated,
-            "last_pruned" to null,
-            "last_full_permission_sync" to null,
+            "last_indexed" to lastSuccessful?.timeStarted,
+            "last_pruned" to pair.lastPrunedAt,
+            "last_full_permission_sync" to lastFullPermission?.timeFinished,
             "overall_indexing_speed" to null,
             "latest_checkpoint_description" to null,
-            "last_permission_sync_attempt_status" to null,
-            "permission_syncing" to false,
-            "last_permission_sync_attempt_finished" to null,
-            "last_permission_sync_attempt_error_message" to null,
+            "last_permission_sync_attempt_status" to latestPermission?.status?.value,
+            "permission_syncing" to (latestPermission?.status in setOf(AttemptStatus.NOT_STARTED, AttemptStatus.IN_PROGRESS)),
+            "last_permission_sync_attempt_finished" to latestPermission?.timeFinished,
+            "last_permission_sync_attempt_error_message" to latestPermission?.errorMessage,
             "supports_targeted_reindex" to false,
         )
     }
 
     @Transactional
     fun setPairStatus(pairId: Long, status: PairStatus): Map<String, Any?> {
-        val pair = pair(pairId)
+        val pair = lockPairForMutation(pairId).pair
         pair.status = status
         pairs.save(pair)
         return pairDetail(pairId)
@@ -267,7 +336,7 @@ class AdminService(
 
     @Transactional
     fun enqueue(request: RunConnectorRequest): StatusResponse {
-        connector(request.connectorId)
+        lockConnectorForMutation(request.connectorId)
         val all = pairs.findAllByConnectorId(request.connectorId)
         val selected = if (request.credentialIds.isNullOrEmpty() || request.credentialIds == listOf(0L)) {
             all
@@ -280,15 +349,22 @@ class AdminService(
     }
 
     @Transactional
-    fun enqueuePair(pairId: Long, fromBeginning: Boolean): Long {
+    fun enqueuePair(pairId: Long, fromBeginning: Boolean, pruneOnly: Boolean = false): Long {
+        val pair = lockPairForMutation(pairId).pair
+        jobs.findFirstByCcPairIdAndStateInOrderById(pairId, listOf(JobState.QUEUED, JobState.RUNNING))
+            ?.let { return id(it) }
         val attempt = attempts.save(
             IngestionAttemptEntity(
                 ccPairId = pairId,
                 fromBeginning = fromBeginning,
-                pollRangeStart = if (fromBeginning) null else Instant.now(),
+                pruneOnly = pruneOnly,
             ),
         )
-        return id(jobs.save(IngestionJobEntity(attemptId = id(attempt), state = JobState.QUEUED)))
+        return id(
+            jobs.save(
+                IngestionJobEntity(attemptId = id(attempt), ccPairId = pairId, state = JobState.QUEUED),
+            ),
+        )
     }
 
     fun indexingStatus(source: ConnectorSource?, filter: String?): List<Map<String, Any?>> =
@@ -315,6 +391,7 @@ class AdminService(
     private fun indexingRow(pair: ConnectorCredentialPairEntity): Map<String, Any?> {
         val pairId = id(pair)
         val latest = attempts.findFirstByCcPairIdOrderByIdDesc(pairId)
+        val lastSuccessful = lastSuccessfulAttempt(pairId)
         return mapOf(
             "cc_pair_id" to pairId,
             "name" to pair.name,
@@ -325,7 +402,7 @@ class AdminService(
             "in_repeated_error_state" to pair.inRepeatedErrorState,
             "last_finished_status" to latest?.status?.takeIf { it != AttemptStatus.IN_PROGRESS }?.value,
             "last_status" to latest?.status?.value,
-            "last_success" to latest?.takeIf { it.status == AttemptStatus.SUCCESS }?.timeUpdated,
+            "last_success" to lastSuccessful?.timeStarted,
             "is_editable" to true,
             "permissions" to mapOf("edit" to true, "delete" to true, "manage" to true),
             "docs_indexed" to documents.countByCcPairId(pairId),
@@ -333,11 +410,21 @@ class AdminService(
         )
     }
 
+    private fun lastSuccessfulAttempt(pairId: Long): IngestionAttemptEntity? =
+        attempts.findFirstByCcPairIdAndStatusInOrderByTimeStartedDescIdDesc(
+            pairId,
+            listOf(AttemptStatus.SUCCESS, AttemptStatus.COMPLETED_WITH_ERRORS),
+        )
+
     @Transactional
     fun createSet(request: DocumentSetRequest): Long {
         validatePairs(request.ccPairIds)
-        val set = sets.save(DocumentSetEntity(name = request.name.trim(), description = request.description, isPublic = true))
+        if (sets.existsByName(request.name.trim())) {
+            throw ApiException(HttpStatus.CONFLICT, "Document set name already exists")
+        }
+        val set = sets.saveAndFlush(DocumentSetEntity(name = request.name.trim(), description = request.description, isPublic = true))
         replaceSetPairs(id(set), request.ccPairIds)
+        enqueueDocumentSetSync(request.ccPairIds, id(set))
         return id(set)
     }
 
@@ -346,36 +433,40 @@ class AdminService(
         val setId = request.id ?: throw ApiException(HttpStatus.BAD_REQUEST, "Document set id is required")
         val set = sets.findById(setId).orElseThrow { ApiException(HttpStatus.NOT_FOUND, "Document set not found") }
         validatePairs(request.ccPairIds)
+        if (sets.existsByNameAndIdNot(request.name.trim(), setId)) {
+            throw ApiException(HttpStatus.CONFLICT, "Document set name already exists")
+        }
+        val previousPairIds = setPairIds(setId)
         set.name = request.name.trim()
         set.description = request.description
         set.isPublic = true
-        sets.save(set)
+        sets.saveAndFlush(set)
         replaceSetPairs(setId, request.ccPairIds)
+        enqueueDocumentSetSync(previousPairIds + request.ccPairIds, setId)
     }
 
     @Transactional
     fun deleteSet(setId: Long) {
         if (!sets.existsById(setId)) throw ApiException(HttpStatus.NOT_FOUND, "Document set not found")
-        jdbc.update("DELETE FROM document_set_cc_pairs WHERE document_set_id = ?", setId)
+        val pairIds = setPairIds(setId)
+        setPairs.deleteAllByDocumentSetId(setId)
         sets.deleteById(setId)
+        sets.flush()
+        enqueueDocumentSetSync(pairIds, setId)
     }
 
     fun listSets(): List<Map<String, Any?>> = sets.findAll().map(::setSnapshot)
 
     fun setSnapshot(set: DocumentSetEntity): Map<String, Any?> {
         val setId = id(set)
-        val pairIds = jdbc.queryForList(
-            "SELECT cc_pair_id FROM document_set_cc_pairs WHERE document_set_id = ? ORDER BY cc_pair_id",
-            Long::class.java,
-            setId,
-        )
+        val pairIds = setPairIds(setId)
         return mapOf(
             "id" to setId,
             "name" to set.name,
             "description" to set.description,
             "cc_pair_summaries" to pairIds.map(::pairSummary),
             "cc_pair_descriptors" to pairIds.map(::pairDescriptor),
-            "is_up_to_date" to true,
+            "is_up_to_date" to !hasActiveDocumentSetSync(setId),
             "is_public" to true,
             "users" to emptyList<String>(),
             "groups" to emptyList<Long>(),
@@ -402,12 +493,64 @@ class AdminService(
     }
 
     private fun replaceSetPairs(setId: Long, pairIds: List<Long>) {
-        jdbc.update("DELETE FROM document_set_cc_pairs WHERE document_set_id = ?", setId)
-        pairIds.distinct().forEach { jdbc.update("INSERT INTO document_set_cc_pairs(document_set_id, cc_pair_id) VALUES (?, ?)", setId, it) }
+        setPairs.deleteAllByDocumentSetId(setId)
+        setPairs.saveAll(pairIds.distinct().map { DocumentSetPairEntity(setId, it) })
+    }
+
+    private fun setPairIds(setId: Long): List<Long> =
+        setPairs.findAllByDocumentSetIdOrderByCcPairId(setId).map { it.ccPairId }
+
+    private fun hasActiveDocumentSetSync(setId: Long): Boolean = documentSetSyncOutbox.findAllByStatusIn(
+        listOf(DocumentSetSyncStatus.PENDING, DocumentSetSyncStatus.IN_PROGRESS),
+    ).any { row -> row.documentSetIds?.let { ids -> ids.any { it.asLong() == setId } } ?: true }
+
+    private fun enqueueDocumentSetSync(pairIds: Collection<Long>, documentSetId: Long) {
+        val distinctPairIds = pairIds.distinct()
+        if (distinctPairIds.isNotEmpty()) {
+            documentSetSyncOutbox.save(
+                DocumentSetSyncOutboxEntity(
+                    ccPairIds = mapper.valueToTree(distinctPairIds),
+                    documentSetIds = mapper.valueToTree(listOf(documentSetId)),
+                ),
+            )
+        }
     }
 
     private fun validatePairs(pairIds: List<Long>) {
         if (pairIds.any { !pairs.existsById(it) }) throw ApiException(HttpStatus.BAD_REQUEST, "Document set references a missing connector")
+    }
+
+    private fun requireNotDeleting(connector: ConnectorEntity) {
+        if (connector.deleting) throw ApiException(HttpStatus.CONFLICT, "Connector is being deleted")
+    }
+
+    private fun requireNotDeleting(pair: ConnectorCredentialPairEntity) {
+        if (pair.status == PairStatus.DELETING) throw ApiException(HttpStatus.CONFLICT, "CC Pair is being deleted")
+    }
+
+    private fun lockConnectorForMutation(connectorId: Long): ConnectorEntity {
+        val connector = connectors.lockById(connectorId)
+            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
+        requireNotDeleting(connector)
+        return connector
+    }
+
+    private fun lockPairForMutation(pairId: Long): PairMutation {
+        val connectorId = pairs.findConnectorIdById(pairId)
+            ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+        val connector = lockConnectorForMutation(connectorId)
+        val pair = pairs.lockById(pairId) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+        requireNotDeleting(pair)
+        return PairMutation(connector, pair)
+    }
+
+    private fun mergeMaskedCredential(current: JsonNode, update: JsonNode): JsonNode {
+        if (!current.isObject || !update.isObject) return update
+        val merged = update.deepCopy<ObjectNode>()
+        update.fields().forEach { (name, value) ->
+            if (value.isTextual && value.asText() == "********") merged.set<JsonNode>(name, current.path(name))
+        }
+        return merged
     }
 
     fun connector(connectorId: Long): ConnectorEntity =
@@ -427,7 +570,7 @@ class AdminService(
     )
     @Transactional
     fun renamePair(pairId: Long, name: String): Map<String, Any?> {
-        val value = pair(pairId)
+        val value = lockPairForMutation(pairId).pair
         value.name = name.trim()
         pairs.save(value)
         return pairDetail(pairId)
@@ -435,8 +578,8 @@ class AdminService(
 
     @Transactional
     fun updatePairProperty(pairId: Long, request: CCPropertyUpdateRequest): StatusResponse {
-        val pair = pair(pairId)
-        val connector = connector(pair.connectorId)
+        val mutation = lockPairForMutation(pairId)
+        val connector = mutation.connector
         val value = request.value.toLongOrNull()
             ?: throw ApiException(HttpStatus.BAD_REQUEST, "Property value must be an integer")
         val message = when (request.name) {
@@ -470,3 +613,13 @@ class AdminService(
         else -> error("Unsupported entity id")
     }
 }
+
+private data class PairDeletionPlan(
+    val pairId: Long,
+    val hasOtherPairs: Boolean,
+)
+
+private data class PairMutation(
+    val connector: ConnectorEntity,
+    val pair: ConnectorCredentialPairEntity,
+)
