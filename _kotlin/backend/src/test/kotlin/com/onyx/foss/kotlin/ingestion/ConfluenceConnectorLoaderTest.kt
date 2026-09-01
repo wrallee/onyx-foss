@@ -996,13 +996,20 @@ class ConfluenceConnectorLoaderTest {
 
     @Test
     fun validateConnectorSettingsSuccess() = MockWebServer().use { server ->
-        server.enqueue(json("""{"results":[{"key":"TEST"}]}"""))
-        server.enqueue(json("""{"key":"TEST"}"""))
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when (request.requestUrl!!.encodedPath) {
+                "/rest/api/space/TEST" -> json("""{"key":"TEST"}""")
+                else -> if (request.requestUrl!!.queryParameter("start") == "0") json(
+                    """{"results":[{"key":"TEST"}],"_links":{"next":"/rest/api/space?limit=1&start=1"}}""",
+                ) else json("""{"results":[]}""")
+            }
+        }
 
         loader().validate(config(server, "\"is_cloud\":false,\"space\":\"TEST\""), credentials())
 
         assertEquals("/rest/api/space", server.takeRequest().requestUrl!!.encodedPath)
         assertEquals("/rest/api/space/TEST", server.takeRequest().requestUrl!!.encodedPath)
+        assertEquals(2, server.requestCount)
     }
 
     @Test

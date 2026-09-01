@@ -77,8 +77,20 @@ class ConfluenceConnectorLoader(
 
     fun validate(config: JsonNode?, credentials: JsonNode) {
         val context = context(config, credentials)
+        val cloudV2 = context.isCloud && !context.config.boolean("scoped_token", false)
+        val initial = if (cloudV2) "/wiki/api/v2/spaces" else "/rest/api/space"
+        var path = updateQuery(initial, "limit", "1")
+        if (!cloudV2) path = updateQuery(path, "start", "0")
         val first = try {
-            retrieveSpaces(context, 1).firstOrNull()
+            val response = try {
+                get(context, path)
+            } catch (error: WebClientResponseException.NotFound) {
+                if (!cloudV2) throw error
+                path = updateQuery("/rest/api/space", "limit", "1")
+                path = updateQuery(path, "start", "0")
+                get(context, path)
+            }
+            response.path("results").firstOrNull()
         } catch (error: WebClientResponseException) {
             throw when (error.statusCode.value()) {
                 401 -> IllegalArgumentException("Invalid or expired Confluence credentials (HTTP 401).", error)
