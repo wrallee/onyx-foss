@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.springframework.web.reactive.function.client.WebClient
+import java.util.concurrent.TimeUnit
 
 class RerankingServiceTest {
     private val server = MockWebServer()
@@ -50,11 +51,29 @@ class RerankingServiceTest {
         assertTrue(response.warning!!.startsWith("Reranker unavailable:"))
     }
 
-    private fun service(fallback: Boolean) = RerankingService(
+    @Test
+    fun `read timeout applies to reranker response`() {
+        server.enqueue(
+            MockResponse()
+                .setHeadersDelay(150, TimeUnit.MILLISECONDS)
+                .setHeader("Content-Type", "application/json")
+                .setBody("""{"scores":[0.1,0.9]}"""),
+        )
+        server.start()
+
+        val response = service(fallback = true, readTimeoutMs = 50).rerank(request())
+
+        assertFalse(response.reranked)
+        assertTrue(response.warning!!.startsWith("Reranker unavailable:"))
+    }
+
+    private fun service(fallback: Boolean, readTimeoutMs: Long = 600_000) = RerankingService(
         properties = OnyxProperties(
             modelServer = OnyxProperties.ModelServer(
                 baseUrl = server.url("/").toString(),
                 rerankerEnabled = true,
+                connectTimeoutMs = 30_000,
+                readTimeoutMs = readTimeoutMs,
                 rerankerFallbackOnError = fallback,
             ),
         ),

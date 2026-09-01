@@ -52,6 +52,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 class IngestionProcessorIntegrationTest : H2IntegrationTest() {
     @Autowired private lateinit var processor: IngestionProcessor
@@ -760,9 +761,38 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
     }
 
     @Test
-    fun ingestionExternalTimeoutsAreBelowThePairLease() {
-        assertThat(MODEL_SERVER_TIMEOUT).isLessThan(INGESTION_LEASE)
-        assertThat(OPENSEARCH_TIMEOUT).isLessThan(INGESTION_LEASE)
+    fun leaseRenewsWhileEmbeddingRequestIsInFlight() {
+        val run = createRun()
+        load(sequenceOf(batch(1, false, document("one"))))
+        val claim = requireNotNull(claims.claimJob(run.jobId))
+        val embeddingStarted = CountDownLatch(1)
+        val releaseEmbedding = CountDownLatch(1)
+        val leaseAtEmbeddingStart = AtomicReference<Instant>()
+        doAnswer { invocation ->
+            leaseAtEmbeddingStart.set(jobs.findById(run.jobId).orElseThrow().leaseExpiresAt)
+            embeddingStarted.countDown()
+            check(releaseEmbedding.await(2, TimeUnit.SECONDS))
+            invocation.getArgument<List<String>>(0).map { listOf(0.1) }
+        }.`when`(embedder).embed(anyList<String>())
+
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val worker = executor.submit { processor.process(claim) }
+            assertThat(embeddingStarted.await(2, TimeUnit.SECONDS)).isTrue()
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+            var renewed = false
+            while (!renewed && System.nanoTime() < deadline) {
+                renewed = jobs.findById(run.jobId).orElseThrow().leaseExpiresAt
+                    ?.isAfter(leaseAtEmbeddingStart.get()) == true
+                if (!renewed) Thread.sleep(10)
+            }
+            assertThat(renewed).isTrue()
+            releaseEmbedding.countDown()
+            worker.get(2, TimeUnit.SECONDS)
+        } finally {
+            releaseEmbedding.countDown()
+            executor.shutdownNow()
+        }
     }
 
     @Test

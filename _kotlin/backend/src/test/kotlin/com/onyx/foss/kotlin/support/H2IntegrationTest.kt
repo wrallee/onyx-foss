@@ -14,6 +14,7 @@ const val H2_TEST_URL =
         "spring.datasource.username=sa",
         "spring.datasource.password=",
         "onyx.worker.enabled=false",
+        "onyx.worker.heartbeat-interval-ms=25",
         "onyx.storage.root=/tmp/onyx-kotlin-tests",
         "onyx.crypto.key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
     ],
