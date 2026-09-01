@@ -193,22 +193,25 @@ class AdminService(
     fun deleteConnector(connectorId: Long): StatusResponse {
         val pairIds = requireNotNull(
             transactions.execute {
-                connectors.lockById(connectorId)
+                val connector = connectors.lockById(connectorId)
                     ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
+                connector.deleting = true
+                connectors.save(connector)
                 val lockedPairs = pairs.findAllByConnectorId(connectorId).map { pair ->
                     pairs.lockById(id(pair)) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
                 }
                 lockedPairs.forEach(::markDeleting)
+                connectors.flush()
                 pairs.flush()
                 lockedPairs.map(::id)
             },
         )
-        pairIds.forEach { pairId ->
-            externalWrites.withPair(pairId) { indexer.deletePair(pairId) }
-        }
-        transactions.executeWithoutResult {
-            pairIds.forEach(documents::deleteAllByCcPairId)
-            connectors.lockById(connectorId)?.let(connectors::delete)
+        externalWrites.withPairs(pairIds) {
+            pairIds.forEach(indexer::deletePair)
+            transactions.executeWithoutResult {
+                pairIds.forEach(documents::deleteAllByCcPairId)
+                connectors.lockById(connectorId)?.let(connectors::delete)
+            }
         }
         return StatusResponse(true, "Connector deleted successfully", connectorId)
     }
@@ -216,22 +219,34 @@ class AdminService(
     fun deletePair(request: DeletionAttemptRequest): StatusResponse {
         val plan = requireNotNull(
             transactions.execute {
+                val connector = connectors.lockById(request.connectorId)
+                    ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
                 val existing = pairs.findByConnectorIdAndCredentialId(request.connectorId, request.credentialId)
                     ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
                 val pair = pairs.lockById(id(existing))
                     ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
                 val pairId = id(pair)
                 val hasOtherPairs = pairs.findAllByConnectorId(request.connectorId).any { id(it) != pairId }
+                if (connector.deleting && hasOtherPairs) {
+                    throw ApiException(HttpStatus.CONFLICT, "Connector is being deleted")
+                }
+                if (!hasOtherPairs) {
+                    connector.deleting = true
+                    connectors.save(connector)
+                }
                 markDeleting(pair)
+                connectors.flush()
                 pairs.flush()
                 PairDeletionPlan(pairId, hasOtherPairs)
             },
         )
-        externalWrites.withPair(plan.pairId) { indexer.deletePair(plan.pairId) }
-        transactions.executeWithoutResult {
-            documents.deleteAllByCcPairId(plan.pairId)
-            pairs.lockById(plan.pairId)?.let(pairs::delete)
-            if (!plan.hasOtherPairs) connectors.lockById(request.connectorId)?.let(connectors::delete)
+        externalWrites.withPair(plan.pairId) {
+            indexer.deletePair(plan.pairId)
+            transactions.executeWithoutResult {
+                documents.deleteAllByCcPairId(plan.pairId)
+                pairs.lockById(plan.pairId)?.let(pairs::delete)
+                if (!plan.hasOtherPairs) connectors.lockById(request.connectorId)?.let(connectors::delete)
+            }
         }
         return StatusResponse(true, "Connector deletion completed", plan.pairId)
     }
@@ -245,12 +260,17 @@ class AdminService(
 
     @Transactional
     fun associate(connectorId: Long, credentialId: Long, request: PairMetadataRequest): StatusResponse {
-        val connector = connector(connectorId)
+        val connector = connectors.lockById(connectorId)
+            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
+        requireNotDeleting(connector)
         val credential = credential(credentialId)
         if (connector.source != credential.source) {
             throw ApiException(HttpStatus.BAD_REQUEST, "Connector and credential source do not match")
         }
         val existingPair = pairs.findByConnectorIdAndCredentialId(connectorId, credentialId)
+        if (existingPair?.status == PairStatus.DELETING) {
+            throw ApiException(HttpStatus.CONFLICT, "CC Pair is being deleted")
+        }
         val pair = existingPair ?: ConnectorCredentialPairEntity(connectorId = connectorId, credentialId = credentialId)
         pair.name = request.name.trim()
         pair.accessType = request.accessType
@@ -304,7 +324,10 @@ class AdminService(
 
     @Transactional
     fun setPairStatus(pairId: Long, status: PairStatus): Map<String, Any?> {
-        val pair = pair(pairId)
+        val pair = pairs.lockById(pairId) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+        if (pair.status == PairStatus.DELETING) {
+            throw ApiException(HttpStatus.CONFLICT, "CC Pair is being deleted")
+        }
         pair.status = status
         pairs.save(pair)
         return pairDetail(pairId)
@@ -312,7 +335,9 @@ class AdminService(
 
     @Transactional
     fun enqueue(request: RunConnectorRequest): StatusResponse {
-        connector(request.connectorId)
+        val connector = connectors.lockById(request.connectorId)
+            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
+        requireNotDeleting(connector)
         val all = pairs.findAllByConnectorId(request.connectorId)
         val selected = if (request.credentialIds.isNullOrEmpty() || request.credentialIds == listOf(0L)) {
             all
@@ -500,6 +525,10 @@ class AdminService(
 
     private fun validatePairs(pairIds: List<Long>) {
         if (pairIds.any { !pairs.existsById(it) }) throw ApiException(HttpStatus.BAD_REQUEST, "Document set references a missing connector")
+    }
+
+    private fun requireNotDeleting(connector: ConnectorEntity) {
+        if (connector.deleting) throw ApiException(HttpStatus.CONFLICT, "Connector is being deleted")
     }
 
     private fun mergeMaskedCredential(current: JsonNode, update: JsonNode): JsonNode {

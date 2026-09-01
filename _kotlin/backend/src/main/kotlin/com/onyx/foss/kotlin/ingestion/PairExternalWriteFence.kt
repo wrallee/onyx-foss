@@ -8,15 +8,19 @@ import javax.sql.DataSource
 class PairExternalWriteFence(
     private val dataSource: DataSource,
 ) {
-    fun <T> withPair(pairId: Long, action: () -> T): T {
-        require(pairId > 0) { "CC pair ID must be positive" }
+    fun <T> withPair(pairId: Long, action: () -> T): T = withPairs(listOf(pairId), action)
+
+    fun <T> withPairs(pairIds: Collection<Long>, action: () -> T): T {
+        val orderedPairIds = pairIds.distinct().sorted()
+        require(orderedPairIds.all { it > 0 }) { "CC pair IDs must be positive" }
+        if (orderedPairIds.isEmpty()) return action()
         dataSource.connection.use { connection ->
             check(connection.autoCommit) { "Pair external-write fences require an auto-commit connection" }
-            lock(connection, pairId)
+            orderedPairIds.forEach { lock(connection, it) }
             try {
                 return action()
             } finally {
-                unlock(connection, pairId)
+                orderedPairIds.asReversed().forEach { unlock(connection, it) }
             }
         }
     }

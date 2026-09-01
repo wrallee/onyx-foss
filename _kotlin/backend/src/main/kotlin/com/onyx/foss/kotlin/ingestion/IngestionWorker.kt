@@ -600,25 +600,25 @@ class OpenSearchIndexer(
     }
 
     private fun updateByQuery(body: Map<String, Any>, operation: String, minimumTotal: Int) {
-        ensureIndex()
-        val response = clientBuilder.build()
-            .post()
-            .uri(
-                properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index +
-                    "/_update_by_query?refresh=true&conflicts=proceed",
-            )
-            .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue(mapper.valueToTree<JsonNode>(body))
-            .exchangeToMono { result ->
-                if (result.statusCode().is2xxSuccessful) {
-                    result.bodyToMono(JsonNode::class.java).defaultIfEmpty(mapper.createObjectNode())
-                } else {
-                    result.bodyToMono(String::class.java).flatMap {
-                        Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
+        val response = withMigrationRetry {
+            clientBuilder.build()
+                .post()
+                .uri(
+                    properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index +
+                        "/_update_by_query?refresh=true&conflicts=proceed",
+                )
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(mapper.valueToTree<JsonNode>(body))
+                .exchangeToMono { result ->
+                    if (result.statusCode().is2xxSuccessful) {
+                        result.bodyToMono(JsonNode::class.java).defaultIfEmpty(mapper.createObjectNode())
+                    } else {
+                        result.bodyToMono(String::class.java).flatMap {
+                            Mono.error(openSearchWriteError(operation, result.statusCode().value(), it))
+                        }
                     }
-                }
-            }
-            .block(DOCUMENT_SET_UPDATE_TIMEOUT)
+                }.block(DOCUMENT_SET_UPDATE_TIMEOUT)
+        }
         val total = response?.path("total")?.asInt(-1) ?: -1
         val updated = response?.path("updated")?.asInt(-1) ?: -1
         val noops = response?.path("noops")?.asInt(-1) ?: -1
@@ -631,24 +631,23 @@ class OpenSearchIndexer(
     }
 
     private fun deleteByQuery(query: Map<String, Any>, operation: String) {
-        ensureIndex()
-        val response = clientBuilder.build()
-            .post()
-            .uri(
-                properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index +
-                    "/_delete_by_query?refresh=true",
-            )
-            .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue(mapOf("query" to query))
-            .exchangeToMono { result ->
-                if (result.statusCode().is2xxSuccessful) {
-                    result.bodyToMono(JsonNode::class.java).defaultIfEmpty(mapper.createObjectNode())
-                }
-                else result.bodyToMono(String::class.java).flatMap {
-                    Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
-                }
-            }
-            .block(OPENSEARCH_TIMEOUT)
+        val response = withMigrationRetry {
+            clientBuilder.build()
+                .post()
+                .uri(
+                    properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index +
+                        "/_delete_by_query?refresh=true",
+                )
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(mapOf("query" to query))
+                .exchangeToMono { result ->
+                    if (result.statusCode().is2xxSuccessful) {
+                        result.bodyToMono(JsonNode::class.java).defaultIfEmpty(mapper.createObjectNode())
+                    } else result.bodyToMono(String::class.java).flatMap {
+                        Mono.error(openSearchWriteError(operation, result.statusCode().value(), it))
+                    }
+                }.block(OPENSEARCH_TIMEOUT)
+        }
         val total = response?.path("total")?.asInt(-1) ?: -1
         val deleted = response?.path("deleted")?.asInt(-1) ?: -1
         check(
@@ -672,7 +671,6 @@ class OpenSearchIndexer(
         primaryOwners: List<String> = emptyList(),
         secondaryOwners: List<String> = emptyList(),
     ) {
-        ensureIndex()
         val documentId = Base64.getUrlEncoder().withoutPadding().encodeToString(
             (pairId.toString() + ":" + sourceDocumentId + ":" + chunkId).toByteArray(StandardCharsets.UTF_8),
         )
@@ -693,17 +691,43 @@ class OpenSearchIndexer(
             "external_user_group_ids" to emptyList<String>(),
             "is_public" to false,
         )
-        val response = clientBuilder.build()
-            .put()
-            .uri(properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index + "/_doc/" + documentId + "?refresh=true")
-            .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue(mapper.valueToTree<JsonNode>(body))
-            .exchangeToMono { result ->
-                if (result.statusCode().is2xxSuccessful) result.releaseBody().thenReturn(true)
-                else result.bodyToMono(String::class.java).flatMap { Mono.error(IllegalStateException("OpenSearch index write failed: " + it)) }
-            }
-            .block(OPENSEARCH_TIMEOUT)
+        val response = withMigrationRetry {
+            clientBuilder.build()
+                .put()
+                .uri(properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index + "/_doc/" + documentId + "?refresh=true")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(mapper.valueToTree<JsonNode>(body))
+                .exchangeToMono { result ->
+                    if (result.statusCode().is2xxSuccessful) result.releaseBody().thenReturn(true)
+                    else result.bodyToMono(String::class.java).flatMap {
+                        Mono.error(openSearchWriteError("index write", result.statusCode().value(), it))
+                    }
+                }.block(OPENSEARCH_TIMEOUT)
+        }
         check(response == true) { "OpenSearch did not confirm the index write" }
+    }
+
+    private fun <T> withMigrationRetry(action: () -> T): T {
+        var lastBlock: OpenSearchWriteBlockedException? = null
+        repeat(2) {
+            ensureIndex()
+            try {
+                return action()
+            } catch (error: OpenSearchWriteBlockedException) {
+                indexReady.set(false)
+                lastBlock = error
+            }
+        }
+        throw requireNotNull(lastBlock)
+    }
+
+    private fun openSearchWriteError(operation: String, status: Int, body: String): RuntimeException {
+        val message = "OpenSearch $operation failed: $body"
+        return if (status == 403 && body.contains("cluster_block_exception")) {
+            OpenSearchWriteBlockedException(message)
+        } else {
+            IllegalStateException(message)
+        }
     }
 
     private fun ensureIndex() {
@@ -711,26 +735,16 @@ class OpenSearchIndexer(
         synchronized(indexReady) {
             if (indexReady.get()) return
             val indexUrl = properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index
-            val exists = clientBuilder.build().head().uri(indexUrl).exchangeToMono { response ->
-                when {
-                    response.statusCode().is2xxSuccessful -> response.releaseBody().thenReturn(true)
-                    response.statusCode().value() == 404 -> response.releaseBody().thenReturn(false)
-                    else -> response.bodyToMono(String::class.java).flatMap {
-                        Mono.error(IllegalStateException("OpenSearch index check failed: $it"))
-                    }
-                }
-            }.block(OPENSEARCH_TIMEOUT) == true
+            val exists = indexExists(indexUrl, "index check")
             if (!exists) {
                 putJson(indexUrl, INDEX_DEFINITION, "index creation")
             } else {
-                val mapping = getJson("$indexUrl/_mapping", "mapping check")
-                check(mapping.size() == 1) { "OpenSearch index must resolve to one concrete index" }
-                val propertiesNode = mapping.fields().next().value.path("mappings").path("properties")
+                val mapping = mapping(indexUrl, "mapping check")
                 val missingFields = linkedMapOf<String, Any>()
                 var incompatibleMapping = false
                 EXACT_FIELDS.forEach { (field, definition) ->
                     val expectedType = (definition as Map<*, *>)["type"].toString()
-                    val actualType = propertiesNode.path(field).path("type").asText()
+                    val actualType = mapping.properties.path(field).path("type").asText()
                     if (actualType.isBlank()) {
                         missingFields[field] = definition
                     } else if (actualType != expectedType) {
@@ -738,7 +752,7 @@ class OpenSearchIndexer(
                     }
                 }
                 if (incompatibleMapping) {
-                    reindexWithExactMappings(indexUrl)
+                    reindexWithExactMappings(mapping.concreteIndex)
                 } else if (missingFields.isNotEmpty()) {
                     putJson("$indexUrl/_mapping", mapOf("properties" to missingFields), "exact mapping creation")
                 }
@@ -747,15 +761,22 @@ class OpenSearchIndexer(
         }
     }
 
-    private fun reindexWithExactMappings(indexUrl: String) {
-        val sourceIndex = properties.opensearch.index
-        val replacementIndex = "$sourceIndex-exact-${UUID.randomUUID()}"
+    private fun reindexWithExactMappings(sourceIndex: String) {
+        val logicalIndex = properties.opensearch.index
+        val replacementIndex = "$logicalIndex-exact-v1"
+        check(sourceIndex != replacementIndex) { "OpenSearch exact mapping replacement cannot replace itself" }
         val baseUrl = properties.opensearch.baseUrl.trimEnd('/')
+        val indexUrl = "$baseUrl/$logicalIndex"
         val replacementUrl = "$baseUrl/$replacementIndex"
-        putJson(replacementUrl, INDEX_DEFINITION, "replacement index creation")
-        var swapRequested = false
         try {
-            val sourceCount = getJson("$indexUrl/_count", "source count").path("count").asLong(-1)
+            addWriteBlock(sourceIndex)
+        } catch (error: Exception) {
+            if (exactLogicalMapping() != null) return
+            if (!isWriteBlocked(sourceIndex)) throw error
+        }
+        try {
+            ensureReplacementIndex(replacementUrl)
+            val sourceCount = getJson("$baseUrl/$sourceIndex/_count", "source count").path("count").asLong(-1)
             val result = postJson(
                 "$baseUrl/_reindex?refresh=true&wait_for_completion=true",
                 mapOf(
@@ -772,13 +793,18 @@ class OpenSearchIndexer(
                     result.path("created").asLong(-1) + result.path("updated").asLong(-1) == sourceCount &&
                     getJson("$replacementUrl/_count", "replacement count").path("count").asLong(-1) == sourceCount,
             ) { "OpenSearch did not fully reindex the existing index" }
-            swapRequested = true
+
+            val current = mapping(indexUrl, "pre-swap mapping check")
+            if (hasExactMappings(current.properties)) return
+            check(current.concreteIndex == sourceIndex) {
+                "OpenSearch logical index changed to an incompatible index during migration"
+            }
             val aliasResult = postJson(
                 "$baseUrl/_aliases",
                 mapOf(
                     "actions" to listOf(
                         mapOf("remove_index" to mapOf("index" to sourceIndex)),
-                        mapOf("add" to mapOf("index" to replacementIndex, "alias" to sourceIndex, "is_write_index" to true)),
+                        mapOf("add" to mapOf("index" to replacementIndex, "alias" to logicalIndex, "is_write_index" to true)),
                     ),
                 ),
                 "exact mapping alias swap",
@@ -787,10 +813,72 @@ class OpenSearchIndexer(
                 "OpenSearch did not confirm the exact mapping alias swap"
             }
         } catch (error: Exception) {
-            if (!swapRequested) runCatching { deleteIndex(replacementUrl) }
+            if (exactLogicalMapping() != null) return
             throw error
         }
     }
+
+    private fun addWriteBlock(sourceIndex: String) {
+        val result = putWithoutBodyJson(
+            properties.opensearch.baseUrl.trimEnd('/') + "/$sourceIndex/_block/write",
+            "migration write block",
+        )
+        check(
+            result.path("acknowledged").asBoolean(false) &&
+                result.path("shards_acknowledged").asBoolean(false),
+        ) { "OpenSearch did not confirm the migration write block" }
+    }
+
+    private fun isWriteBlocked(sourceIndex: String): Boolean = runCatching {
+        val settings = getJson(
+            properties.opensearch.baseUrl.trimEnd('/') + "/$sourceIndex/_settings/index.blocks.write?flat_settings=true",
+            "migration write block check",
+        ).path(sourceIndex).path("settings")
+        settings.path("index.blocks.write").asText().equals("true", ignoreCase = true) ||
+            settings.path("index").path("blocks").path("write").asBoolean(false)
+    }.getOrDefault(false)
+
+    private fun ensureReplacementIndex(replacementUrl: String) {
+        if (!indexExists(replacementUrl, "replacement index check")) {
+            try {
+                putJson(replacementUrl, INDEX_DEFINITION, "replacement index creation")
+            } catch (error: Exception) {
+                if (!indexExists(replacementUrl, "replacement index race check")) throw error
+            }
+        }
+        check(hasExactMappings(mapping(replacementUrl, "replacement mapping check").properties)) {
+            "OpenSearch replacement index does not have exact mappings"
+        }
+    }
+
+    private fun exactLogicalMapping(): IndexMapping? = runCatching {
+        mapping(
+            properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index,
+            "migration recovery mapping check",
+        )
+    }.getOrNull()?.takeIf { hasExactMappings(it.properties) }
+
+    private fun hasExactMappings(propertiesNode: JsonNode): Boolean = EXACT_FIELDS.all { (field, definition) ->
+        propertiesNode.path(field).path("type").asText() == (definition as Map<*, *>)["type"].toString()
+    }
+
+    private fun mapping(indexUrl: String, operation: String): IndexMapping {
+        val response = getJson("$indexUrl/_mapping", operation)
+        check(response.size() == 1) { "OpenSearch index must resolve to one concrete index" }
+        val entry = response.fields().next()
+        return IndexMapping(entry.key, entry.value.path("mappings").path("properties"))
+    }
+
+    private fun indexExists(uri: String, operation: String): Boolean =
+        clientBuilder.build().head().uri(uri).exchangeToMono { response ->
+            when {
+                response.statusCode().is2xxSuccessful -> response.releaseBody().thenReturn(true)
+                response.statusCode().value() == 404 -> response.releaseBody().thenReturn(false)
+                else -> response.bodyToMono(String::class.java).flatMap {
+                    Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
+                }
+            }
+        }.block(OPENSEARCH_TIMEOUT) == true
 
     private fun getJson(uri: String, operation: String): JsonNode = requireNotNull(
         clientBuilder.build().get().uri(uri).exchangeToMono { response ->
@@ -814,6 +902,15 @@ class OpenSearchIndexer(
         check(confirmed == true) { "OpenSearch did not confirm $operation" }
     }
 
+    private fun putWithoutBodyJson(uri: String, operation: String): JsonNode = requireNotNull(
+        clientBuilder.build().put().uri(uri).exchangeToMono { response ->
+            if (response.statusCode().is2xxSuccessful) response.bodyToMono(JsonNode::class.java)
+            else response.bodyToMono(String::class.java).flatMap {
+                Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
+            }
+        }.block(OPENSEARCH_TIMEOUT),
+    )
+
     private fun postJson(uri: String, body: Map<String, Any>, operation: String): JsonNode = requireNotNull(
         clientBuilder.build().post().uri(uri)
             .contentType(MediaType.APPLICATION_JSON)
@@ -823,18 +920,13 @@ class OpenSearchIndexer(
                 else response.bodyToMono(String::class.java).flatMap {
                     Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
                 }
-            }.block(OPENSEARCH_MIGRATION_TIMEOUT),
+        }.block(OPENSEARCH_MIGRATION_TIMEOUT),
     )
 
-    private fun deleteIndex(uri: String) {
-        val confirmed = clientBuilder.build().delete().uri(uri).exchangeToMono { response ->
-            if (response.statusCode().is2xxSuccessful) response.releaseBody().thenReturn(true)
-            else response.bodyToMono(String::class.java).flatMap {
-                Mono.error(IllegalStateException("OpenSearch replacement cleanup failed: $it"))
-            }
-        }.block(OPENSEARCH_TIMEOUT)
-        check(confirmed == true) { "OpenSearch did not confirm replacement cleanup" }
-    }
+    private data class IndexMapping(
+        val concreteIndex: String,
+        val properties: JsonNode,
+    )
 
     private companion object {
         const val EXACT_DOCUMENT_ID_FIELD = "source_document_id"
@@ -853,6 +945,8 @@ class OpenSearchIndexer(
         val INDEX_DEFINITION: Map<String, Any> = mapOf("mappings" to mapOf("properties" to EXACT_FIELDS))
     }
 }
+
+private class OpenSearchWriteBlockedException(message: String) : RuntimeException(message)
 
 internal val DOCUMENT_SET_UPDATE_TIMEOUT: Duration = Duration.ofSeconds(30)
 internal val OPENSEARCH_TIMEOUT: Duration = Duration.ofSeconds(30)

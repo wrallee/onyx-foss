@@ -85,6 +85,8 @@ class ConnectorEntity(
     var pruneFreq: Long? = null,
     @Column(name = "indexing_start")
     var indexingStart: Instant? = null,
+    @Column(nullable = false)
+    var deleting: Boolean = false,
     @CreationTimestamp @Column(name = "created_at", updatable = false)
     var createdAt: Instant? = null,
     @UpdateTimestamp @Column(name = "updated_at")

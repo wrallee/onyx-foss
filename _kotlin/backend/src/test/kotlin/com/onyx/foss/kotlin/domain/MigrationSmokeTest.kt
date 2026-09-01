@@ -30,7 +30,7 @@ class MigrationSmokeTest : PostgresIntegrationTest() {
     }
 
     @Test
-    fun `existing V7 data migrates through V14 and duplicate active jobs are cleaned`() {
+    fun `existing V7 data migrates through V15 and duplicate active jobs are cleaned`() {
         val schema = "migration_${UUID.randomUUID().toString().replace("-", "")}"
         jdbc.execute("CREATE SCHEMA $schema")
         try {
@@ -138,6 +138,9 @@ class MigrationSmokeTest : PostgresIntegrationTest() {
                     Boolean::class.java,
                 ),
             ).isTrue()
+            assertThat(
+                legacy.queryForObject("SELECT deleting FROM connectors WHERE id = 101", Boolean::class.java),
+            ).isFalse()
         } finally {
             jdbc.execute("DROP SCHEMA $schema CASCADE")
         }

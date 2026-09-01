@@ -4,6 +4,14 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.mockwebserver.Dispatcher
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
@@ -17,6 +25,11 @@ import org.testcontainers.containers.wait.strategy.Wait
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import okio.Buffer
 
 @Testcontainers
 class OpenSearchIndexerIntegrationTest {
@@ -110,8 +123,76 @@ class OpenSearchIndexerIntegrationTest {
         assertThat(exactDocuments(fileId)).isEmpty()
     }
 
-    private fun indexer(): OpenSearchIndexer = OpenSearchIndexer(
-        OnyxProperties(opensearch = OnyxProperties.OpenSearch(baseUrl = baseUrl, index = index)),
+    @Test
+    fun concurrentWriterCompletesWhileAnotherReplicaIsMigratingTheLegacyIndex() {
+        val legacyId = "legacy-document"
+        val concurrentId = "concurrent-document"
+        putRawDocument("legacy", legacyId, "legacy content")
+        val firstReindex = CountDownLatch(1)
+        val releaseFirstReindex = CountDownLatch(1)
+        val proxyClient = OkHttpClient()
+        MockWebServer().use { proxy ->
+            proxy.dispatcher = pausingProxy(proxyClient, firstReindex, releaseFirstReindex)
+            proxy.start()
+            val migratingReplica = indexer(proxy.url("/").toString().trimEnd('/'))
+            val writingReplica = indexer(proxy.url("/").toString().trimEnd('/'))
+            val executor = Executors.newSingleThreadExecutor()
+            try {
+                val migration = executor.submit {
+                    migratingReplica.updateAccess(
+                        7,
+                        mapOf(legacyId to ExternalAccess(setOf("reader@example.com"), isPublic = false)),
+                    )
+                }
+                assertThat(firstReindex.await(10, TimeUnit.SECONDS)).isTrue()
+
+                writingReplica.upsert(
+                    7,
+                    concurrentId,
+                    0,
+                    "Concurrent",
+                    "concurrent content",
+                    null,
+                    emptyMap(),
+                    listOf(0.2),
+                )
+
+                releaseFirstReindex.countDown()
+                migration.get(30, TimeUnit.SECONDS)
+            } finally {
+                releaseFirstReindex.countDown()
+                executor.shutdownNow()
+                proxyClient.dispatcher.executorService.shutdown()
+                proxyClient.connectionPool.evictAll()
+            }
+        }
+
+        assertThat(exactDocuments(legacyId).single().path("external_user_emails").map(JsonNode::asText))
+            .containsExactly("reader@example.com")
+        assertThat(exactDocuments(concurrentId).single().path("content").asText()).isEqualTo("concurrent content")
+    }
+
+    @Test
+    fun restartedReplicaCompletesTheDurableBlockedMigration() {
+        val firstId = "legacy-one"
+        val secondId = "legacy-two"
+        putRawDocument("legacy-one", firstId, "first")
+        putRawDocument("legacy-two", secondId, "second")
+        put("/$index/_block/write")
+        val replacement = "$index-exact-v1"
+        put("/$replacement", exactIndexDefinition())
+        putRawDocument(replacement, "legacy-one", firstId, "first")
+
+        indexer().upsert(7, "after-restart", 0, "Restarted", "new", null, emptyMap(), listOf(0.3))
+
+        assertThat(get("/_alias/$index").fieldNames().asSequence().toList()).containsExactly(replacement)
+        assertThat(exactDocuments(firstId)).hasSize(1)
+        assertThat(exactDocuments(secondId)).hasSize(1)
+        assertThat(exactDocuments("after-restart")).hasSize(1)
+    }
+
+    private fun indexer(url: String = baseUrl): OpenSearchIndexer = OpenSearchIndexer(
+        OnyxProperties(opensearch = OnyxProperties.OpenSearch(baseUrl = url, index = index)),
         WebClient.builder(),
         mapper,
     )
@@ -127,7 +208,16 @@ class OpenSearchIndexerIntegrationTest {
         .orEmpty()
 
     private fun putRawDocument(documentId: String, sourceDocumentId: String, content: String) {
-        client.put().uri("$baseUrl/$index/_doc/$documentId?refresh=true")
+        putRawDocument(index, documentId, sourceDocumentId, content)
+    }
+
+    private fun putRawDocument(
+        targetIndex: String,
+        documentId: String,
+        sourceDocumentId: String,
+        content: String,
+    ) {
+        client.put().uri("$baseUrl/$targetIndex/_doc/$documentId?refresh=true")
             .contentType(MediaType.APPLICATION_JSON)
             .bodyValue(
                 mapOf(
@@ -138,6 +228,66 @@ class OpenSearchIndexerIntegrationTest {
                 ),
             )
             .retrieve().toBodilessEntity().block(Duration.ofSeconds(30))
+    }
+
+    private fun put(path: String, body: Any? = null) {
+        val request = client.put().uri(baseUrl + path)
+        val response = if (body == null) request.retrieve() else {
+            request.contentType(MediaType.APPLICATION_JSON).bodyValue(body).retrieve()
+        }
+        response.toBodilessEntity().block(Duration.ofSeconds(30))
+    }
+
+    private fun exactIndexDefinition(): Map<String, Any> = mapOf(
+        "mappings" to mapOf(
+            "properties" to mapOf(
+                "cc_pair_id" to mapOf("type" to "long"),
+                "source_document_id" to mapOf("type" to "keyword"),
+                "chunk_id" to mapOf("type" to "integer"),
+                "external_user_emails" to mapOf("type" to "keyword"),
+                "external_user_group_ids" to mapOf("type" to "keyword"),
+                "is_public" to mapOf("type" to "boolean"),
+                "document_sets" to mapOf("type" to "keyword"),
+                "doc_updated_at" to mapOf("type" to "date"),
+                "primary_owners" to mapOf("type" to "keyword"),
+                "secondary_owners" to mapOf("type" to "keyword"),
+            ),
+        ),
+    )
+
+    private fun pausingProxy(
+        proxyClient: OkHttpClient,
+        firstReindex: CountDownLatch,
+        releaseFirstReindex: CountDownLatch,
+    ): Dispatcher {
+        val pauseNextReindex = AtomicBoolean(true)
+        return object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.path?.startsWith("/_reindex") == true && pauseNextReindex.compareAndSet(true, false)) {
+                    firstReindex.countDown()
+                    check(releaseFirstReindex.await(30, TimeUnit.SECONDS))
+                }
+                val method = requireNotNull(request.method)
+                val contentType = request.getHeader("Content-Type")?.toMediaTypeOrNull()
+                val requestBody = if (method in setOf("POST", "PUT", "PATCH")) {
+                    request.body.clone().readByteArray().toRequestBody(contentType)
+                } else {
+                    null
+                }
+                val upstreamRequest = Request.Builder()
+                    .url(baseUrl + requireNotNull(request.path))
+                    .method(method, requestBody)
+                    .apply { request.getHeader("Content-Type")?.let { header("Content-Type", it) } }
+                    .build()
+                return proxyClient.newCall(upstreamRequest).execute().use { response ->
+                    MockResponse().setResponseCode(response.code)
+                        .apply {
+                            response.header("Content-Type")?.let { setHeader("Content-Type", it) }
+                            response.body?.bytes()?.let { setBody(Buffer().write(it)) }
+                        }
+                }
+            }
+        }
     }
 
     private fun mappingProperties(): JsonNode = get("/$index/_mapping").fields().next().value

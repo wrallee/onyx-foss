@@ -43,20 +43,33 @@ class PermissionSyncClaimService(
 
     private fun claim(attempt: com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity, now: Instant): PermissionSyncClaim {
         val token = UUID.randomUUID()
+        val reclaimed = attempt.status == AttemptStatus.IN_PROGRESS
         attempt.status = AttemptStatus.IN_PROGRESS
         attempt.timeStarted = attempt.timeStarted ?: now
         attempt.timeFinished = null
         attempt.claimToken = token
         attempt.leaseExpiresAt = now.plus(PERMISSION_SYNC_LEASE)
+        if (reclaimed) attempt.followUpRequested = false
         attempts.saveAndFlush(attempt)
         return PermissionSyncClaim(requireNotNull(attempt.id), attempt.ccPairId, token)
     }
 
-    fun renew(claim: PermissionSyncClaim, now: Instant = Instant.now()): Boolean =
-        attempts.renewOwned(claim.attemptId, claim.token, now.plus(PERMISSION_SYNC_LEASE)) == 1
+    @Transactional
+    fun renew(claim: PermissionSyncClaim): Boolean {
+        val attempt = lockLiveOwner(claim) ?: return false
+        attempt.leaseExpiresAt = Instant.now().plus(PERMISSION_SYNC_LEASE)
+        attempts.saveAndFlush(attempt)
+        return true
+    }
 
-    fun updateCounts(claim: PermissionSyncClaim, total: Int, errors: Int): Boolean =
-        attempts.updateCountsOwned(claim.attemptId, claim.token, total, errors) == 1
+    @Transactional
+    fun updateCounts(claim: PermissionSyncClaim, total: Int, errors: Int): Boolean {
+        val attempt = lockLiveOwner(claim) ?: return false
+        attempt.totalDocsSynced = total
+        attempt.docsWithPermissionErrors = errors
+        attempts.saveAndFlush(attempt)
+        return true
+    }
 
     @Transactional
     fun complete(claim: PermissionSyncClaim, status: AttemptStatus): Boolean = finish(claim) { attempt ->
@@ -74,7 +87,7 @@ class PermissionSyncClaimService(
         claim: PermissionSyncClaim,
         update: (com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity) -> Unit,
     ): Boolean {
-        val attempt = attempts.lockOwned(claim.attemptId, claim.token) ?: return false
+        val attempt = lockLiveOwner(claim) ?: return false
         val followUpRequested = attempt.followUpRequested
         update(attempt)
         attempt.claimToken = null
@@ -89,6 +102,12 @@ class PermissionSyncClaimService(
         }
         return true
     }
+
+    private fun lockLiveOwner(
+        claim: PermissionSyncClaim,
+    ): com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity? =
+        attempts.lockOwned(claim.attemptId, claim.token)
+            ?.takeIf { it.leaseExpiresAt?.isAfter(Instant.now()) == true }
 }
 
 @Component

@@ -2,12 +2,17 @@ package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
+import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import org.springframework.web.reactive.function.client.WebClient
 import java.time.Duration
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class OpenSearchIndexerTest {
     private val mapper = jacksonObjectMapper()
@@ -191,31 +196,7 @@ class OpenSearchIndexerTest {
     @Test
     fun uncertainAliasSwapPreservesTheReindexedCopyForRecovery() {
         MockWebServer().use { server ->
-            server.enqueue(MockResponse().setResponseCode(200))
-            server.enqueue(
-                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
-                    .setBody("""{"documents":{"mappings":{"properties":{"source_document_id":{"type":"text"}}}}}"""),
-            )
-            server.enqueue(MockResponse().setResponseCode(200))
-            server.enqueue(
-                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
-                    .setBody("""{"count":1}"""),
-            )
-            server.enqueue(
-                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
-                    .setBody(
-                        """{"timed_out":false,"total":1,"created":1,"updated":0,"version_conflicts":0,"failures":[]}""",
-                    ),
-            )
-            server.enqueue(
-                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
-                    .setBody("""{"count":1}"""),
-            )
-            server.enqueue(
-                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
-                    .setBody("""{"acknowledged":false}"""),
-            )
-            server.enqueue(MockResponse().setResponseCode(200))
+            server.dispatcher = migrationDispatcher(aliasAppliedDespiteResponse = false)
             server.start()
             val indexer = OpenSearchIndexer(
                 OnyxProperties(
@@ -232,8 +213,31 @@ class OpenSearchIndexerTest {
                 indexer.deleteDocuments(7, setOf("one"))
             }
 
-            repeat(7) { requireNotNull(server.takeRequest(1, java.util.concurrent.TimeUnit.SECONDS)) }
-            assertThat(server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS)).isNull()
+            val requests = recordedRequests(server)
+            assertThat(requests).contains("PUT /documents/_block/write")
+            assertThat(requests.none { it.startsWith("DELETE /documents-exact-") }).isTrue()
+        }
+    }
+
+    @Test
+    fun uncertainAliasResponseRecoversWhenTheLogicalIndexIsAlreadyExact() {
+        MockWebServer().use { server ->
+            server.dispatcher = migrationDispatcher(aliasAppliedDespiteResponse = true)
+            server.start()
+            val indexer = OpenSearchIndexer(
+                OnyxProperties(
+                    opensearch = OnyxProperties.OpenSearch(
+                        baseUrl = server.url("/").toString().trimEnd('/'),
+                        index = "documents",
+                    ),
+                ),
+                WebClient.builder(),
+                mapper,
+            )
+
+            indexer.deleteDocuments(7, setOf("one"))
+
+            assertThat(recordedRequests(server)).contains("POST /documents/_delete_by_query?refresh=true")
         }
     }
 
@@ -271,6 +275,79 @@ class OpenSearchIndexerTest {
 
     private fun successfulUpdateResponse(): String =
         """{"timed_out":false,"total":1,"updated":1,"noops":0,"version_conflicts":0,"failures":[]}"""
+
+    private fun migrationDispatcher(aliasAppliedDespiteResponse: Boolean): Dispatcher {
+        val logicalMappingReads = AtomicInteger()
+        val replacementExists = AtomicBoolean(false)
+        return object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = requireNotNull(request.path)
+                val method = requireNotNull(request.method)
+                return when {
+                    method == "HEAD" && path == "/documents" -> MockResponse().setResponseCode(200)
+                    method == "HEAD" && path.startsWith("/documents-exact-") ->
+                        MockResponse().setResponseCode(if (replacementExists.get()) 200 else 404)
+                    method == "GET" && path == "/documents/_mapping" -> {
+                        val exact = aliasAppliedDespiteResponse && logicalMappingReads.getAndIncrement() > 0
+                        jsonResponse(if (exact) exactMappingResponse() else legacyMappingResponse())
+                    }
+                    method == "PUT" && path == "/documents/_block/write" ->
+                        jsonResponse("""{"acknowledged":true,"shards_acknowledged":true}""")
+                    method == "PUT" && path.startsWith("/documents-exact-") -> {
+                        replacementExists.set(true)
+                        jsonResponse("""{"acknowledged":true}""")
+                    }
+                    method == "GET" && path.startsWith("/documents-exact-") && path.endsWith("/_mapping") ->
+                        jsonResponse(exactMappingResponse())
+                    method == "GET" && path.endsWith("/_count") -> jsonResponse("""{"count":1}""")
+                    method == "POST" && path.startsWith("/_reindex") -> jsonResponse(
+                        """{"timed_out":false,"total":1,"created":1,"updated":0,"version_conflicts":0,"failures":[]}""",
+                    )
+                    method == "POST" && path == "/_aliases" -> jsonResponse("""{"acknowledged":false}""")
+                    method == "POST" && path.startsWith("/documents/_delete_by_query") -> jsonResponse(
+                        """{"timed_out":false,"total":0,"deleted":0,"version_conflicts":0,"failures":[]}""",
+                    )
+                    else -> MockResponse().setResponseCode(500).setBody("Unexpected $method $path")
+                }
+            }
+        }
+    }
+
+    private fun legacyMappingResponse(): String =
+        """{"documents":{"mappings":{"properties":{"source_document_id":{"type":"text"}}}}}"""
+
+    private fun exactMappingResponse(): String = mapper.writeValueAsString(
+        mapOf(
+            "documents-exact-v1" to mapOf(
+                "mappings" to mapOf(
+                    "properties" to mapOf(
+                        "cc_pair_id" to mapOf("type" to "long"),
+                        "source_document_id" to mapOf("type" to "keyword"),
+                        "chunk_id" to mapOf("type" to "integer"),
+                        "external_user_emails" to mapOf("type" to "keyword"),
+                        "external_user_group_ids" to mapOf("type" to "keyword"),
+                        "is_public" to mapOf("type" to "boolean"),
+                        "document_sets" to mapOf("type" to "keyword"),
+                        "doc_updated_at" to mapOf("type" to "date"),
+                        "primary_owners" to mapOf("type" to "keyword"),
+                        "secondary_owners" to mapOf("type" to "keyword"),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    private fun jsonResponse(body: String): MockResponse = MockResponse()
+        .setResponseCode(200)
+        .setHeader("Content-Type", "application/json")
+        .setBody(body)
+
+    private fun recordedRequests(server: MockWebServer): List<String> = buildList {
+        while (true) {
+            val request = server.takeRequest(200, TimeUnit.MILLISECONDS) ?: break
+            add("${request.method} ${request.path}")
+        }
+    }
 
     private fun enqueueKeywordMapping(server: MockWebServer) {
         server.enqueue(MockResponse().setResponseCode(200))

@@ -45,6 +45,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import javax.sql.DataSource
 
 @AutoConfigureMockMvc
 class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
@@ -61,6 +62,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var attempts: PermissionSyncAttemptRepository
     @Autowired private lateinit var staging: PermissionSyncStageRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
+    @Autowired private lateinit var dataSource: DataSource
     @MockitoBean private lateinit var remoteLoaders: RemoteConnectorLoaders
     @MockitoBean private lateinit var indexer: OpenSearchIndexer
 
@@ -196,6 +198,115 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         assertThat(attempts.findAllByCcPairIdOrderByIdDesc(pairId).map { it.status })
             .containsExactly(AttemptStatus.NOT_STARTED, AttemptStatus.SUCCESS)
         assertThat(claims.claimForPair(pairId)).isNotNull()
+    }
+
+    @Test
+    fun expiredPermissionOwnerCannotRenewUpdateCountsCompleteOrFail() {
+        val renewClaim = expiredClaim(createPair())
+        val countClaim = expiredClaim(createPair())
+        val completeClaim = expiredClaim(createPair())
+        val failClaim = expiredClaim(createPair())
+
+        assertThat(claims.renew(renewClaim)).isFalse()
+        assertThat(claims.updateCounts(countClaim, 7, 2)).isFalse()
+        assertThat(claims.complete(completeClaim, AttemptStatus.SUCCESS)).isFalse()
+        assertThat(claims.fail(failClaim, IllegalStateException("late failure"))).isFalse()
+
+        listOf(renewClaim, countClaim, completeClaim, failClaim).forEach { claim ->
+            val attempt = attempts.findById(claim.attemptId).orElseThrow()
+            assertThat(attempt.status).isEqualTo(AttemptStatus.IN_PROGRESS)
+            assertThat(attempt.claimToken).isEqualTo(claim.token)
+        }
+    }
+
+    @Test
+    fun enqueueAtExpiredLeaseIsAbsorbedByFreshOwnerWithoutLosingWork() {
+        val pairId = createPair()
+        val expired = expiredClaim(pairId)
+
+        worker.enqueue(pairId)
+
+        val queued = attempts.findById(expired.attemptId).orElseThrow()
+        assertThat(queued.followUpRequested).isTrue()
+        assertThat(claims.complete(expired, AttemptStatus.SUCCESS)).isFalse()
+
+        val reclaimed = requireNotNull(claims.claimForPair(pairId))
+        assertThat(reclaimed.attemptId).isEqualTo(expired.attemptId)
+        assertThat(reclaimed.token).isNotEqualTo(expired.token)
+        assertThat(attempts.findById(reclaimed.attemptId).orElseThrow().followUpRequested).isFalse()
+        assertThat(claims.complete(reclaimed, AttemptStatus.SUCCESS)).isTrue()
+        assertThat(attempts.findAllByCcPairIdOrderByIdDesc(pairId).map { it.status })
+            .containsExactly(AttemptStatus.SUCCESS)
+    }
+
+    @Test
+    fun permissionOwnerCannotCompleteAfterItsLeaseExpiresWhileWaitingForARowLock() {
+        val pairId = createPair()
+        worker.enqueue(pairId)
+        val claim = requireNotNull(claims.claimForPair(pairId))
+        jdbc.update(
+            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() + INTERVAL '1 second' WHERE id = ?",
+            claim.attemptId,
+        )
+        val blocker = dataSource.connection
+        blocker.autoCommit = false
+        blocker.prepareStatement("SELECT id FROM permission_sync_attempts WHERE id = ? FOR UPDATE").use { statement ->
+            statement.setLong(1, claim.attemptId)
+            statement.executeQuery().use { result -> assertThat(result.next()).isTrue() }
+        }
+        val callStarted = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val completion = executor.submit<Boolean> {
+                callStarted.countDown()
+                claims.complete(claim, AttemptStatus.SUCCESS)
+            }
+            assertThat(callStarted.await(10, TimeUnit.SECONDS)).isTrue()
+            Thread.sleep(1_200)
+            blocker.commit()
+
+            assertThat(completion.get(10, TimeUnit.SECONDS)).isEqualTo(false)
+            assertThat(attempts.findById(claim.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.IN_PROGRESS)
+        } finally {
+            runCatching { blocker.rollback() }
+            blocker.close()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun permissionOwnerCannotRenewAfterItsLeaseExpiresWhileWaitingForARowLock() {
+        val pairId = createPair()
+        worker.enqueue(pairId)
+        val claim = requireNotNull(claims.claimForPair(pairId))
+        jdbc.update(
+            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() + INTERVAL '1 second' WHERE id = ?",
+            claim.attemptId,
+        )
+        val blocker = dataSource.connection
+        blocker.autoCommit = false
+        blocker.prepareStatement("SELECT id FROM permission_sync_attempts WHERE id = ? FOR UPDATE").use { statement ->
+            statement.setLong(1, claim.attemptId)
+            statement.executeQuery().use { result -> assertThat(result.next()).isTrue() }
+        }
+        val callStarted = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val renewal = executor.submit<Boolean> {
+                callStarted.countDown()
+                claims.renew(claim)
+            }
+            assertThat(callStarted.await(10, TimeUnit.SECONDS)).isTrue()
+            Thread.sleep(1_200)
+            blocker.commit()
+
+            assertThat(renewal.get(10, TimeUnit.SECONDS)).isEqualTo(false)
+            assertThat(attempts.findById(claim.attemptId).orElseThrow().leaseExpiresAt).isBefore(Instant.now())
+        } finally {
+            runCatching { blocker.rollback() }
+            blocker.close()
+            executor.shutdownNow()
+        }
     }
 
     @Test
@@ -619,6 +730,16 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
 
     private fun checkpoint(hasMore: Boolean = false): ConnectorCheckpoint =
         ConnectorCheckpoint(mapper.createObjectNode().put("hasMore", hasMore), hasMore)
+
+    private fun expiredClaim(pairId: Long): PermissionSyncClaim {
+        worker.enqueue(pairId)
+        val claim = requireNotNull(claims.claimForPair(pairId))
+        jdbc.update(
+            "UPDATE permission_sync_attempts SET lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE id = ?",
+            claim.attemptId,
+        )
+        return claim
+    }
 
     private fun <T> match(value: T): T {
         org.mockito.ArgumentMatchers.eq(value)

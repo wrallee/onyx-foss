@@ -312,7 +312,7 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
         value = """
             SELECT * FROM permission_sync_attempts
             WHERE status = 'NOT_STARTED'
-               OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at < :now))
+               OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at <= :now))
             ORDER BY created_at, id
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -327,7 +327,7 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
             WHERE cc_pair_id = :ccPairId
               AND (
                   status = 'NOT_STARTED'
-                  OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at < :now))
+                  OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at <= :now))
               )
             ORDER BY created_at, id
             FOR UPDATE SKIP LOCKED
@@ -360,55 +360,12 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
             VALUES (:ccPairId, 'NOT_STARTED')
             ON CONFLICT (cc_pair_id) WHERE status IN ('NOT_STARTED', 'IN_PROGRESS') DO UPDATE
             SET follow_up_requested = permission_sync_attempts.follow_up_requested
-                    OR (
-                        permission_sync_attempts.status = 'IN_PROGRESS'
-                        AND COALESCE(permission_sync_attempts.lease_expires_at > CURRENT_TIMESTAMP, FALSE)
-                    ),
+                    OR permission_sync_attempts.status = 'IN_PROGRESS',
                 updated_at = CURRENT_TIMESTAMP
         """,
         nativeQuery = true,
     )
     fun createOrCoalesce(@Param("ccPairId") ccPairId: Long): Int
-
-    @Transactional
-    @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query(
-        value = """
-            UPDATE permission_sync_attempts
-            SET lease_expires_at = :leaseExpiresAt,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = :id
-              AND claim_token = :token
-              AND status = 'IN_PROGRESS'
-        """,
-        nativeQuery = true,
-    )
-    fun renewOwned(
-        @Param("id") id: Long,
-        @Param("token") token: UUID,
-        @Param("leaseExpiresAt") leaseExpiresAt: Instant,
-    ): Int
-
-    @Transactional
-    @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query(
-        value = """
-            UPDATE permission_sync_attempts
-            SET total_docs_synced = :total,
-                docs_with_permission_errors = :errors,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = :id
-              AND claim_token = :token
-              AND status = 'IN_PROGRESS'
-        """,
-        nativeQuery = true,
-    )
-    fun updateCountsOwned(
-        @Param("id") id: Long,
-        @Param("token") token: UUID,
-        @Param("total") total: Int,
-        @Param("errors") errors: Int,
-    ): Int
 }
 
 data class PermissionSyncStageRow(
