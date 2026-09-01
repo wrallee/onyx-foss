@@ -43,6 +43,8 @@ onyx:
   opensearch:
     base-url: ${OPENSEARCH_URL:http://opensearch:9200}
     index: ${OPENSEARCH_INDEX:onyx-kotlin-chunks}
+    username: ${OPENSEARCH_ADMIN_USERNAME:}
+    password: ${OPENSEARCH_ADMIN_PASSWORD:}
     verify-certs: false
   worker:
     enabled: ${ONYX_WORKER_ENABLED:false}

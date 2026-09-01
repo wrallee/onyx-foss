@@ -519,13 +519,20 @@ class OpenSearchIndexer(
     private val mapper: ObjectMapper,
     private val externalWrites: PairExternalWriteFence,
 ) {
+    private val configuredClientBuilder = clientBuilder.clone().also { builder ->
+        if (properties.opensearch.username.isNotBlank() && properties.opensearch.password.isNotBlank()) {
+            builder.defaultHeaders { headers ->
+                headers.setBasicAuth(properties.opensearch.username, properties.opensearch.password)
+            }
+        }
+    }
     private val client = if (properties.opensearch.verifyCerts) {
-        clientBuilder.build()
+        configuredClientBuilder.build()
     } else {
         val sslContext = SslContextBuilder.forClient()
             .trustManager(InsecureTrustManagerFactory.INSTANCE)
             .build()
-        clientBuilder.clone()
+        configuredClientBuilder
             .clientConnector(ReactorClientHttpConnector(HttpClient.create().secure { it.sslContext(sslContext) }))
             .build()
     }
