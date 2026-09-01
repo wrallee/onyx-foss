@@ -27,6 +27,9 @@ interface ConnectorCredentialPairRepository : JpaRepository<ConnectorCredentialP
     fun findAllByCredentialId(credentialId: Long): List<ConnectorCredentialPairEntity>
     fun findByConnectorIdAndCredentialId(connectorId: Long, credentialId: Long): ConnectorCredentialPairEntity?
 
+    @Query(value = "SELECT connector_id FROM connector_credential_pairs WHERE id = :id", nativeQuery = true)
+    fun findConnectorIdById(@Param("id") id: Long): Long?
+
     @Query(value = "SELECT * FROM connector_credential_pairs WHERE id = :id FOR UPDATE", nativeQuery = true)
     fun lockById(@Param("id") id: Long): ConnectorCredentialPairEntity?
 

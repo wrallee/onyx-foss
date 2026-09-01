@@ -537,9 +537,8 @@ class AdminService(
     }
 
     private fun lockPairForMutation(pairId: Long): PairMutation {
-        val connectorId = pairs.findById(pairId).orElseThrow {
-            ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
-        }.connectorId
+        val connectorId = pairs.findConnectorIdById(pairId)
+            ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
         val connector = lockConnectorForMutation(connectorId)
         val pair = pairs.lockById(pairId) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
         requireNotDeleting(pair)
