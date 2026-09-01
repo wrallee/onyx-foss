@@ -3,6 +3,7 @@ package com.onyx.foss.kotlin.ingestion
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
+import com.onyx.foss.kotlin.config.buildModelServerClient
 import com.onyx.foss.kotlin.domain.AttemptStatus
 import com.onyx.foss.kotlin.domain.ConnectorCredentialPairRepository
 import com.onyx.foss.kotlin.domain.ConnectorSource
@@ -216,6 +217,7 @@ private data class IngestionOwnership(
 
 @Service
 class IngestionProcessor(
+    private val properties: OnyxProperties,
     private val admin: AdminService,
     private val pairs: ConnectorCredentialPairRepository,
     private val attempts: IngestionAttemptRepository,
@@ -311,7 +313,7 @@ class IngestionProcessor(
                         return@forEach
                     }
                     renew(claim)
-                    val vectors = embedder.embed(chunks)
+                    val vectors = withLeaseHeartbeat(claim) { embedder.embed(chunks) }
                     check(vectors.size == chunks.size) {
                         "Model server returned ${vectors.size} embeddings for ${chunks.size} chunks"
                     }
@@ -427,6 +429,34 @@ class IngestionProcessor(
         if (!claims.renew(claim)) throw StaleIngestionClaimException()
     }
 
+    private fun <T> withLeaseHeartbeat(claim: IngestionClaim, action: () -> T): T {
+        require(properties.worker.heartbeatIntervalMs > 0) { "Worker heartbeat interval must be positive" }
+        val stopped = AtomicBoolean(false)
+        val stale = AtomicBoolean(false)
+        val heartbeat = Thread.ofVirtual().name("ingestion-heartbeat-${claim.jobId}").start {
+            try {
+                while (!stopped.get()) {
+                    Thread.sleep(properties.worker.heartbeatIntervalMs)
+                    if (!stopped.get() && !runCatching { claims.renew(claim) }.getOrDefault(false)) {
+                        stale.set(true)
+                        return@start
+                    }
+                }
+            } catch (_: InterruptedException) {
+                // The model request completed.
+            }
+        }
+        val result = try {
+            action()
+        } finally {
+            stopped.set(true)
+            heartbeat.interrupt()
+            heartbeat.join(5_000)
+        }
+        if (stale.get()) throw StaleIngestionClaimException()
+        return result
+    }
+
     private fun hash(value: String): String =
         MessageDigest.getInstance("SHA-256").digest(value.toByteArray(StandardCharsets.UTF_8))
             .joinToString("") { "%02x".format(it) }
@@ -483,20 +513,21 @@ private fun ConnectorFailure.toEntity(attemptId: Long): IngestionErrorEntity = w
 @Service
 class ModelServerClient(
     private val properties: OnyxProperties,
-    private val clientBuilder: WebClient.Builder,
+    clientBuilder: WebClient.Builder,
 ) {
     private companion object {
         const val MAX_RESPONSE_BYTES = 16 * 1024 * 1024
     }
 
+    private val client = clientBuilder.clone().codecs { codecs ->
+        codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
+    }.buildModelServerClient(properties.modelServer)
+
     fun embed(texts: List<String>): List<List<Double>> {
         require(properties.modelServer.modelName.isNotBlank()) {
             "ONYX_EMBEDDING_MODEL_NAME must be configured before file ingestion"
         }
-        val response = clientBuilder.clone().codecs { codecs ->
-            codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
-        }.build()
-            .post()
+        val response = client.post()
             .uri(properties.modelServer.baseUrl.trimEnd('/') + "/encoder/bi-encoder-embed")
             .contentType(MediaType.APPLICATION_JSON)
             .bodyValue(
@@ -510,7 +541,7 @@ class ModelServerClient(
             )
             .retrieve()
             .bodyToMono(JsonNode::class.java)
-            .block(MODEL_SERVER_TIMEOUT) ?: error("Model server returned no embedding response")
+            .block() ?: error("Model server returned no embedding response")
         return response.path("embeddings").map { vector -> vector.map { it.asDouble() } }
     }
 }
@@ -978,5 +1009,4 @@ private class OpenSearchWriteBlockedException(message: String) : RuntimeExceptio
 internal val DOCUMENT_SET_UPDATE_TIMEOUT: Duration = Duration.ofSeconds(30)
 internal val OPENSEARCH_TIMEOUT: Duration = Duration.ofSeconds(30)
 internal val OPENSEARCH_MIGRATION_TIMEOUT: Duration = Duration.ofMinutes(10)
-internal val MODEL_SERVER_TIMEOUT: Duration = Duration.ofSeconds(30)
 internal val INGESTION_LEASE: Duration = Duration.ofMinutes(1)

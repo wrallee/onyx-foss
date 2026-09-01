@@ -6,16 +6,18 @@ import com.onyx.foss.kotlin.api.RerankCandidate
 import com.onyx.foss.kotlin.api.RerankCandidatesRequest
 import com.onyx.foss.kotlin.api.RerankCandidatesResponse
 import com.onyx.foss.kotlin.config.OnyxProperties
+import com.onyx.foss.kotlin.config.buildModelServerClient
 import org.springframework.http.MediaType
 import org.springframework.stereotype.Service
 import org.springframework.web.reactive.function.client.WebClient
-import java.time.Duration
 
 @Service
 class RerankingService(
     private val properties: OnyxProperties,
-    private val clientBuilder: WebClient.Builder,
+    clientBuilder: WebClient.Builder,
 ) {
+    private val client = clientBuilder.buildModelServerClient(properties.modelServer)
+
     fun rerank(request: RerankCandidatesRequest): RerankCandidatesResponse {
         val config = properties.modelServer
         require(request.candidates.size <= config.rerankerMaxDocuments) {
@@ -26,7 +28,7 @@ class RerankingService(
         }
 
         return try {
-            val response = clientBuilder.build().post()
+            val response = client.post()
                 .uri(config.baseUrl.trimEnd('/') + "/encoder/cross-encoder-scores")
                 .contentType(MediaType.APPLICATION_JSON)
                 .bodyValue(
@@ -38,7 +40,7 @@ class RerankingService(
                 )
                 .retrieve()
                 .bodyToMono(RerankerModelResponse::class.java)
-                .block(Duration.ofMillis(config.rerankerTimeoutMs))
+                .block()
                 ?: error("Model server returned no reranker response")
             require(response.scores.size == request.candidates.size) {
                 "Reranker score count does not match candidate count"

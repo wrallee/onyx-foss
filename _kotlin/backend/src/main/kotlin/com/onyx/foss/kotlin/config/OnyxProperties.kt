@@ -20,7 +20,8 @@ data class OnyxProperties(
         val rerankerEnabled: Boolean = true,
         val rerankerModelName: String = "Alibaba-NLP/gte-multilingual-reranker-base",
         val rerankerMaxDocuments: Int = 100,
-        val rerankerTimeoutMs: Long = 30_000,
+        val connectTimeoutMs: Long = 30_000,
+        val readTimeoutMs: Long = 600_000,
         val rerankerFallbackOnError: Boolean = true,
     )
     data class OpenSearch(
@@ -30,5 +31,9 @@ data class OnyxProperties(
         val password: String = "",
         val verifyCerts: Boolean = false,
     )
-    data class Worker(val enabled: Boolean = false, val pollDelayMs: Long = 1000)
+    data class Worker(
+        val enabled: Boolean = false,
+        val pollDelayMs: Long = 1000,
+        val heartbeatIntervalMs: Long = 15_000,
+    )
 }

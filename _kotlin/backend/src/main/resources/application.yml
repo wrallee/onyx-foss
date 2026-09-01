@@ -38,7 +38,8 @@ onyx:
     reranker-enabled: ${ONYX_RERANKER_ENABLED:true}
     reranker-model-name: ${ONYX_RERANKER_MODEL_NAME:Alibaba-NLP/gte-multilingual-reranker-base}
     reranker-max-documents: ${ONYX_RERANKER_MAX_DOCUMENTS:100}
-    reranker-timeout-ms: ${ONYX_RERANKER_TIMEOUT_MS:30000}
+    connect-timeout-ms: ${MODEL_SERVER_CONNECT_TIMEOUT_MS:30000}
+    read-timeout-ms: ${MODEL_SERVER_READ_TIMEOUT_MS:600000}
     reranker-fallback-on-error: ${ONYX_RERANKER_FALLBACK_ON_ERROR:true}
   opensearch:
     base-url: ${OPENSEARCH_URL:http://opensearch:9200}
@@ -49,3 +50,4 @@ onyx:
   worker:
     enabled: ${ONYX_WORKER_ENABLED:false}
     poll-delay-ms: ${ONYX_WORKER_POLL_DELAY_MS:1000}
+    heartbeat-interval-ms: ${ONYX_WORKER_HEARTBEAT_INTERVAL_MS:15000}
