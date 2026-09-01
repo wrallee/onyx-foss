@@ -527,6 +527,33 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun unrelatedPendingDocumentSetDoesNotMakeACompletedSetStale() {
+        val firstConnector = createConnector("file")
+        val firstCredential = createCredential("file", "first-secret")
+        val firstPair = associate(firstConnector, firstCredential)
+        val firstSet = postJson(
+            "/manage/admin/document-set",
+            documentSet("Engineering", listOf(firstPair)),
+        ).body.asLong()
+        val secondConnector = createConnector("file")
+        val secondCredential = createCredential("file", "second-secret")
+        val secondPair = associate(secondConnector, secondCredential)
+        val secondSet = postJson(
+            "/manage/admin/document-set",
+            documentSet("Finance", listOf(secondPair)),
+        ).body.asLong()
+        val firstEvent = documentSetSyncOutbox.findAll().minBy { requireNotNull(it.id) }
+        firstEvent.status = DocumentSetSyncStatus.DONE
+        documentSetSyncOutbox.saveAndFlush(firstEvent)
+
+        val completed = request(get("/manage/admin/document-set/$firstSet")).body
+        val pending = request(get("/manage/admin/document-set/$secondSet")).body
+
+        assertThat(completed.path("is_up_to_date").asBoolean()).isTrue()
+        assertThat(pending.path("is_up_to_date").asBoolean()).isFalse()
+    }
+
+    @Test
     fun fileMetadataKeepsNamesAlignedWithLocations() {
         val connectorId = createConnector("file")
         val credentialId = createCredential("file", "file-secret")

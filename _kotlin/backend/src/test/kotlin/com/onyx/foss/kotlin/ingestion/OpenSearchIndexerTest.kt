@@ -189,6 +189,55 @@ class OpenSearchIndexerTest {
     }
 
     @Test
+    fun uncertainAliasSwapPreservesTheReindexedCopyForRecovery() {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.enqueue(
+                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
+                    .setBody("""{"documents":{"mappings":{"properties":{"source_document_id":{"type":"text"}}}}}"""),
+            )
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.enqueue(
+                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
+                    .setBody("""{"count":1}"""),
+            )
+            server.enqueue(
+                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
+                    .setBody(
+                        """{"timed_out":false,"total":1,"created":1,"updated":0,"version_conflicts":0,"failures":[]}""",
+                    ),
+            )
+            server.enqueue(
+                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
+                    .setBody("""{"count":1}"""),
+            )
+            server.enqueue(
+                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
+                    .setBody("""{"acknowledged":false}"""),
+            )
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.start()
+            val indexer = OpenSearchIndexer(
+                OnyxProperties(
+                    opensearch = OnyxProperties.OpenSearch(
+                        baseUrl = server.url("/").toString().trimEnd('/'),
+                        index = "documents",
+                    ),
+                ),
+                WebClient.builder(),
+                mapper,
+            )
+
+            org.junit.jupiter.api.assertThrows<IllegalStateException> {
+                indexer.deleteDocuments(7, setOf("one"))
+            }
+
+            repeat(7) { requireNotNull(server.takeRequest(1, java.util.concurrent.TimeUnit.SECONDS)) }
+            assertThat(server.takeRequest(200, java.util.concurrent.TimeUnit.MILLISECONDS)).isNull()
+        }
+    }
+
+    @Test
     fun rejectsTimedOutFailedAndIncompleteAclUpdates() {
         listOf(
             """{"timed_out":true,"total":1,"updated":1,"noops":0,"version_conflicts":0,"failures":[]}""",

@@ -85,7 +85,21 @@ interface DocumentSetRepository : JpaRepository<DocumentSetEntity, Long> {
 }
 
 interface DocumentSetSyncOutboxRepository : JpaRepository<DocumentSetSyncOutboxEntity, Long> {
-    fun existsByStatusIn(statuses: Collection<DocumentSetSyncStatus>): Boolean
+    @Query(
+        value = """
+            SELECT EXISTS (
+                SELECT 1
+                FROM document_set_sync_outbox
+                WHERE status IN ('PENDING', 'IN_PROGRESS')
+                  AND (
+                      document_set_ids IS NULL
+                      OR document_set_ids @> jsonb_build_array(CAST(:documentSetId AS BIGINT))
+                  )
+            )
+        """,
+        nativeQuery = true,
+    )
+    fun existsActiveForDocumentSet(@Param("documentSetId") documentSetId: Long): Boolean
 
     @Query(
         value = """
@@ -326,17 +340,35 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
         @Param("now") now: Instant,
     ): PermissionSyncAttemptEntity?
 
+    @Query(
+        value = """
+            SELECT * FROM permission_sync_attempts
+            WHERE id = :id
+              AND claim_token = :token
+              AND status = 'IN_PROGRESS'
+            FOR UPDATE
+        """,
+        nativeQuery = true,
+    )
+    fun lockOwned(@Param("id") id: Long, @Param("token") token: UUID): PermissionSyncAttemptEntity?
+
     @Transactional
     @Modifying
     @Query(
         value = """
             INSERT INTO permission_sync_attempts (cc_pair_id, status)
             VALUES (:ccPairId, 'NOT_STARTED')
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (cc_pair_id) WHERE status IN ('NOT_STARTED', 'IN_PROGRESS') DO UPDATE
+            SET follow_up_requested = permission_sync_attempts.follow_up_requested
+                    OR (
+                        permission_sync_attempts.status = 'IN_PROGRESS'
+                        AND COALESCE(permission_sync_attempts.lease_expires_at > CURRENT_TIMESTAMP, FALSE)
+                    ),
+                updated_at = CURRENT_TIMESTAMP
         """,
         nativeQuery = true,
     )
-    fun createIfNoActive(@Param("ccPairId") ccPairId: Long): Int
+    fun createOrCoalesce(@Param("ccPairId") ccPairId: Long): Int
 
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
@@ -376,53 +408,6 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
         @Param("token") token: UUID,
         @Param("total") total: Int,
         @Param("errors") errors: Int,
-    ): Int
-
-    @Transactional
-    @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query(
-        value = """
-            UPDATE permission_sync_attempts
-            SET status = :status,
-                claim_token = NULL,
-                lease_expires_at = NULL,
-                time_finished = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = :id
-              AND claim_token = :token
-              AND status = 'IN_PROGRESS'
-        """,
-        nativeQuery = true,
-    )
-    fun completeOwned(
-        @Param("id") id: Long,
-        @Param("token") token: UUID,
-        @Param("status") status: String,
-    ): Int
-
-    @Transactional
-    @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query(
-        value = """
-            UPDATE permission_sync_attempts
-            SET status = 'FAILED',
-                error_msg = :message,
-                full_exception_trace = :trace,
-                claim_token = NULL,
-                lease_expires_at = NULL,
-                time_finished = CURRENT_TIMESTAMP,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = :id
-              AND claim_token = :token
-              AND status = 'IN_PROGRESS'
-        """,
-        nativeQuery = true,
-    )
-    fun failOwned(
-        @Param("id") id: Long,
-        @Param("token") token: UUID,
-        @Param("message") message: String,
-        @Param("trace") trace: String,
     ): Int
 }
 

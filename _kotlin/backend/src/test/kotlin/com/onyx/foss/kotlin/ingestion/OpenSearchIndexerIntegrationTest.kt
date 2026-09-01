@@ -28,7 +28,10 @@ class OpenSearchIndexerIntegrationTest {
 
     @AfterEach
     fun deleteIndex() {
-        client.delete().uri("$baseUrl/$index").retrieve().toBodilessEntity().block(Duration.ofSeconds(30))
+        get("/_cat/indices/$index*?format=json").forEach { row ->
+            client.delete().uri("$baseUrl/${row.path("index").asText()}")
+                .retrieve().toBodilessEntity().block(Duration.ofSeconds(30))
+        }
     }
 
     @Test
@@ -86,6 +89,27 @@ class OpenSearchIndexerIntegrationTest {
         assertThat(exactDocuments(documentId).map { it.path("content").asText() }).containsExactly("new content")
     }
 
+    @Test
+    fun dynamicallyMappedTextIdsAreReindexedWithoutLosingExactIdentity() {
+        val urlId = "https://example.test/wiki/Engineering?id=ABC-123"
+        val fileId = "FILE_CONNECTOR__file-123"
+        putRawDocument("legacy-url", urlId, "url content")
+        putRawDocument("legacy-file", fileId, "file content")
+        assertThat(mappingProperties().path("source_document_id").path("type").asText()).isEqualTo("text")
+
+        val indexer = indexer()
+        indexer.updateAccess(7, mapOf(urlId to ExternalAccess(setOf("reader@example.com"), isPublic = false)))
+        indexer.updateDocumentSets(7, setOf(urlId, fileId), listOf("Engineering"))
+        indexer.deleteDocuments(7, setOf(fileId))
+
+        assertThat(mappingProperties().path("source_document_id").path("type").asText()).isEqualTo("keyword")
+        val urlDocument = exactDocuments(urlId).single()
+        assertThat(urlDocument.path("content").asText()).isEqualTo("url content")
+        assertThat(urlDocument.path("external_user_emails").map(JsonNode::asText)).containsExactly("reader@example.com")
+        assertThat(urlDocument.path("document_sets").map(JsonNode::asText)).containsExactly("Engineering")
+        assertThat(exactDocuments(fileId)).isEmpty()
+    }
+
     private fun indexer(): OpenSearchIndexer = OpenSearchIndexer(
         OnyxProperties(opensearch = OnyxProperties.OpenSearch(baseUrl = baseUrl, index = index)),
         WebClient.builder(),
@@ -101,6 +125,23 @@ class OpenSearchIndexerIntegrationTest {
         .block(Duration.ofSeconds(30))
         ?.path("hits")?.path("hits")?.map { it.path("_source") }
         .orEmpty()
+
+    private fun putRawDocument(documentId: String, sourceDocumentId: String, content: String) {
+        client.put().uri("$baseUrl/$index/_doc/$documentId?refresh=true")
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue(
+                mapOf(
+                    "cc_pair_id" to 7,
+                    "source_document_id" to sourceDocumentId,
+                    "chunk_id" to 0,
+                    "content" to content,
+                ),
+            )
+            .retrieve().toBodilessEntity().block(Duration.ofSeconds(30))
+    }
+
+    private fun mappingProperties(): JsonNode = get("/$index/_mapping").fields().next().value
+        .path("mappings").path("properties")
 
     private fun get(path: String): JsonNode = requireNotNull(
         client.get().uri(baseUrl + path).retrieve().bodyToMono(JsonNode::class.java).block(Duration.ofSeconds(30)),

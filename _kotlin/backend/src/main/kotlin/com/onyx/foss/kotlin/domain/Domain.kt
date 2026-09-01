@@ -160,6 +160,9 @@ class DocumentSetSyncOutboxEntity(
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "cc_pair_ids", nullable = false, columnDefinition = "jsonb")
     var ccPairIds: JsonNode? = null,
+    @JdbcTypeCode(SqlTypes.JSON)
+    @Column(name = "document_set_ids", columnDefinition = "jsonb")
+    var documentSetIds: JsonNode? = null,
     @Enumerated(EnumType.STRING)
     var status: DocumentSetSyncStatus = DocumentSetSyncStatus.PENDING,
     @Column(name = "attempt_count", nullable = false)
@@ -353,6 +356,8 @@ class PermissionSyncAttemptEntity(
     var claimToken: UUID? = null,
     @Column(name = "lease_expires_at")
     var leaseExpiresAt: Instant? = null,
+    @Column(name = "follow_up_requested", nullable = false)
+    var followUpRequested: Boolean = false,
     @CreationTimestamp @Column(name = "created_at", updatable = false)
     var createdAt: Instant? = null,
     @UpdateTimestamp @Column(name = "updated_at")

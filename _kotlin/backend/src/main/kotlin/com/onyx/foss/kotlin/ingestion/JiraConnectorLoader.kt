@@ -179,8 +179,12 @@ class JiraConnectorLoader(
                 }
             }
 
-            val issues = bulkFetch(context, pendingIds.removeAt(0))
-            val result = processIssues(context, issues, seenHierarchyNodeIds)
+            val bulkResult = bulkFetch(context, pendingIds.removeAt(0))
+            val processed = processIssues(context, bulkResult.issues, seenHierarchyNodeIds)
+            val result = processed.copy(
+                failures = processed.failures + bulkResult.failures,
+                enumerationComplete = processed.enumerationComplete && bulkResult.failures.isEmpty(),
+            )
             val checkpoint = JiraCheckpoint(
                 hasMore = pendingIds.isNotEmpty() || !idsDone,
                 allIssueIds = pendingIds.map { it.toList() },
@@ -192,19 +196,60 @@ class JiraConnectorLoader(
         }
     }
 
-    private fun bulkFetch(context: Context, issueIds: List<String>): List<JsonNode> = try {
-        http.post(
+    private fun bulkFetch(context: Context, issueIds: List<String>): BulkFetchResult = try {
+        val response = http.post(
             context.apiBase,
             "/rest/api/3/issue/bulkfetch",
             context.headers,
             mapOf("issueIdsOrKeys" to issueIds, "fields" to context.issueFields.split(',')),
-        ).path("issues").toList()
+        )
+        val issues = response.path("issues").toList()
+        val returnedIds = issues.flatMapTo(mutableSetOf()) { issue ->
+            listOf(issue.path("id").asText(), issue.path("key").asText()).filter(String::isNotBlank)
+        }
+        val issueErrors = response.path("issueErrors").toList()
+        val errorById = issueErrors.associateBy { error ->
+            listOf("issueId", "issueIdOrKey", "id", "key")
+                .firstNotNullOfOrNull { field -> error.path(field).asText().takeIf(String::isNotBlank) }
+                .orEmpty()
+        }
+        val missingIds = issueIds.filterNot(returnedIds::contains)
+        val failures = missingIds.map { issueId ->
+            ConnectorFailure(
+                target = FailureTarget.Entity("jira_issue:$issueId"),
+                message = issueErrorMessage(errorById[issueId], issueId),
+                errorType = "jira_bulk_fetch",
+            )
+        }.toMutableList()
+        issueErrors.filter { error ->
+            val id = listOf("issueId", "issueIdOrKey", "id", "key")
+                .firstNotNullOfOrNull { field -> error.path(field).asText().takeIf(String::isNotBlank) }
+            id == null || id !in missingIds
+        }.forEach { error ->
+            val issueId = listOf("issueId", "issueIdOrKey", "id", "key")
+                .firstNotNullOfOrNull { field -> error.path(field).asText().takeIf(String::isNotBlank) }
+            failures += ConnectorFailure(
+                target = FailureTarget.Entity(issueId?.let { "jira_issue:$it" } ?: "jira_issue:unknown"),
+                message = issueErrorMessage(error, issueId ?: "unknown"),
+                errorType = "jira_bulk_fetch",
+            )
+        }
+        BulkFetchResult(issues, failures)
     } catch (error: WebClientResponseException) {
         throw searchError(error, context.jql)
     } catch (error: RuntimeException) {
         if (issueIds.size <= 1 || !error.isJsonDecodeFailure()) throw error
         val middle = issueIds.size / 2
-        bulkFetch(context, issueIds.subList(0, middle)) + bulkFetch(context, issueIds.subList(middle, issueIds.size))
+        val left = bulkFetch(context, issueIds.subList(0, middle))
+        val right = bulkFetch(context, issueIds.subList(middle, issueIds.size))
+        BulkFetchResult(left.issues + right.issues, left.failures + right.failures)
+    }
+
+    private fun issueErrorMessage(error: JsonNode?, issueId: String): String {
+        val details = error?.path("errorMessages")?.map(JsonNode::asText).orEmpty() +
+            listOfNotNull(error?.path("errorMessage")?.asText()?.takeIf(String::isNotBlank))
+        return details.filter(String::isNotBlank).joinToString("; ")
+            .ifBlank { "Jira bulk fetch did not return requested issue $issueId" }
     }
 
     private fun processIssues(
@@ -563,6 +608,11 @@ class JiraConnectorLoader(
         val documents: List<SourceDocument> = emptyList(),
         val failures: List<ConnectorFailure> = emptyList(),
         val enumerationComplete: Boolean = true,
+    )
+
+    private data class BulkFetchResult(
+        val issues: List<JsonNode>,
+        val failures: List<ConnectorFailure>,
     )
 
     private fun ProcessResult.toBatch(checkpoint: JiraCheckpoint): ConnectorBatch = ConnectorBatch(

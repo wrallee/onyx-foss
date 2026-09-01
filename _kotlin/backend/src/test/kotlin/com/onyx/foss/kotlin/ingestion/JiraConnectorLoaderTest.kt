@@ -328,6 +328,33 @@ class JiraConnectorLoaderTest {
     }
 
     @Test
+    fun cloudBulkFetchMissingIssueMakesEnumerationIncomplete() = MockWebServer().use { server ->
+        server.json("""{"issues":[{"id":"10001"},{"id":"10002"}]}""")
+        server.json(bulkPage(issue("ENG-1", id = "10001")))
+
+        val batch = loader().load(config(server, "\"project_key\":\"ENG\""), cloudCredentials(), null).single()
+
+        assertEquals(listOf("ENG-1"), batch.documents.map { it.metadata["key"] })
+        assertFalse(batch.enumerationComplete)
+        assertEquals("jira_issue:10002", (batch.failures.single().target as FailureTarget.Entity).id)
+    }
+
+    @Test
+    fun cloudBulkFetchIssueErrorsMakeEnumerationIncomplete() = MockWebServer().use { server ->
+        server.json("""{"issues":[{"id":"10001"}]}""")
+        server.json(
+            """{"issues":[],"issueErrors":[{"issueId":"10001","errorMessages":["Issue is not visible"]}]}""",
+        )
+
+        val batch = loader().load(config(server, "\"project_key\":\"ENG\""), cloudCredentials(), null).single()
+
+        assertTrue(batch.documents.isEmpty())
+        assertFalse(batch.enumerationComplete)
+        assertEquals("jira_issue:10001", (batch.failures.single().target as FailureTarget.Entity).id)
+        assertTrue(batch.failures.single().message.contains("Issue is not visible"))
+    }
+
+    @Test
     fun largeIssueIsSkippedWithoutDroppingSmallIssues() = MockWebServer().use { server ->
         server.json(
             serverPage(

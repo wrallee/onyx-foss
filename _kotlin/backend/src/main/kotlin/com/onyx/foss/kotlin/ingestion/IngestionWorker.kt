@@ -225,6 +225,7 @@ class IngestionProcessor(
     private val permissionSync: PermissionSyncWorker,
     private val mapper: ObjectMapper,
     private val claims: JobClaimService,
+    private val externalWrites: PairExternalWriteFence,
 ) {
     fun process(jobId: Long) {
         claims.claimJob(jobId)?.let(::process)
@@ -304,23 +305,29 @@ class IngestionProcessor(
                     }
                     renew(claim)
                     val vectors = embedder.embed(chunks)
+                    check(vectors.size == chunks.size) {
+                        "Model server returned ${vectors.size} embeddings for ${chunks.size} chunks"
+                    }
                     renew(claim)
                     val documentSetNames = documentSets.findNamesByCcPairId(requireNotNull(pair.id))
                     chunks.zip(vectors).forEachIndexed { index, item ->
-                        indexer.upsert(
-                            pairId = requireNotNull(pair.id),
-                            sourceDocumentId = document.id,
-                            chunkId = index,
-                            title = document.title,
-                            content = item.first,
-                            link = document.link,
-                            metadata = document.metadata,
-                            embedding = item.second,
-                            documentSets = documentSetNames,
-                            updatedAt = document.updatedAt,
-                            primaryOwners = document.primaryOwners,
-                            secondaryOwners = document.secondaryOwners,
-                        )
+                        externalWrites.withPair(requireNotNull(pair.id)) {
+                            renew(claim)
+                            indexer.upsert(
+                                pairId = requireNotNull(pair.id),
+                                sourceDocumentId = document.id,
+                                chunkId = index,
+                                title = document.title,
+                                content = item.first,
+                                link = document.link,
+                                metadata = document.metadata,
+                                embedding = item.second,
+                                documentSets = documentSetNames,
+                                updatedAt = document.updatedAt,
+                                primaryOwners = document.primaryOwners,
+                                secondaryOwners = document.secondaryOwners,
+                            )
+                        }
                         renew(claim)
                     }
                     renew(claim)
@@ -717,24 +724,71 @@ class OpenSearchIndexer(
                 putJson(indexUrl, INDEX_DEFINITION, "index creation")
             } else {
                 val mapping = getJson("$indexUrl/_mapping", "mapping check")
-                val propertiesNode = mapping.path(properties.opensearch.index).path("mappings").path("properties")
+                check(mapping.size() == 1) { "OpenSearch index must resolve to one concrete index" }
+                val propertiesNode = mapping.fields().next().value.path("mappings").path("properties")
                 val missingFields = linkedMapOf<String, Any>()
+                var incompatibleMapping = false
                 EXACT_FIELDS.forEach { (field, definition) ->
                     val expectedType = (definition as Map<*, *>)["type"].toString()
                     val actualType = propertiesNode.path(field).path("type").asText()
                     if (actualType.isBlank()) {
                         missingFields[field] = definition
-                    } else {
-                        check(actualType == expectedType) {
-                            "OpenSearch field $field must use $expectedType mapping, but found $actualType"
-                        }
+                    } else if (actualType != expectedType) {
+                        incompatibleMapping = true
                     }
                 }
-                if (missingFields.isNotEmpty()) {
+                if (incompatibleMapping) {
+                    reindexWithExactMappings(indexUrl)
+                } else if (missingFields.isNotEmpty()) {
                     putJson("$indexUrl/_mapping", mapOf("properties" to missingFields), "exact mapping creation")
                 }
             }
             indexReady.set(true)
+        }
+    }
+
+    private fun reindexWithExactMappings(indexUrl: String) {
+        val sourceIndex = properties.opensearch.index
+        val replacementIndex = "$sourceIndex-exact-${UUID.randomUUID()}"
+        val baseUrl = properties.opensearch.baseUrl.trimEnd('/')
+        val replacementUrl = "$baseUrl/$replacementIndex"
+        putJson(replacementUrl, INDEX_DEFINITION, "replacement index creation")
+        var swapRequested = false
+        try {
+            val sourceCount = getJson("$indexUrl/_count", "source count").path("count").asLong(-1)
+            val result = postJson(
+                "$baseUrl/_reindex?refresh=true&wait_for_completion=true",
+                mapOf(
+                    "source" to mapOf("index" to sourceIndex),
+                    "dest" to mapOf("index" to replacementIndex),
+                ),
+                "exact mapping reindex",
+            )
+            check(
+                sourceCount >= 0 && !result.path("timed_out").asBoolean(true) &&
+                    result.path("failures").isArray && result.path("failures").isEmpty &&
+                    result.path("version_conflicts").asLong(-1) == 0L &&
+                    result.path("total").asLong(-1) == sourceCount &&
+                    result.path("created").asLong(-1) + result.path("updated").asLong(-1) == sourceCount &&
+                    getJson("$replacementUrl/_count", "replacement count").path("count").asLong(-1) == sourceCount,
+            ) { "OpenSearch did not fully reindex the existing index" }
+            swapRequested = true
+            val aliasResult = postJson(
+                "$baseUrl/_aliases",
+                mapOf(
+                    "actions" to listOf(
+                        mapOf("remove_index" to mapOf("index" to sourceIndex)),
+                        mapOf("add" to mapOf("index" to replacementIndex, "alias" to sourceIndex, "is_write_index" to true)),
+                    ),
+                ),
+                "exact mapping alias swap",
+            )
+            check(aliasResult.path("acknowledged").asBoolean(false)) {
+                "OpenSearch did not confirm the exact mapping alias swap"
+            }
+        } catch (error: Exception) {
+            if (!swapRequested) runCatching { deleteIndex(replacementUrl) }
+            throw error
         }
     }
 
@@ -760,6 +814,28 @@ class OpenSearchIndexer(
         check(confirmed == true) { "OpenSearch did not confirm $operation" }
     }
 
+    private fun postJson(uri: String, body: Map<String, Any>, operation: String): JsonNode = requireNotNull(
+        clientBuilder.build().post().uri(uri)
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue(mapper.valueToTree<JsonNode>(body))
+            .exchangeToMono { response ->
+                if (response.statusCode().is2xxSuccessful) response.bodyToMono(JsonNode::class.java)
+                else response.bodyToMono(String::class.java).flatMap {
+                    Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
+                }
+            }.block(OPENSEARCH_MIGRATION_TIMEOUT),
+    )
+
+    private fun deleteIndex(uri: String) {
+        val confirmed = clientBuilder.build().delete().uri(uri).exchangeToMono { response ->
+            if (response.statusCode().is2xxSuccessful) response.releaseBody().thenReturn(true)
+            else response.bodyToMono(String::class.java).flatMap {
+                Mono.error(IllegalStateException("OpenSearch replacement cleanup failed: $it"))
+            }
+        }.block(OPENSEARCH_TIMEOUT)
+        check(confirmed == true) { "OpenSearch did not confirm replacement cleanup" }
+    }
+
     private companion object {
         const val EXACT_DOCUMENT_ID_FIELD = "source_document_id"
         val EXACT_FIELDS: Map<String, Any> = mapOf(
@@ -780,5 +856,6 @@ class OpenSearchIndexer(
 
 internal val DOCUMENT_SET_UPDATE_TIMEOUT: Duration = Duration.ofSeconds(30)
 internal val OPENSEARCH_TIMEOUT: Duration = Duration.ofSeconds(30)
+internal val OPENSEARCH_MIGRATION_TIMEOUT: Duration = Duration.ofMinutes(10)
 internal val MODEL_SERVER_TIMEOUT: Duration = Duration.ofSeconds(30)
 internal val INGESTION_LEASE: Duration = Duration.ofMinutes(1)

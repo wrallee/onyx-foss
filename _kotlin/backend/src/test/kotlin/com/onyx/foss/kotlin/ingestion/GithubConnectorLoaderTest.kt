@@ -333,7 +333,37 @@ class GithubConnectorLoaderTest {
         loader(now = { Instant.ofEpochSecond(1000) }, sleep = sleeps::add)
             .load(config(server), credentials(), null).toList()
 
-        assertEquals(listOf(3_600_000L), sleeps)
+        assertEquals(3_600_000L, sleeps.sum())
+        assertTrue(sleeps.all { it < PERMISSION_SYNC_LEASE.toMillis() })
+    }
+
+    @Test
+    fun permissionRateLimitWaitRenewsBeforeTheLeaseCanExpire() = MockWebServer().use { server ->
+        var pullsCalls = 0
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when {
+                request.requestUrl!!.encodedPath == "/repos/test-org/test-repo" -> json(repoJson())
+                request.requestUrl!!.encodedPath.endsWith("/pulls") && pullsCalls++ == 0 -> json("{}", 403)
+                    .setHeader("X-RateLimit-Remaining", "0")
+                    .setHeader("X-RateLimit-Reset", "1070")
+                request.requestUrl!!.encodedPath.endsWith("/pulls") -> json("[${pull(1)}]")
+                request.requestUrl!!.encodedPath.endsWith("/pulls/1") -> json(pull(1))
+                else -> json("[]")
+            }
+        }
+        val sleeps = mutableListOf<Long>()
+        var heartbeats = 0
+
+        loader(now = { Instant.ofEpochSecond(1000) }, sleep = sleeps::add)
+            .retrieveAllSlimDocuments(
+                config(server),
+                credentials(),
+                heartbeat = { heartbeats += 1 },
+            ).toList()
+
+        assertEquals(70_000L, sleeps.sum())
+        assertTrue(sleeps.all { it < PERMISSION_SYNC_LEASE.toMillis() })
+        assertTrue(heartbeats >= sleeps.size)
     }
 
     @Test

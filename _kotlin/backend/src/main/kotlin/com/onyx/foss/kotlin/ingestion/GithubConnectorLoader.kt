@@ -95,6 +95,7 @@ class GithubConnectorLoader(
         private const val MAX_FILE_SIZE_BYTES = 1_000_000
         private const val MAX_RATE_LIMIT_RETRIES = 5
         private const val MAX_RATE_LIMIT_WAIT_SECONDS = 60 * 60L
+        private const val RATE_LIMIT_HEARTBEAT_MILLIS = 15_000L
         private const val MAX_REPOSITORIES = 10_000
         private const val MAX_FILE_PATHS = 100_000
         private const val MAX_PERMISSION_ENTRIES = 5_000
@@ -122,6 +123,7 @@ class GithubConnectorLoader(
         checkpointNode: JsonNode?,
         start: Instant? = null,
         end: Instant? = null,
+        heartbeat: () -> Unit = {},
     ): Sequence<ConnectorBatch> = loadInternal(
         config,
         credentials,
@@ -130,6 +132,7 @@ class GithubConnectorLoader(
         end?.plus(1, ChronoUnit.DAYS),
         slim = false,
         includePermissions = config.boolean("include_permissions", false),
+        heartbeat = heartbeat,
     )
 
     fun retrieveAllSlimDocuments(
@@ -138,6 +141,7 @@ class GithubConnectorLoader(
         start: Instant? = null,
         end: Instant? = null,
         includePermissions: Boolean = false,
+        heartbeat: () -> Unit = {},
     ): Sequence<ConnectorBatch> = loadInternal(
         config,
         credentials,
@@ -146,10 +150,11 @@ class GithubConnectorLoader(
         end = end,
         slim = true,
         includePermissions = includePermissions,
+        heartbeat = heartbeat,
     )
 
-    fun validate(config: JsonNode?, credentials: JsonNode) {
-        val context = context(config, credentials, includePermissions = false)
+    fun validate(config: JsonNode?, credentials: JsonNode, heartbeat: () -> Unit = {}) {
+        val context = context(config, credentials, includePermissions = false, heartbeat)
         if (!context.includePullRequests && !context.includeIssues && !context.includeFiles) {
             throw GithubConnectorValidationException(
                 "Invalid GitHub settings: select pull requests, issues, or files.",
@@ -160,8 +165,10 @@ class GithubConnectorLoader(
             var lastError: WebClientResponseException? = null
             names.forEach { name ->
                 try {
+                    context.heartbeat()
                     http.get(context.base, repositoryPath(context.owner, name), context.headers)
                     if (context.configuredBranch != null) {
+                        context.heartbeat()
                         http.get(
                             context.base,
                             "${repositoryPath(context.owner, name)}/branches/${segment(context.configuredBranch)}",
@@ -177,6 +184,7 @@ class GithubConnectorLoader(
         }
 
         val repositories = try {
+            context.heartbeat()
             http.get(
                 context.base,
                 "/orgs/${segment(context.owner)}/repos?per_page=1&page=1",
@@ -184,6 +192,7 @@ class GithubConnectorLoader(
             )
         } catch (error: WebClientResponseException.NotFound) {
             try {
+                context.heartbeat()
                 http.get(
                     context.base,
                     "/users/${segment(context.owner)}/repos?per_page=1&page=1",
@@ -210,8 +219,9 @@ class GithubConnectorLoader(
         end: Instant?,
         slim: Boolean,
         includePermissions: Boolean,
+        heartbeat: () -> Unit,
     ): Sequence<ConnectorBatch> = sequence {
-        val context = context(config, credentials, includePermissions)
+        val context = context(config, credentials, includePermissions, heartbeat)
         val savedCheckpoint = parseCheckpoint(checkpointNode)
         validateRepositoryIndex(context, savedCheckpoint)
         var checkpoint = if (savedCheckpoint.hasMore) savedCheckpoint else GithubCheckpoint()
@@ -957,7 +967,12 @@ class GithubConnectorLoader(
     private fun invalidCheckpointType(field: String): Nothing =
         throw GithubConnectorValidationException("Invalid GitHub checkpoint: $field has the wrong type")
 
-    private fun context(config: JsonNode?, credentials: JsonNode, includePermissions: Boolean): Context {
+    private fun context(
+        config: JsonNode?,
+        credentials: JsonNode,
+        includePermissions: Boolean,
+        heartbeat: () -> Unit,
+    ): Context {
         val owner = config.text("repo_owner") ?: config.text("owner")
             ?: throw GithubConnectorValidationException("Invalid GitHub settings: repo_owner is required.")
         val token = credentials.firstText("github_access_token", "access_token", "token")
@@ -974,6 +989,7 @@ class GithubConnectorLoader(
             includeFiles = config.boolean("include_files", false),
             configuredBranch = config.text("branch")?.trim()?.takeIf(String::isNotEmpty),
             includePermissions = includePermissions,
+            heartbeat = heartbeat,
             headers = mapOf(
                 HttpHeaders.AUTHORIZATION to "Bearer $token",
                 HttpHeaders.ACCEPT to "application/vnd.github+json",
@@ -987,6 +1003,7 @@ class GithubConnectorLoader(
             throw GithubRateLimitValidationException("GitHub rate limit retry limit was exceeded")
         }
         try {
+            context.heartbeat()
             return http.getResponse(context.base, path, context.headers)
         } catch (error: WebClientResponseException) {
             if (!isRateLimited(error)) throw error
@@ -1000,9 +1017,18 @@ class GithubConnectorLoader(
             if (waitSeconds > MAX_RATE_LIMIT_WAIT_SECONDS) {
                 throw GithubRateLimitValidationException("GitHub rate limit reset wait exceeds one hour.", error)
             }
-            val wait = waitSeconds.coerceAtLeast(0) * 1000
-            sleepMillis(wait)
+            waitWithHeartbeat(context, waitSeconds.coerceAtLeast(0) * 1000)
             return get(context, path, attempt + 1)
+        }
+    }
+
+    private fun waitWithHeartbeat(context: Context, waitMillis: Long) {
+        var remaining = waitMillis
+        while (remaining > 0) {
+            context.heartbeat()
+            val delay = minOf(remaining, RATE_LIMIT_HEARTBEAT_MILLIS)
+            sleepMillis(delay)
+            remaining -= delay
         }
     }
 
@@ -1118,6 +1144,7 @@ class GithubConnectorLoader(
         val includeFiles: Boolean,
         val configuredBranch: String?,
         val includePermissions: Boolean,
+        val heartbeat: () -> Unit,
         val headers: Map<String, String>,
     )
 

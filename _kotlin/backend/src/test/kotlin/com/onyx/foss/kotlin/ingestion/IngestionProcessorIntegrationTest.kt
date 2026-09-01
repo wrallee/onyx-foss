@@ -41,11 +41,13 @@ import org.mockito.Mockito.mockingDetails
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
+import org.springframework.transaction.support.TransactionSynchronizationManager
 import java.sql.Timestamp
 import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var processor: IngestionProcessor
@@ -423,6 +425,28 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun embeddingCountMismatchDoesNotReplaceOrCommitTheDocument() {
+        val run = createRun()
+        load(
+            sequenceOf(
+                batch(
+                    1,
+                    false,
+                    SourceDocument(id = "one", title = "one", content = "x".repeat(1501)),
+                ),
+            ),
+        )
+        doReturn(listOf(listOf(0.1))).`when`(embedder).embed(anyList<String>())
+
+        processor.process(run.jobId)
+
+        assertThat(documents.findByCcPairIdAndSourceDocumentId(run.pairId, "one")).isNull()
+        assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.FAILED)
+        assertThat(attempts.findById(run.attemptId).orElseThrow().errorMessage).contains("embedding")
+        verifyNoInteractions(indexer, permissionSync)
+    }
+
+    @Test
     fun newAndReindexedDocumentsKeepCurrentDocumentSetMembership() {
         val run = createRun()
         saveDocument(run.pairId, "reindexed")
@@ -681,6 +705,64 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun deletionWaitsForAnAuthorizedInFlightUpsertBeforeItsFinalIndexDelete() {
+        val run = createRun(status = PairStatus.ACTIVE)
+        val pair = pairs.findById(run.pairId).orElseThrow()
+        load(sequenceOf(batch(1, false, document("one"))))
+        val claim = requireNotNull(claims.claimNext())
+        val upsertStarted = CountDownLatch(1)
+        val releaseUpsert = CountDownLatch(1)
+        val deletionStarted = CountDownLatch(1)
+        val indexDeleteStarted = CountDownLatch(1)
+        val orphanedChunk = AtomicBoolean(false)
+        val indexDeleteHadDatabaseTransaction = AtomicBoolean(false)
+        doAnswer {
+            upsertStarted.countDown()
+            check(releaseUpsert.await(10, TimeUnit.SECONDS))
+            orphanedChunk.set(true)
+            Unit
+        }.`when`(indexer).upsert(
+            run.pairId,
+            "one",
+            0,
+            "one",
+            "one content",
+            null,
+            emptyMap(),
+            listOf(0.1),
+        )
+        doAnswer {
+            indexDeleteStarted.countDown()
+            indexDeleteHadDatabaseTransaction.set(TransactionSynchronizationManager.isActualTransactionActive())
+            orphanedChunk.set(false)
+            Unit
+        }.`when`(indexer).deletePair(run.pairId)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val worker = executor.submit { processor.process(claim) }
+            assertThat(upsertStarted.await(10, TimeUnit.SECONDS)).isTrue()
+            val deletion = executor.submit {
+                deletionStarted.countDown()
+                admin.deletePair(DeletionAttemptRequest(pair.connectorId, pair.credentialId))
+            }
+            assertThat(deletionStarted.await(10, TimeUnit.SECONDS)).isTrue()
+            assertThat(indexDeleteStarted.await(2, TimeUnit.SECONDS)).isFalse()
+            assertThat(awaitPairStatus(run.pairId, PairStatus.DELETING)).isTrue()
+
+            releaseUpsert.countDown()
+            worker.get(10, TimeUnit.SECONDS)
+            deletion.get(10, TimeUnit.SECONDS)
+        } finally {
+            releaseUpsert.countDown()
+            executor.shutdownNow()
+        }
+
+        assertThat(orphanedChunk).isFalse()
+        assertThat(indexDeleteHadDatabaseTransaction).isFalse()
+        assertThat(pairs.findById(run.pairId)).isEmpty()
+    }
+
+    @Test
     fun ingestionExternalTimeoutsAreBelowThePairLease() {
         assertThat(MODEL_SERVER_TIMEOUT).isLessThan(INGESTION_LEASE)
         assertThat(OPENSEARCH_TIMEOUT).isLessThan(INGESTION_LEASE)
@@ -905,6 +987,20 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
                 metadata = mapper.createObjectNode(),
             ),
         )
+    }
+
+    private fun awaitPairStatus(pairId: Long, expected: PairStatus): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        while (System.nanoTime() < deadline) {
+            val status = jdbc.queryForList(
+                "SELECT status FROM connector_credential_pairs WHERE id = ?",
+                String::class.java,
+                pairId,
+            ).singleOrNull()
+            if (status == expected.name) return true
+            Thread.sleep(10)
+        }
+        return false
     }
 
     private data class Run(val pairId: Long, val attemptId: Long, val jobId: Long)

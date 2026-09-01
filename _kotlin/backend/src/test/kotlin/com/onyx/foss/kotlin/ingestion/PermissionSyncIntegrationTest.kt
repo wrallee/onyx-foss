@@ -24,6 +24,8 @@ import okhttp3.mockwebserver.MockWebServer
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.isNull
 import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.doReturn
 import org.mockito.Mockito.inOrder
@@ -183,6 +185,20 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun enqueueDuringActiveAttemptCreatesDurableFollowUpAfterCompletion() {
+        val pairId = createPair()
+        worker.enqueue(pairId)
+        val activeClaim = requireNotNull(claims.claimNext())
+
+        worker.enqueue(pairId)
+        assertThat(claims.complete(activeClaim, AttemptStatus.SUCCESS)).isTrue()
+
+        assertThat(attempts.findAllByCcPairIdOrderByIdDesc(pairId).map { it.status })
+            .containsExactly(AttemptStatus.NOT_STARTED, AttemptStatus.SUCCESS)
+        assertThat(claims.claimForPair(pairId)).isNotNull()
+    }
+
+    @Test
     fun crashedPermissionAttemptIsReclaimedWithFreshToken() {
         val pairId = createPair()
         val now = Instant.parse("2026-09-01T00:00:00Z")
@@ -304,12 +320,13 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
                 throw IllegalStateException("fatal permission failure")
             },
         ).`when`(remoteLoaders).loadSlim(
-            ConnectorSource.JIRA,
-            mapper.createObjectNode(),
-            mapper.createObjectNode(),
-            start = null,
-            end = null,
-            includePermissions = true,
+            match(ConnectorSource.JIRA),
+            match(mapper.createObjectNode()),
+            match(mapper.createObjectNode()),
+            start = isNull(),
+            end = isNull(),
+            includePermissions = match(true),
+            heartbeat = any(),
         )
 
         worker.process(pairId)
@@ -447,12 +464,13 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
                 )
             }
         }.`when`(remoteLoaders).loadSlim(
-            ConnectorSource.JIRA,
-            mapper.createObjectNode(),
-            mapper.createObjectNode(),
-            start = null,
-            end = null,
-            includePermissions = true,
+            match(ConnectorSource.JIRA),
+            match(mapper.createObjectNode()),
+            match(mapper.createObjectNode()),
+            start = isNull(),
+            end = isNull(),
+            includePermissions = match(true),
+            heartbeat = any(),
         )
         val executor = Executors.newFixedThreadPool(2)
         try {
@@ -469,7 +487,8 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
             executor.shutdownNow()
         }
 
-        assertThat(attempts.findAllByCcPairIdOrderByIdDesc(pairId)).hasSize(1)
+        assertThat(attempts.findAllByCcPairIdOrderByIdDesc(pairId).map { it.status })
+            .containsExactly(AttemptStatus.NOT_STARTED, AttemptStatus.SUCCESS)
     }
 
     @Test
@@ -525,12 +544,13 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         val indexingStart = Instant.parse("2025-06-01T00:00:00Z")
         val pairId = createPair(indexingStart = indexingStart)
         doReturn(sequenceOf(ConnectorBatch(checkpoint = checkpoint()))).`when`(remoteLoaders).loadSlim(
-            ConnectorSource.JIRA,
-            mapper.createObjectNode(),
-            mapper.createObjectNode(),
-            start = indexingStart,
-            end = null,
-            includePermissions = true,
+            match(ConnectorSource.JIRA),
+            match(mapper.createObjectNode()),
+            match(mapper.createObjectNode()),
+            start = match(indexingStart),
+            end = isNull(),
+            includePermissions = match(true),
+            heartbeat = any(),
         )
 
         worker.process(pairId)
@@ -584,12 +604,13 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
 
     private fun permissionLoad(vararg batches: ConnectorBatch) {
         doReturn(batches.asSequence()).`when`(remoteLoaders).loadSlim(
-            ConnectorSource.JIRA,
-            mapper.createObjectNode(),
-            mapper.createObjectNode(),
-            start = null,
-            end = null,
-            includePermissions = true,
+            match(ConnectorSource.JIRA),
+            match(mapper.createObjectNode()),
+            match(mapper.createObjectNode()),
+            start = isNull(),
+            end = isNull(),
+            includePermissions = match(true),
+            heartbeat = any(),
         )
     }
 
@@ -599,6 +620,11 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     private fun checkpoint(hasMore: Boolean = false): ConnectorCheckpoint =
         ConnectorCheckpoint(mapper.createObjectNode().put("hasMore", hasMore), hasMore)
 
+    private fun <T> match(value: T): T {
+        org.mockito.ArgumentMatchers.eq(value)
+        return value
+    }
+
     private fun assertAccess(pairId: Long, sourceDocumentId: String, expected: ExternalAccess) {
         val stored = documents.findByCcPairIdAndSourceDocumentId(pairId, sourceDocumentId)?.externalAccess
         assertThat(mapper.treeToValue(stored, ExternalAccess::class.java)).isEqualTo(expected)
@@ -607,7 +633,6 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     private fun realWorker(server: MockWebServer): PermissionSyncWorker = PermissionSyncWorker(
         admin,
         pairs,
-        attempts,
         claims,
         documents,
         staging,
@@ -634,7 +659,22 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         server.enqueue(MockResponse().setResponseCode(200))
         server.enqueue(
             MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
-                .setBody("""{"documents":{"mappings":{"properties":{"source_document_id":{"type":"keyword"}}}}}"""),
+                .setBody(
+                    """
+                        {"documents":{"mappings":{"properties":{
+                          "cc_pair_id":{"type":"long"},
+                          "source_document_id":{"type":"keyword"},
+                          "chunk_id":{"type":"integer"},
+                          "external_user_emails":{"type":"keyword"},
+                          "external_user_group_ids":{"type":"keyword"},
+                          "is_public":{"type":"boolean"},
+                          "document_sets":{"type":"keyword"},
+                          "doc_updated_at":{"type":"date"},
+                          "primary_owners":{"type":"keyword"},
+                          "secondary_owners":{"type":"keyword"}
+                        }}}}
+                    """.trimIndent(),
+                ),
         )
     }
 

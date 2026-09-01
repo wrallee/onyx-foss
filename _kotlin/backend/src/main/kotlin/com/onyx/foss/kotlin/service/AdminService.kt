@@ -26,7 +26,6 @@ import com.onyx.foss.kotlin.domain.DocumentSetEntity
 import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxEntity
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxRepository
-import com.onyx.foss.kotlin.domain.DocumentSetSyncStatus
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
 import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
@@ -36,11 +35,13 @@ import com.onyx.foss.kotlin.domain.JobState
 import com.onyx.foss.kotlin.domain.PairStatus
 import com.onyx.foss.kotlin.domain.PermissionSyncAttemptRepository
 import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
+import com.onyx.foss.kotlin.ingestion.PairExternalWriteFence
 import com.onyx.foss.kotlin.security.CredentialCipher
 import org.springframework.http.HttpStatus
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
+import org.springframework.transaction.support.TransactionTemplate
 
 @Service
 class AdminService(
@@ -57,6 +58,8 @@ class AdminService(
     private val documents: IndexedDocumentRepository,
     private val indexer: OpenSearchIndexer,
     private val jdbc: JdbcTemplate,
+    private val externalWrites: PairExternalWriteFence,
+    private val transactions: TransactionTemplate,
 ) {
     @Transactional
     fun createCredential(request: CredentialRequest): ObjectCreationResponse {
@@ -187,38 +190,50 @@ class AdminService(
         return connectorSnapshot(connectors.save(value))
     }
 
-    @Transactional
     fun deleteConnector(connectorId: Long): StatusResponse {
-        val connector = connectors.lockById(connectorId)
-            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
-        val lockedPairs = pairs.findAllByConnectorId(connectorId).map { pair ->
-            pairs.lockById(id(pair)) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+        val pairIds = requireNotNull(
+            transactions.execute {
+                connectors.lockById(connectorId)
+                    ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
+                val lockedPairs = pairs.findAllByConnectorId(connectorId).map { pair ->
+                    pairs.lockById(id(pair)) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+                }
+                lockedPairs.forEach(::markDeleting)
+                pairs.flush()
+                lockedPairs.map(::id)
+            },
+        )
+        pairIds.forEach { pairId ->
+            externalWrites.withPair(pairId) { indexer.deletePair(pairId) }
         }
-        lockedPairs.forEach(::markDeleting)
-        pairs.flush()
-        lockedPairs.map(::id).forEach { pairId ->
-            indexer.deletePair(pairId)
-            documents.deleteAllByCcPairId(pairId)
+        transactions.executeWithoutResult {
+            pairIds.forEach(documents::deleteAllByCcPairId)
+            connectors.lockById(connectorId)?.let(connectors::delete)
         }
-        connectors.delete(connector)
         return StatusResponse(true, "Connector deleted successfully", connectorId)
     }
 
-    @Transactional
     fun deletePair(request: DeletionAttemptRequest): StatusResponse {
-        val existing = pairs.findByConnectorIdAndCredentialId(request.connectorId, request.credentialId)
-            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
-        val pair = pairs.lockById(id(existing))
-            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
-        val pairId = id(pair)
-        val hasOtherPairs = pairs.findAllByConnectorId(request.connectorId).any { id(it) != pairId }
-        markDeleting(pair)
-        pairs.flush()
-        indexer.deletePair(pairId)
-        documents.deleteAllByCcPairId(pairId)
-        pairs.delete(pair)
-        if (!hasOtherPairs) connectors.delete(connector(request.connectorId))
-        return StatusResponse(true, "Connector deletion completed", pairId)
+        val plan = requireNotNull(
+            transactions.execute {
+                val existing = pairs.findByConnectorIdAndCredentialId(request.connectorId, request.credentialId)
+                    ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
+                val pair = pairs.lockById(id(existing))
+                    ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector credential pair not found")
+                val pairId = id(pair)
+                val hasOtherPairs = pairs.findAllByConnectorId(request.connectorId).any { id(it) != pairId }
+                markDeleting(pair)
+                pairs.flush()
+                PairDeletionPlan(pairId, hasOtherPairs)
+            },
+        )
+        externalWrites.withPair(plan.pairId) { indexer.deletePair(plan.pairId) }
+        transactions.executeWithoutResult {
+            documents.deleteAllByCcPairId(plan.pairId)
+            pairs.lockById(plan.pairId)?.let(pairs::delete)
+            if (!plan.hasOtherPairs) connectors.lockById(request.connectorId)?.let(connectors::delete)
+        }
+        return StatusResponse(true, "Connector deletion completed", plan.pairId)
     }
 
     private fun markDeleting(pair: ConnectorCredentialPairEntity) {
@@ -388,7 +403,7 @@ class AdminService(
         }
         val set = sets.saveAndFlush(DocumentSetEntity(name = request.name.trim(), description = request.description, isPublic = true))
         replaceSetPairs(id(set), request.ccPairIds)
-        enqueueDocumentSetSync(request.ccPairIds)
+        enqueueDocumentSetSync(request.ccPairIds, id(set))
         return id(set)
     }
 
@@ -406,7 +421,7 @@ class AdminService(
         set.isPublic = true
         sets.saveAndFlush(set)
         replaceSetPairs(setId, request.ccPairIds)
-        enqueueDocumentSetSync(previousPairIds + request.ccPairIds)
+        enqueueDocumentSetSync(previousPairIds + request.ccPairIds, setId)
     }
 
     @Transactional
@@ -416,7 +431,7 @@ class AdminService(
         jdbc.update("DELETE FROM document_set_cc_pairs WHERE document_set_id = ?", setId)
         sets.deleteById(setId)
         sets.flush()
-        enqueueDocumentSetSync(pairIds)
+        enqueueDocumentSetSync(pairIds, setId)
     }
 
     fun listSets(): List<Map<String, Any?>> = sets.findAll().map(::setSnapshot)
@@ -434,9 +449,7 @@ class AdminService(
             "description" to set.description,
             "cc_pair_summaries" to pairIds.map(::pairSummary),
             "cc_pair_descriptors" to pairIds.map(::pairDescriptor),
-            "is_up_to_date" to !documentSetSyncOutbox.existsByStatusIn(
-                listOf(DocumentSetSyncStatus.PENDING, DocumentSetSyncStatus.IN_PROGRESS),
-            ),
+            "is_up_to_date" to !documentSetSyncOutbox.existsActiveForDocumentSet(setId),
             "is_public" to true,
             "users" to emptyList<String>(),
             "groups" to emptyList<Long>(),
@@ -473,11 +486,14 @@ class AdminService(
         setId,
     )
 
-    private fun enqueueDocumentSetSync(pairIds: Collection<Long>) {
+    private fun enqueueDocumentSetSync(pairIds: Collection<Long>, documentSetId: Long) {
         val distinctPairIds = pairIds.distinct()
         if (distinctPairIds.isNotEmpty()) {
             documentSetSyncOutbox.save(
-                DocumentSetSyncOutboxEntity(ccPairIds = mapper.valueToTree(distinctPairIds)),
+                DocumentSetSyncOutboxEntity(
+                    ccPairIds = mapper.valueToTree(distinctPairIds),
+                    documentSetIds = mapper.valueToTree(listOf(documentSetId)),
+                ),
             )
         }
     }
@@ -555,3 +571,8 @@ class AdminService(
         else -> error("Unsupported entity id")
     }
 }
+
+private data class PairDeletionPlan(
+    val pairId: Long,
+    val hasOtherPairs: Boolean,
+)

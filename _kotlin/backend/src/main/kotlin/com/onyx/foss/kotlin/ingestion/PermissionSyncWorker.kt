@@ -31,7 +31,7 @@ class PermissionSyncClaimService(
     private val attempts: PermissionSyncAttemptRepository,
 ) {
     @Transactional
-    fun enqueue(pairId: Long): Boolean = attempts.createIfNoActive(pairId) == 1
+    fun enqueue(pairId: Long): Boolean = attempts.createOrCoalesce(pairId) == 1
 
     @Transactional
     fun claimNext(now: Instant = Instant.now()): PermissionSyncClaim? =
@@ -58,15 +58,37 @@ class PermissionSyncClaimService(
     fun updateCounts(claim: PermissionSyncClaim, total: Int, errors: Int): Boolean =
         attempts.updateCountsOwned(claim.attemptId, claim.token, total, errors) == 1
 
-    fun complete(claim: PermissionSyncClaim, status: AttemptStatus): Boolean =
-        attempts.completeOwned(claim.attemptId, claim.token, status.name) == 1
+    @Transactional
+    fun complete(claim: PermissionSyncClaim, status: AttemptStatus): Boolean = finish(claim) { attempt ->
+        attempt.status = status
+    }
 
-    fun fail(claim: PermissionSyncClaim, error: Exception): Boolean = attempts.failOwned(
-        claim.attemptId,
-        claim.token,
-        (error.message ?: "Permission sync failed").take(1000),
-        error.stackTraceToString().take(16000),
-    ) == 1
+    @Transactional
+    fun fail(claim: PermissionSyncClaim, error: Exception): Boolean = finish(claim) { attempt ->
+        attempt.status = AttemptStatus.FAILED
+        attempt.errorMessage = (error.message ?: "Permission sync failed").take(1000)
+        attempt.fullExceptionTrace = error.stackTraceToString().take(16000)
+    }
+
+    private fun finish(
+        claim: PermissionSyncClaim,
+        update: (com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity) -> Unit,
+    ): Boolean {
+        val attempt = attempts.lockOwned(claim.attemptId, claim.token) ?: return false
+        val followUpRequested = attempt.followUpRequested
+        update(attempt)
+        attempt.claimToken = null
+        attempt.leaseExpiresAt = null
+        attempt.followUpRequested = false
+        attempt.timeFinished = Instant.now()
+        attempts.saveAndFlush(attempt)
+        if (followUpRequested) {
+            attempts.save(
+                com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity(ccPairId = claim.pairId),
+            )
+        }
+        return true
+    }
 }
 
 @Component
@@ -84,7 +106,6 @@ class PermissionSyncScheduledWorker(
 class PermissionSyncWorker(
     private val admin: AdminService,
     private val pairs: ConnectorCredentialPairRepository,
-    private val attempts: PermissionSyncAttemptRepository,
     private val claims: PermissionSyncClaimService,
     private val documents: IndexedDocumentRepository,
     private val staging: PermissionSyncStageRepository,
@@ -126,6 +147,7 @@ class PermissionSyncWorker(
                         admin.credentialSecret(pair.credentialId),
                         start = connector.indexingStart,
                         includePermissions = true,
+                        heartbeat = { renew(claim) },
                     ),
                 )
             }
