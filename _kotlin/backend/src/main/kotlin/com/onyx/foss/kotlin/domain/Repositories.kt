@@ -52,7 +52,6 @@ interface ConnectorCredentialPairRepository : JpaRepository<ConnectorCredentialP
                   WHERE active_attempt.cc_pair_id = pair.id
                     AND active_job.state IN ('QUEUED', 'RUNNING')
               )
-            FOR UPDATE OF pair SKIP LOCKED
         """,
         nativeQuery = true,
     )
@@ -312,14 +311,14 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
         value = """
             SELECT * FROM permission_sync_attempts
             WHERE status = 'NOT_STARTED'
-               OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at <= :now))
+               OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp()))
             ORDER BY created_at, id
             FOR UPDATE SKIP LOCKED
             LIMIT 1
         """,
         nativeQuery = true,
     )
-    fun lockNextClaimable(@Param("now") now: Instant): PermissionSyncAttemptEntity?
+    fun lockNextClaimable(): PermissionSyncAttemptEntity?
 
     @Query(
         value = """
@@ -327,7 +326,7 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
             WHERE cc_pair_id = :ccPairId
               AND (
                   status = 'NOT_STARTED'
-                  OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at <= :now))
+                  OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp()))
               )
             ORDER BY created_at, id
             FOR UPDATE SKIP LOCKED
@@ -337,8 +336,10 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
     )
     fun lockClaimableForPair(
         @Param("ccPairId") ccPairId: Long,
-        @Param("now") now: Instant,
     ): PermissionSyncAttemptEntity?
+
+    @Query(value = "SELECT clock_timestamp()", nativeQuery = true)
+    fun databaseNow(): Instant
 
     @Query(
         value = """

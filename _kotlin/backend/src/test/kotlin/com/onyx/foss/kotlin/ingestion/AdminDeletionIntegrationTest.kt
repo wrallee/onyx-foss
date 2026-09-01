@@ -2,6 +2,8 @@ package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.api.ApiException
+import com.onyx.foss.kotlin.api.CCPropertyUpdateRequest
+import com.onyx.foss.kotlin.api.ConnectorRequest
 import com.onyx.foss.kotlin.api.DeletionAttemptRequest
 import com.onyx.foss.kotlin.api.PairMetadataRequest
 import com.onyx.foss.kotlin.api.RunConnectorRequest
@@ -21,6 +23,8 @@ import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.mockito.Mockito.doAnswer
+import org.mockito.Mockito.doReturn
+import org.mockito.Mockito.mock
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
 import org.springframework.jdbc.core.JdbcTemplate
@@ -77,6 +81,14 @@ class AdminDeletionIntegrationTest : PostgresIntegrationTest() {
             assertConflict { admin.setPairStatus(fixture.pairId, PairStatus.ACTIVE) }
             assertConflict { admin.enqueuePair(fixture.pairId, fromBeginning = false) }
             assertConflict { admin.enqueue(RunConnectorRequest(connectorId = fixture.connectorId)) }
+            assertConflict { admin.updateConnector(fixture.connectorId, connectorRequest("late update")) }
+            assertConflict { admin.renamePair(fixture.pairId, "late rename") }
+            assertConflict {
+                admin.updatePairProperty(
+                    fixture.pairId,
+                    CCPropertyUpdateRequest(name = "refresh_frequency", value = "60"),
+                )
+            }
 
             releaseDelete.countDown()
             deletion.get(10, TimeUnit.SECONDS)
@@ -182,6 +194,75 @@ class AdminDeletionIntegrationTest : PostgresIntegrationTest() {
         assertThat(entered).isTrue()
     }
 
+    @Test
+    fun staleConnectorUpdateCannotEraseATombstoneAfterDeletionStarts() {
+        val fixture = createPair()
+        val updateEntered = CountDownLatch(1)
+        val releaseUpdate = CountDownLatch(1)
+        val indexDeleted = CountDownLatch(1)
+        val releaseDelete = CountDownLatch(1)
+        val request = blockingConnectorRequest(updateEntered, releaseUpdate)
+        pauseIndexDelete(fixture.pairId, indexDeleted, releaseDelete)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val update = executor.submit { admin.updateConnector(fixture.connectorId, request) }
+            assertThat(updateEntered.await(10, TimeUnit.SECONDS)).isTrue()
+            val deletion = executor.submit { admin.deleteConnector(fixture.connectorId) }
+            val deletionStartedBeforeUpdateReleased = indexDeleted.await(300, TimeUnit.MILLISECONDS)
+
+            releaseUpdate.countDown()
+            update.get(10, TimeUnit.SECONDS)
+            assertThat(indexDeleted.await(10, TimeUnit.SECONDS)).isTrue()
+            val tombstone = connectors.findById(fixture.connectorId).orElseThrow().deleting
+
+            releaseDelete.countDown()
+            deletion.get(10, TimeUnit.SECONDS)
+            assertThat(deletionStartedBeforeUpdateReleased).isFalse()
+            assertThat(tombstone).isTrue()
+        } finally {
+            releaseUpdate.countDown()
+            releaseDelete.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun stalePairRenameCannotEraseDeletingStatusAfterDeletionStarts() {
+        val fixture = createPair()
+        val queryBlocker = dataSource.connection
+        queryBlocker.autoCommit = false
+        queryBlocker.createStatement().use { statement ->
+            statement.execute("LOCK TABLE ingestion_attempts IN ACCESS EXCLUSIVE MODE")
+        }
+        val indexDeleted = CountDownLatch(1)
+        val releaseDelete = CountDownLatch(1)
+        pauseIndexDelete(fixture.pairId, indexDeleted, releaseDelete)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val rename = executor.submit { admin.renamePair(fixture.pairId, "late rename") }
+            assertThat(awaitBlockedIngestionAttemptQuery()).isTrue()
+            val deletion = executor.submit {
+                admin.deletePair(DeletionAttemptRequest(fixture.connectorId, fixture.credentialId))
+            }
+            val deletionStartedBeforeRenameReleased = indexDeleted.await(300, TimeUnit.MILLISECONDS)
+
+            queryBlocker.commit()
+            rename.get(10, TimeUnit.SECONDS)
+            assertThat(indexDeleted.await(10, TimeUnit.SECONDS)).isTrue()
+            val status = pairStatus(fixture.pairId)
+
+            releaseDelete.countDown()
+            deletion.get(10, TimeUnit.SECONDS)
+            assertThat(deletionStartedBeforeRenameReleased).isFalse()
+            assertThat(status).isEqualTo(PairStatus.DELETING)
+        } finally {
+            runCatching { queryBlocker.rollback() }
+            queryBlocker.close()
+            releaseDelete.countDown()
+            executor.shutdownNow()
+        }
+    }
+
     private fun createPair(): Fixture {
         val connector = connectors.save(
             ConnectorEntity(
@@ -217,6 +298,25 @@ class AdminDeletionIntegrationTest : PostgresIntegrationTest() {
             check(release.await(10, TimeUnit.SECONDS))
             Unit
         }.`when`(indexer).deletePair(pairId)
+    }
+
+    private fun connectorRequest(name: String): ConnectorRequest = ConnectorRequest(
+        name = name,
+        source = ConnectorSource.FILE,
+        connectorSpecificConfig = mapper.createObjectNode(),
+    )
+
+    private fun blockingConnectorRequest(entered: CountDownLatch, release: CountDownLatch): ConnectorRequest {
+        val request = mock(ConnectorRequest::class.java)
+        doAnswer {
+            entered.countDown()
+            check(release.await(10, TimeUnit.SECONDS))
+            "updated"
+        }.`when`(request).name
+        doReturn(ConnectorSource.FILE).`when`(request).source
+        doReturn("load_state").`when`(request).inputType
+        doReturn(mapper.createObjectNode()).`when`(request).connectorSpecificConfig
+        return request
     }
 
     private fun pairStatus(pairId: Long): PairStatus = PairStatus.valueOf(
@@ -271,6 +371,27 @@ class AdminDeletionIntegrationTest : PostgresIntegrationTest() {
         while (System.nanoTime() < deadline) {
             val waiting = jdbc.queryForObject(
                 "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'advisory')",
+                Boolean::class.java,
+            ) ?: false
+            if (waiting) return true
+            Thread.sleep(10)
+        }
+        return false
+    }
+
+    private fun awaitBlockedIngestionAttemptQuery(): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (System.nanoTime() < deadline) {
+            val waiting = jdbc.queryForObject(
+                """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_stat_activity
+                        WHERE pid <> pg_backend_pid()
+                          AND wait_event_type = 'Lock'
+                          AND query ILIKE '%ingestion_attempts%'
+                    )
+                """.trimIndent(),
                 Boolean::class.java,
             ) ?: false
             if (waiting) return true

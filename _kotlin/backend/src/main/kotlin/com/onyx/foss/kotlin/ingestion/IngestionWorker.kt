@@ -513,6 +513,7 @@ class OpenSearchIndexer(
     private val properties: OnyxProperties,
     private val clientBuilder: WebClient.Builder,
     private val mapper: ObjectMapper,
+    private val externalWrites: PairExternalWriteFence,
 ) {
     private val indexReady = AtomicBoolean(false)
 
@@ -734,27 +735,29 @@ class OpenSearchIndexer(
         if (indexReady.get()) return
         synchronized(indexReady) {
             if (indexReady.get()) return
-            val indexUrl = properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index
-            val exists = indexExists(indexUrl, "index check")
-            if (!exists) {
-                putJson(indexUrl, INDEX_DEFINITION, "index creation")
-            } else {
-                val mapping = mapping(indexUrl, "mapping check")
-                val missingFields = linkedMapOf<String, Any>()
-                var incompatibleMapping = false
-                EXACT_FIELDS.forEach { (field, definition) ->
-                    val expectedType = (definition as Map<*, *>)["type"].toString()
-                    val actualType = mapping.properties.path(field).path("type").asText()
-                    if (actualType.isBlank()) {
-                        missingFields[field] = definition
-                    } else if (actualType != expectedType) {
-                        incompatibleMapping = true
+            externalWrites.withOpenSearchIndex(properties.opensearch.index) {
+                val indexUrl = properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index
+                val exists = indexExists(indexUrl, "index check")
+                if (!exists) {
+                    putJson(indexUrl, INDEX_DEFINITION, "index creation")
+                } else {
+                    val mapping = mapping(indexUrl, "mapping check")
+                    val missingFields = linkedMapOf<String, Any>()
+                    var incompatibleMapping = false
+                    EXACT_FIELDS.forEach { (field, definition) ->
+                        val expectedType = (definition as Map<*, *>)["type"].toString()
+                        val actualType = mapping.properties.path(field).path("type").asText()
+                        if (actualType.isBlank()) {
+                            missingFields[field] = definition
+                        } else if (actualType != expectedType) {
+                            incompatibleMapping = true
+                        }
                     }
-                }
-                if (incompatibleMapping) {
-                    reindexWithExactMappings(mapping.concreteIndex)
-                } else if (missingFields.isNotEmpty()) {
-                    putJson("$indexUrl/_mapping", mapOf("properties" to missingFields), "exact mapping creation")
+                    if (incompatibleMapping) {
+                        reindexWithExactMappings(mapping.concreteIndex)
+                    } else if (missingFields.isNotEmpty()) {
+                        putJson("$indexUrl/_mapping", mapOf("properties" to missingFields), "exact mapping creation")
+                    }
                 }
             }
             indexReady.set(true)

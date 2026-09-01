@@ -8,6 +8,10 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
+import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.anyString
+import org.mockito.Mockito.doAnswer
+import org.mockito.Mockito.mock
 import org.springframework.web.reactive.function.client.WebClient
 import java.time.Duration
 import java.util.concurrent.TimeUnit
@@ -16,6 +20,10 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class OpenSearchIndexerTest {
     private val mapper = jacksonObjectMapper()
+    private val externalWrites = mock(PairExternalWriteFence::class.java).also { fence ->
+        doAnswer { invocation -> invocation.getArgument<() -> Unit>(1).invoke() }
+            .`when`(fence).withOpenSearchIndex(anyString(), any<() -> Unit>() ?: {})
+    }
 
     @Test
     fun deletesOnlySelectedDocumentIds() {
@@ -32,7 +40,7 @@ class OpenSearchIndexerTest {
                     index = "documents",
                 ),
             )
-            val indexer = OpenSearchIndexer(properties, WebClient.builder(), mapper)
+            val indexer = OpenSearchIndexer(properties, WebClient.builder(), mapper, externalWrites)
 
             indexer.deleteDocuments(7, setOf("one", "two"))
 
@@ -61,7 +69,7 @@ class OpenSearchIndexerTest {
                     index = "documents",
                 ),
             )
-            val indexer = OpenSearchIndexer(properties, WebClient.builder(), mapper)
+            val indexer = OpenSearchIndexer(properties, WebClient.builder(), mapper, externalWrites)
             val access = ExternalAccess(setOf("reader@example.com"), setOf("team-1"), isPublic = false)
 
             indexer.updateAccess(7, mapOf("one" to access))
@@ -98,6 +106,7 @@ class OpenSearchIndexerTest {
                 ),
                 WebClient.builder(),
                 mapper,
+                externalWrites,
             )
 
             indexer.updateDocumentSets(7, setOf("one", "two"), listOf("first", "second"))
@@ -134,6 +143,7 @@ class OpenSearchIndexerTest {
                 ),
                 WebClient.builder(),
                 mapper,
+                externalWrites,
             )
 
             indexer.upsert(7, "one", 0, "One", "content", null, emptyMap(), listOf(0.1))
@@ -168,6 +178,7 @@ class OpenSearchIndexerTest {
                 ),
                 WebClient.builder(),
                 mapper,
+                externalWrites,
             )
 
             indexer.upsert(
@@ -207,6 +218,7 @@ class OpenSearchIndexerTest {
                 ),
                 WebClient.builder(),
                 mapper,
+                externalWrites,
             )
 
             org.junit.jupiter.api.assertThrows<IllegalStateException> {
@@ -233,6 +245,7 @@ class OpenSearchIndexerTest {
                 ),
                 WebClient.builder(),
                 mapper,
+                externalWrites,
             )
 
             indexer.deleteDocuments(7, setOf("one"))
@@ -264,6 +277,7 @@ class OpenSearchIndexerTest {
                     ),
                     WebClient.builder(),
                     mapper,
+                    externalWrites,
                 )
 
                 org.junit.jupiter.api.assertThrows<IllegalStateException> {

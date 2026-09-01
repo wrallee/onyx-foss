@@ -179,7 +179,7 @@ class AdminService(
 
     @Transactional
     fun updateConnector(connectorId: Long, request: ConnectorRequest): Map<String, Any?> {
-        val value = connector(connectorId)
+        val value = lockConnectorForMutation(connectorId)
         value.name = request.name.trim()
         value.source = request.source
         value.inputType = request.inputType
@@ -268,10 +268,12 @@ class AdminService(
             throw ApiException(HttpStatus.BAD_REQUEST, "Connector and credential source do not match")
         }
         val existingPair = pairs.findByConnectorIdAndCredentialId(connectorId, credentialId)
-        if (existingPair?.status == PairStatus.DELETING) {
-            throw ApiException(HttpStatus.CONFLICT, "CC Pair is being deleted")
-        }
-        val pair = existingPair ?: ConnectorCredentialPairEntity(connectorId = connectorId, credentialId = credentialId)
+        val pair = existingPair?.let { existing ->
+            val locked = pairs.lockById(id(existing))
+                ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+            requireNotDeleting(locked)
+            locked
+        } ?: ConnectorCredentialPairEntity(connectorId = connectorId, credentialId = credentialId)
         pair.name = request.name.trim()
         pair.accessType = request.accessType
         pair.autoSyncOptions = request.autoSyncOptions
@@ -324,10 +326,7 @@ class AdminService(
 
     @Transactional
     fun setPairStatus(pairId: Long, status: PairStatus): Map<String, Any?> {
-        val pair = pairs.lockById(pairId) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
-        if (pair.status == PairStatus.DELETING) {
-            throw ApiException(HttpStatus.CONFLICT, "CC Pair is being deleted")
-        }
+        val pair = lockPairForMutation(pairId).pair
         pair.status = status
         pairs.save(pair)
         return pairDetail(pairId)
@@ -335,9 +334,7 @@ class AdminService(
 
     @Transactional
     fun enqueue(request: RunConnectorRequest): StatusResponse {
-        val connector = connectors.lockById(request.connectorId)
-            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
-        requireNotDeleting(connector)
+        lockConnectorForMutation(request.connectorId)
         val all = pairs.findAllByConnectorId(request.connectorId)
         val selected = if (request.credentialIds.isNullOrEmpty() || request.credentialIds == listOf(0L)) {
             all
@@ -351,10 +348,7 @@ class AdminService(
 
     @Transactional
     fun enqueuePair(pairId: Long, fromBeginning: Boolean, pruneOnly: Boolean = false): Long {
-        val pair = pairs.lockById(pairId) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
-        if (pair.status == PairStatus.DELETING) {
-            throw ApiException(HttpStatus.CONFLICT, "CC Pair is being deleted")
-        }
+        val pair = lockPairForMutation(pairId).pair
         jobs.findFirstByCcPairIdAndStateInOrderById(pairId, listOf(JobState.QUEUED, JobState.RUNNING))
             ?.let { return id(it) }
         val attempt = attempts.save(
@@ -531,6 +525,27 @@ class AdminService(
         if (connector.deleting) throw ApiException(HttpStatus.CONFLICT, "Connector is being deleted")
     }
 
+    private fun requireNotDeleting(pair: ConnectorCredentialPairEntity) {
+        if (pair.status == PairStatus.DELETING) throw ApiException(HttpStatus.CONFLICT, "CC Pair is being deleted")
+    }
+
+    private fun lockConnectorForMutation(connectorId: Long): ConnectorEntity {
+        val connector = connectors.lockById(connectorId)
+            ?: throw ApiException(HttpStatus.NOT_FOUND, "Connector not found")
+        requireNotDeleting(connector)
+        return connector
+    }
+
+    private fun lockPairForMutation(pairId: Long): PairMutation {
+        val connectorId = pairs.findById(pairId).orElseThrow {
+            ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+        }.connectorId
+        val connector = lockConnectorForMutation(connectorId)
+        val pair = pairs.lockById(pairId) ?: throw ApiException(HttpStatus.NOT_FOUND, "CC Pair not found")
+        requireNotDeleting(pair)
+        return PairMutation(connector, pair)
+    }
+
     private fun mergeMaskedCredential(current: JsonNode, update: JsonNode): JsonNode {
         if (!current.isObject || !update.isObject) return update
         val merged = update.deepCopy<ObjectNode>()
@@ -557,7 +572,7 @@ class AdminService(
     )
     @Transactional
     fun renamePair(pairId: Long, name: String): Map<String, Any?> {
-        val value = pair(pairId)
+        val value = lockPairForMutation(pairId).pair
         value.name = name.trim()
         pairs.save(value)
         return pairDetail(pairId)
@@ -565,8 +580,8 @@ class AdminService(
 
     @Transactional
     fun updatePairProperty(pairId: Long, request: CCPropertyUpdateRequest): StatusResponse {
-        val pair = pair(pairId)
-        val connector = connector(pair.connectorId)
+        val mutation = lockPairForMutation(pairId)
+        val connector = mutation.connector
         val value = request.value.toLongOrNull()
             ?: throw ApiException(HttpStatus.BAD_REQUEST, "Property value must be an integer")
         val message = when (request.name) {
@@ -604,4 +619,9 @@ class AdminService(
 private data class PairDeletionPlan(
     val pairId: Long,
     val hasOtherPairs: Boolean,
+)
+
+private data class PairMutation(
+    val connector: ConnectorEntity,
+    val pair: ConnectorCredentialPairEntity,
 )

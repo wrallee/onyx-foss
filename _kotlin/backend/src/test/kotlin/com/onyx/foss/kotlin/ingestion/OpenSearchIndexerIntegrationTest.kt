@@ -15,6 +15,10 @@ import okhttp3.mockwebserver.RecordedRequest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
+import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.anyString
+import org.mockito.Mockito.doAnswer
+import org.mockito.Mockito.mock
 import org.springframework.http.MediaType
 import org.springframework.web.reactive.function.client.WebClient
 import org.testcontainers.containers.GenericContainer
@@ -22,13 +26,17 @@ import org.testcontainers.junit.jupiter.Container
 import org.testcontainers.junit.jupiter.Testcontainers
 import org.testcontainers.utility.DockerImageName
 import org.testcontainers.containers.wait.strategy.Wait
+import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.time.Instant
+import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import okio.Buffer
 
 @Testcontainers
@@ -38,6 +46,12 @@ class OpenSearchIndexerIntegrationTest {
     private val client = WebClient.builder().build()
     private val index = "indexer-test-${UUID.randomUUID()}"
     private val baseUrl get() = "http://${openSearch.host}:${openSearch.getMappedPort(9200)}"
+    private val migrationLock = ReentrantLock()
+    private val externalWrites = mock(PairExternalWriteFence::class.java).also { fence ->
+        doAnswer { invocation ->
+            migrationLock.withLock { invocation.getArgument<() -> Unit>(1).invoke() }
+        }.`when`(fence).withOpenSearchIndex(anyString(), any<() -> Unit>() ?: {})
+    }
 
     @AfterEach
     fun deleteIndex() {
@@ -130,13 +144,14 @@ class OpenSearchIndexerIntegrationTest {
         putRawDocument("legacy", legacyId, "legacy content")
         val firstReindex = CountDownLatch(1)
         val releaseFirstReindex = CountDownLatch(1)
+        val writerStarted = CountDownLatch(1)
         val proxyClient = OkHttpClient()
         MockWebServer().use { proxy ->
             proxy.dispatcher = pausingProxy(proxyClient, firstReindex, releaseFirstReindex)
             proxy.start()
             val migratingReplica = indexer(proxy.url("/").toString().trimEnd('/'))
             val writingReplica = indexer(proxy.url("/").toString().trimEnd('/'))
-            val executor = Executors.newSingleThreadExecutor()
+            val executor = Executors.newFixedThreadPool(2)
             try {
                 val migration = executor.submit {
                     migratingReplica.updateAccess(
@@ -146,19 +161,25 @@ class OpenSearchIndexerIntegrationTest {
                 }
                 assertThat(firstReindex.await(10, TimeUnit.SECONDS)).isTrue()
 
-                writingReplica.upsert(
-                    7,
-                    concurrentId,
-                    0,
-                    "Concurrent",
-                    "concurrent content",
-                    null,
-                    emptyMap(),
-                    listOf(0.2),
-                )
+                val concurrentWrite = executor.submit {
+                    writerStarted.countDown()
+                    writingReplica.upsert(
+                        7,
+                        concurrentId,
+                        0,
+                        "Concurrent",
+                        "concurrent content",
+                        null,
+                        emptyMap(),
+                        listOf(0.2),
+                    )
+                }
+                assertThat(writerStarted.await(10, TimeUnit.SECONDS)).isTrue()
+                assertThat(concurrentWrite.isDone).isFalse()
 
                 releaseFirstReindex.countDown()
                 migration.get(30, TimeUnit.SECONDS)
+                concurrentWrite.get(30, TimeUnit.SECONDS)
             } finally {
                 releaseFirstReindex.countDown()
                 executor.shutdownNow()
@@ -170,6 +191,65 @@ class OpenSearchIndexerIntegrationTest {
         assertThat(exactDocuments(legacyId).single().path("external_user_emails").map(JsonNode::asText))
             .containsExactly("reader@example.com")
         assertThat(exactDocuments(concurrentId).single().path("content").asText()).isEqualTo("concurrent content")
+    }
+
+    @Test
+    fun concurrentMigratorsRunOneReindexAndPreserveThePostSwapWrite() {
+        val sourceDocumentId = "shared-document"
+        val documentId = Base64.getUrlEncoder().withoutPadding().encodeToString(
+            "7:$sourceDocumentId:0".toByteArray(StandardCharsets.UTF_8),
+        )
+        putRawDocument(documentId, sourceDocumentId, "legacy content")
+        val firstReindex = CountDownLatch(1)
+        val secondReindex = CountDownLatch(1)
+        val releaseFirstReindex = CountDownLatch(1)
+        val reindexCalls = AtomicInteger()
+        val proxyClient = OkHttpClient()
+        MockWebServer().use { proxy ->
+            proxy.dispatcher = pausingProxy(
+                proxyClient,
+                firstReindex,
+                releaseFirstReindex,
+                reindexCalls,
+                secondReindex,
+            )
+            proxy.start()
+            val firstReplica = indexer(proxy.url("/").toString().trimEnd('/'))
+            val secondReplica = indexer(proxy.url("/").toString().trimEnd('/'))
+            val executor = Executors.newFixedThreadPool(2)
+            try {
+                val firstMigration = executor.submit {
+                    firstReplica.deleteDocuments(7, setOf("not-present"))
+                }
+                assertThat(firstReindex.await(10, TimeUnit.SECONDS)).isTrue()
+                val postSwapWrite = executor.submit {
+                    secondReplica.upsert(
+                        7,
+                        sourceDocumentId,
+                        0,
+                        "Updated",
+                        "post-swap content",
+                        null,
+                        emptyMap(),
+                        listOf(0.2),
+                    )
+                }
+                val migrationsOverlapped = secondReindex.await(3, TimeUnit.SECONDS)
+                if (migrationsOverlapped) postSwapWrite.get(30, TimeUnit.SECONDS)
+                releaseFirstReindex.countDown()
+                firstMigration.get(30, TimeUnit.SECONDS)
+                if (!migrationsOverlapped) postSwapWrite.get(30, TimeUnit.SECONDS)
+            } finally {
+                releaseFirstReindex.countDown()
+                executor.shutdownNow()
+                proxyClient.dispatcher.executorService.shutdown()
+                proxyClient.connectionPool.evictAll()
+            }
+        }
+
+        assertThat(reindexCalls.get()).isEqualTo(1)
+        assertThat(exactDocuments(sourceDocumentId).single().path("content").asText())
+            .isEqualTo("post-swap content")
     }
 
     @Test
@@ -195,6 +275,7 @@ class OpenSearchIndexerIntegrationTest {
         OnyxProperties(opensearch = OnyxProperties.OpenSearch(baseUrl = url, index = index)),
         WebClient.builder(),
         mapper,
+        externalWrites,
     )
 
     private fun exactDocuments(sourceDocumentId: String): List<JsonNode> = client.post()
@@ -259,13 +340,19 @@ class OpenSearchIndexerIntegrationTest {
         proxyClient: OkHttpClient,
         firstReindex: CountDownLatch,
         releaseFirstReindex: CountDownLatch,
+        reindexCalls: AtomicInteger = AtomicInteger(),
+        secondReindex: CountDownLatch = CountDownLatch(0),
     ): Dispatcher {
-        val pauseNextReindex = AtomicBoolean(true)
         return object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
-                if (request.path?.startsWith("/_reindex") == true && pauseNextReindex.compareAndSet(true, false)) {
-                    firstReindex.countDown()
-                    check(releaseFirstReindex.await(30, TimeUnit.SECONDS))
+                if (request.path?.startsWith("/_reindex") == true) {
+                    when (reindexCalls.incrementAndGet()) {
+                        1 -> {
+                            firstReindex.countDown()
+                            check(releaseFirstReindex.await(30, TimeUnit.SECONDS))
+                        }
+                        2 -> secondReindex.countDown()
+                    }
                 }
                 val method = requireNotNull(request.method)
                 val contentType = request.getHeader("Content-Type")?.toMediaTypeOrNull()

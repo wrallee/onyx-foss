@@ -29,6 +29,8 @@ import org.mockito.ArgumentMatchers.isNull
 import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.doReturn
 import org.mockito.Mockito.inOrder
+import org.mockito.Mockito.CALLS_REAL_METHODS
+import org.mockito.Mockito.mockStatic
 import org.mockito.Mockito.mockingDetails
 import org.mockito.Mockito.times
 import org.mockito.Mockito.verify
@@ -63,6 +65,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var staging: PermissionSyncStageRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
     @Autowired private lateinit var dataSource: DataSource
+    @Autowired private lateinit var externalWrites: PairExternalWriteFence
     @MockitoBean private lateinit var remoteLoaders: RemoteConnectorLoaders
     @MockitoBean private lateinit var indexer: OpenSearchIndexer
 
@@ -310,18 +313,196 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
+    fun permissionOwnerCannotFailAfterItsLeaseExpiresWhileWaitingForARowLock() {
+        val pairId = createPair()
+        worker.enqueue(pairId)
+        val claim = requireNotNull(claims.claimForPair(pairId))
+        jdbc.update(
+            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() + INTERVAL '1 second' WHERE id = ?",
+            claim.attemptId,
+        )
+        val blocker = dataSource.connection
+        blocker.autoCommit = false
+        blocker.prepareStatement("SELECT id FROM permission_sync_attempts WHERE id = ? FOR UPDATE").use { statement ->
+            statement.setLong(1, claim.attemptId)
+            statement.executeQuery().use { result -> assertThat(result.next()).isTrue() }
+        }
+        val callStarted = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val failure = executor.submit<Boolean> {
+                callStarted.countDown()
+                claims.fail(claim, IllegalStateException("late failure"))
+            }
+            assertThat(callStarted.await(10, TimeUnit.SECONDS)).isTrue()
+            Thread.sleep(1_200)
+            blocker.commit()
+
+            assertThat(failure.get(10, TimeUnit.SECONDS)).isEqualTo(false)
+            val attempt = attempts.findById(claim.attemptId).orElseThrow()
+            assertThat(attempt.status).isEqualTo(AttemptStatus.IN_PROGRESS)
+            assertThat(attempt.errorMessage).isNull()
+        } finally {
+            runCatching { blocker.rollback() }
+            blocker.close()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun permissionOwnerCannotUpdateCountsAfterItsLeaseExpiresWhileWaitingForARowLock() {
+        val pairId = createPair()
+        worker.enqueue(pairId)
+        val claim = requireNotNull(claims.claimForPair(pairId))
+        jdbc.update(
+            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() + INTERVAL '1 second' WHERE id = ?",
+            claim.attemptId,
+        )
+        val blocker = dataSource.connection
+        blocker.autoCommit = false
+        blocker.prepareStatement("SELECT id FROM permission_sync_attempts WHERE id = ? FOR UPDATE").use { statement ->
+            statement.setLong(1, claim.attemptId)
+            statement.executeQuery().use { result -> assertThat(result.next()).isTrue() }
+        }
+        val callStarted = CountDownLatch(1)
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val update = executor.submit<Boolean> {
+                callStarted.countDown()
+                claims.updateCounts(claim, total = 9, errors = 3)
+            }
+            assertThat(callStarted.await(10, TimeUnit.SECONDS)).isTrue()
+            Thread.sleep(1_200)
+            blocker.commit()
+
+            assertThat(update.get(10, TimeUnit.SECONDS)).isEqualTo(false)
+            val attempt = attempts.findById(claim.attemptId).orElseThrow()
+            assertThat(attempt.totalDocsSynced).isZero()
+            assertThat(attempt.docsWithPermissionErrors).isZero()
+        } finally {
+            runCatching { blocker.rollback() }
+            blocker.close()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun permissionLeaseDecisionsExtensionsAndTerminalTimesUseTheDatabaseClock() {
+        val expiredPair = createPair()
+        val renewedPair = createPair()
+        val completedPair = createPair()
+        listOf(expiredPair, renewedPair, completedPair).forEach(worker::enqueue)
+        val expiredClaim = requireNotNull(claims.claimForPair(expiredPair))
+        val renewedClaim = requireNotNull(claims.claimForPair(renewedPair))
+        val completedClaim = requireNotNull(claims.claimForPair(completedPair))
+        jdbc.update(
+            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE id = ?",
+            expiredClaim.attemptId,
+        )
+        val databaseBefore = requireNotNull(
+            jdbc.queryForObject("SELECT clock_timestamp()", Instant::class.java),
+        )
+
+        val expiredRenewed: Boolean
+        val activeRenewed: Boolean
+        val completed: Boolean
+        mockStatic(Instant::class.java, CALLS_REAL_METHODS).use { clock ->
+            clock.`when`<Instant> { Instant.now() }.thenReturn(Instant.EPOCH)
+            expiredRenewed = claims.renew(expiredClaim)
+            activeRenewed = claims.renew(renewedClaim)
+            completed = claims.complete(completedClaim, AttemptStatus.SUCCESS)
+        }
+
+        assertThat(expiredRenewed).isFalse()
+        assertThat(activeRenewed).isTrue()
+        assertThat(completed).isTrue()
+        assertThat(attempts.findById(renewedClaim.attemptId).orElseThrow().leaseExpiresAt)
+            .isAfter(databaseBefore.plusSeconds(59))
+        assertThat(attempts.findById(completedClaim.attemptId).orElseThrow().timeFinished)
+            .isAfterOrEqualTo(databaseBefore)
+    }
+
+    @Test
+    fun aclDatabaseSaveRollsBackWhenTheLeaseExpiresWhileWaitingForADocumentLock() {
+        val pairId = createPair()
+        val previous = ExternalAccess(setOf("previous@example.com"), isPublic = false)
+        val replacement = ExternalAccess(isPublic = true)
+        saveDocument(pairId, "one", previous)
+        permissionLoad(
+            ConnectorBatch(
+                documents = listOf(permissionDocument("one", replacement)),
+                checkpoint = checkpoint(),
+            ),
+        )
+        worker.enqueue(pairId)
+        val claim = requireNotNull(claims.claimForPair(pairId))
+        jdbc.execute(
+            """
+                CREATE FUNCTION shorten_permission_lease() RETURNS trigger AS ${'$'}${'$'}
+                BEGIN
+                    NEW.lease_expires_at := clock_timestamp() + INTERVAL '1 second';
+                    RETURN NEW;
+                END;
+                ${'$'}${'$'} LANGUAGE plpgsql
+            """.trimIndent(),
+        )
+        jdbc.execute(
+            """
+                CREATE TRIGGER shorten_permission_lease
+                BEFORE UPDATE OF lease_expires_at ON permission_sync_attempts
+                FOR EACH ROW EXECUTE FUNCTION shorten_permission_lease()
+            """.trimIndent(),
+        )
+        val documentId = requireNotNull(documents.findByCcPairIdAndSourceDocumentId(pairId, "one")?.id)
+        val blocker = dataSource.connection
+        blocker.autoCommit = false
+        blocker.prepareStatement("SELECT id FROM indexed_documents WHERE id = ? FOR UPDATE").use { statement ->
+            statement.setLong(1, documentId)
+            statement.executeQuery().use { result -> assertThat(result.next()).isTrue() }
+        }
+        val privateWrite = CountDownLatch(1)
+        val writes = AtomicInteger()
+        doAnswer {
+            writes.incrementAndGet()
+            privateWrite.countDown()
+            Unit
+        }.`when`(indexer).updateAccess(
+            org.mockito.ArgumentMatchers.eq(pairId),
+            org.mockito.ArgumentMatchers.anyMap(),
+        )
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            val processing = executor.submit { worker.process(claim) }
+            assertThat(privateWrite.await(10, TimeUnit.SECONDS)).isTrue()
+            assertThat(awaitBlockedDocumentUpdate()).isTrue()
+            Thread.sleep(1_200)
+            blocker.commit()
+            processing.get(10, TimeUnit.SECONDS)
+
+            assertAccess(pairId, "one", previous)
+            assertThat(writes.get()).isEqualTo(1)
+            assertThat(attempts.findById(claim.attemptId).orElseThrow().status)
+                .isEqualTo(AttemptStatus.IN_PROGRESS)
+        } finally {
+            runCatching { blocker.rollback() }
+            blocker.close()
+            executor.shutdownNow()
+            jdbc.execute("DROP TRIGGER shorten_permission_lease ON permission_sync_attempts")
+            jdbc.execute("DROP FUNCTION shorten_permission_lease()")
+        }
+    }
+
+    @Test
     fun crashedPermissionAttemptIsReclaimedWithFreshToken() {
         val pairId = createPair()
-        val now = Instant.parse("2026-09-01T00:00:00Z")
         worker.enqueue(pairId)
-        val first = requireNotNull(claims.claimNext(now))
+        val first = requireNotNull(claims.claimNext())
         jdbc.update(
-            "UPDATE permission_sync_attempts SET lease_expires_at = ? WHERE id = ?",
-            java.sql.Timestamp.from(now.minusSeconds(1)),
+            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE id = ?",
             first.attemptId,
         )
 
-        val reclaimed = requireNotNull(claims.claimNext(now.plusSeconds(1)))
+        val reclaimed = requireNotNull(claims.claimNext())
 
         assertThat(reclaimed.attemptId).isEqualTo(first.attemptId)
         assertThat(reclaimed.token).isNotEqualTo(first.token)
@@ -751,6 +932,27 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         assertThat(mapper.treeToValue(stored, ExternalAccess::class.java)).isEqualTo(expected)
     }
 
+    private fun awaitBlockedDocumentUpdate(): Boolean {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (System.nanoTime() < deadline) {
+            val blocked = jdbc.queryForObject(
+                """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_stat_activity
+                        WHERE pid <> pg_backend_pid()
+                          AND wait_event_type = 'Lock'
+                          AND query ILIKE '%update indexed_documents%'
+                    )
+                """.trimIndent(),
+                Boolean::class.java,
+            ) == true
+            if (blocked) return true
+            Thread.sleep(25)
+        }
+        return false
+    }
+
     private fun realWorker(server: MockWebServer): PermissionSyncWorker = PermissionSyncWorker(
         admin,
         pairs,
@@ -767,6 +969,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
             ),
             WebClient.builder(),
             mapper,
+            externalWrites,
         ),
         mapper,
     )

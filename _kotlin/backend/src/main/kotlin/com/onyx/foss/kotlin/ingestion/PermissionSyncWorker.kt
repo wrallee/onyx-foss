@@ -29,19 +29,21 @@ data class PermissionSyncClaim(
 @Service
 class PermissionSyncClaimService(
     private val attempts: PermissionSyncAttemptRepository,
+    private val documents: IndexedDocumentRepository,
 ) {
     @Transactional
     fun enqueue(pairId: Long): Boolean = attempts.createOrCoalesce(pairId) == 1
 
     @Transactional
-    fun claimNext(now: Instant = Instant.now()): PermissionSyncClaim? =
-        attempts.lockNextClaimable(now)?.let { claim(it, now) }
+    fun claimNext(): PermissionSyncClaim? =
+        attempts.lockNextClaimable()?.let(::claim)
 
     @Transactional
-    fun claimForPair(pairId: Long, now: Instant = Instant.now()): PermissionSyncClaim? =
-        attempts.lockClaimableForPair(pairId, now)?.let { claim(it, now) }
+    fun claimForPair(pairId: Long): PermissionSyncClaim? =
+        attempts.lockClaimableForPair(pairId)?.let(::claim)
 
-    private fun claim(attempt: com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity, now: Instant): PermissionSyncClaim {
+    private fun claim(attempt: com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity): PermissionSyncClaim {
+        val now = attempts.databaseNow()
         val token = UUID.randomUUID()
         val reclaimed = attempt.status == AttemptStatus.IN_PROGRESS
         attempt.status = AttemptStatus.IN_PROGRESS
@@ -56,18 +58,33 @@ class PermissionSyncClaimService(
 
     @Transactional
     fun renew(claim: PermissionSyncClaim): Boolean {
-        val attempt = lockLiveOwner(claim) ?: return false
-        attempt.leaseExpiresAt = Instant.now().plus(PERMISSION_SYNC_LEASE)
-        attempts.saveAndFlush(attempt)
+        val owner = lockLiveOwner(claim) ?: return false
+        owner.attempt.leaseExpiresAt = owner.now.plus(PERMISSION_SYNC_LEASE)
+        attempts.saveAndFlush(owner.attempt)
         return true
     }
 
     @Transactional
     fun updateCounts(claim: PermissionSyncClaim, total: Int, errors: Int): Boolean {
-        val attempt = lockLiveOwner(claim) ?: return false
-        attempt.totalDocsSynced = total
-        attempt.docsWithPermissionErrors = errors
-        attempts.saveAndFlush(attempt)
+        val owner = lockLiveOwner(claim) ?: return false
+        owner.attempt.totalDocsSynced = total
+        owner.attempt.docsWithPermissionErrors = errors
+        attempts.saveAndFlush(owner.attempt)
+        return true
+    }
+
+    @Transactional
+    fun saveDocumentAccess(
+        claim: PermissionSyncClaim,
+        storedDocuments: List<IndexedDocumentEntity>,
+        accessByDocument: Map<String, JsonNode?>,
+    ): Boolean {
+        val owner = lockLiveOwner(claim) ?: return false
+        storedDocuments.forEach { document ->
+            document.externalAccess = accessByDocument[document.sourceDocumentId]
+        }
+        documents.saveAllAndFlush(storedDocuments)
+        if (!isLive(owner.attempt, attempts.databaseNow())) throw StalePermissionClaimException()
         return true
     }
 
@@ -87,13 +104,14 @@ class PermissionSyncClaimService(
         claim: PermissionSyncClaim,
         update: (com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity) -> Unit,
     ): Boolean {
-        val attempt = lockLiveOwner(claim) ?: return false
+        val owner = lockLiveOwner(claim) ?: return false
+        val attempt = owner.attempt
         val followUpRequested = attempt.followUpRequested
         update(attempt)
         attempt.claimToken = null
         attempt.leaseExpiresAt = null
         attempt.followUpRequested = false
-        attempt.timeFinished = Instant.now()
+        attempt.timeFinished = owner.now
         attempts.saveAndFlush(attempt)
         if (followUpRequested) {
             attempts.save(
@@ -105,9 +123,22 @@ class PermissionSyncClaimService(
 
     private fun lockLiveOwner(
         claim: PermissionSyncClaim,
-    ): com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity? =
-        attempts.lockOwned(claim.attemptId, claim.token)
-            ?.takeIf { it.leaseExpiresAt?.isAfter(Instant.now()) == true }
+    ): LivePermissionOwner? {
+        val attempt = attempts.lockOwned(claim.attemptId, claim.token) ?: return null
+        val now = attempts.databaseNow()
+        return attempt.takeIf { isLive(it, now) }?.let { LivePermissionOwner(it, now) }
+    }
+
+    private fun isLive(
+        attempt: com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity,
+        now: Instant,
+    ): Boolean = attempt.status == AttemptStatus.IN_PROGRESS &&
+        attempt.leaseExpiresAt?.isAfter(now) == true
+
+    private data class LivePermissionOwner(
+        val attempt: com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity,
+        val now: Instant,
+    )
 }
 
 @Component
@@ -267,21 +298,18 @@ class PermissionSyncWorker(
         val previousAccess = previousJson.mapNotNull { (sourceDocumentId, value) ->
             value?.let { sourceDocumentId to mapper.treeToValue(it, ExternalAccess::class.java) }
         }.toMap()
-        val targetAccess = storedDocuments.associate { document ->
-            document.sourceDocumentId to mapper.treeToValue(
-                requireNotNull(rowsById[document.sourceDocumentId]).externalAccess,
-                ExternalAccess::class.java,
-            )
+        val targetJson = storedDocuments.associate { document ->
+            document.sourceDocumentId to requireNotNull(rowsById[document.sourceDocumentId]).externalAccess
+        }
+        val targetAccess = targetJson.mapValues { (_, access) ->
+            mapper.treeToValue(access, ExternalAccess::class.java)
         }
         val privateFence = targetAccess.keys.associateWith { PRIVATE_ACCESS }
         renew(claim)
         indexer.updateAccess(pairId, privateFence)
         renew(claim)
-        storedDocuments.forEach { document ->
-            document.externalAccess = requireNotNull(rowsById[document.sourceDocumentId]).externalAccess
-        }
         try {
-            documents.saveAllAndFlush(storedDocuments)
+            if (!claims.saveDocumentAccess(claim, storedDocuments, targetJson)) throw StalePermissionClaimException()
         } catch (error: Exception) {
             restoreAfterDatabaseFailure(claim, pairId, storedDocuments, previousJson, previousAccess, privateFence)
             throw error
@@ -308,9 +336,8 @@ class PermissionSyncWorker(
         runCatching { indexer.updateAccess(pairId, privateFence) }
         if (!claims.renew(claim)) return
         val databaseRestored = runCatching {
-            storedDocuments.forEach { document -> document.externalAccess = previousJson[document.sourceDocumentId] }
-            documents.saveAllAndFlush(storedDocuments)
-        }.isSuccess
+            claims.saveDocumentAccess(claim, storedDocuments, previousJson)
+        }.getOrDefault(false)
         if (!databaseRestored || previousAccess.isEmpty()) return
         if (!claims.renew(claim)) return
         if (runCatching { indexer.updateAccess(pairId, previousAccess) }.isFailure) {
