@@ -22,7 +22,7 @@ import com.onyx.foss.kotlin.domain.PermissionSyncAttemptRepository
 import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
 import com.onyx.foss.kotlin.service.AdminService
 import com.onyx.foss.kotlin.service.FileStorageService
-import com.onyx.foss.kotlin.support.PostgresIntegrationTest
+import com.onyx.foss.kotlin.support.H2IntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -47,7 +47,7 @@ import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put
 
 @AutoConfigureMockMvc
-class AdminApiIntegrationTest : PostgresIntegrationTest() {
+class AdminApiIntegrationTest : H2IntegrationTest() {
     @Autowired private lateinit var mvc: MockMvc
     @Autowired private lateinit var mapper: ObjectMapper
     @Autowired private lateinit var admin: AdminService
@@ -67,11 +67,10 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
 
     @BeforeEach
     fun resetDatabase() {
-        jdbc.execute(
-            "TRUNCATE permission_sync_staging, permission_sync_attempts, document_set_sync_outbox, ingestion_errors, " +
-                "ingestion_jobs, ingestion_attempts, ingestion_checkpoints, indexed_documents, document_set_cc_pairs, " +
-                "document_sets, connector_credential_pairs, " +
-                "connectors, credentials RESTART IDENTITY CASCADE",
+        truncateTables(
+            "permission_sync_staging", "permission_sync_attempts", "document_set_sync_outbox", "ingestion_errors",
+            "ingestion_jobs", "ingestion_attempts", "ingestion_checkpoints", "indexed_documents",
+            "document_set_cc_pairs", "document_sets", "connector_credential_pairs", "connectors", "credentials",
         )
     }
 
@@ -346,7 +345,10 @@ class AdminApiIntegrationTest : PostgresIntegrationTest() {
         val connectorId = createConnector("github")
         val credentialId = createCredential("github", "secret-token")
         val pairId = associate(connectorId, credentialId)
-        jobs.saveAndFlush(jobs.findAll().single().apply { state = JobState.SUCCEEDED })
+        jobs.saveAndFlush(jobs.findAll().single().apply {
+            state = JobState.SUCCEEDED
+            activeMarker = null
+        })
         attempts.saveAndFlush(
             attempts.findAllByCcPairIdOrderByIdDesc(pairId).single().apply { status = AttemptStatus.SUCCESS },
         )

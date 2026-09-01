@@ -4,28 +4,30 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import io.netty.handler.ssl.SslContextBuilder
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.mockito.ArgumentMatchers.any
 import org.mockito.ArgumentMatchers.anyString
 import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.mock
+import org.springframework.http.HttpMethod
 import org.springframework.http.MediaType
+import org.springframework.http.client.reactive.ReactorClientHttpConnector
 import org.springframework.web.reactive.function.client.WebClient
 import org.testcontainers.containers.GenericContainer
 import org.testcontainers.junit.jupiter.Container
 import org.testcontainers.junit.jupiter.Testcontainers
 import org.testcontainers.utility.DockerImageName
 import org.testcontainers.containers.wait.strategy.Wait
+import reactor.netty.http.client.HttpClient
 import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.time.Instant
@@ -40,12 +42,13 @@ import kotlin.concurrent.withLock
 import okio.Buffer
 
 @Testcontainers
+@Tag("opensearch-integration")
 class OpenSearchIndexerIntegrationTest {
     private val mapper = jacksonObjectMapper().findAndRegisterModules()
         .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
-    private val client = WebClient.builder().build()
+    private val client = insecureClient()
     private val index = "indexer-test-${UUID.randomUUID()}"
-    private val baseUrl get() = "http://${openSearch.host}:${openSearch.getMappedPort(9200)}"
+    private val baseUrl get() = "https://${openSearch.host}:${openSearch.getMappedPort(9200)}"
     private val migrationLock = ReentrantLock()
     private val externalWrites = mock(PairExternalWriteFence::class.java).also { fence ->
         doAnswer { invocation ->
@@ -145,9 +148,8 @@ class OpenSearchIndexerIntegrationTest {
         val firstReindex = CountDownLatch(1)
         val releaseFirstReindex = CountDownLatch(1)
         val writerStarted = CountDownLatch(1)
-        val proxyClient = OkHttpClient()
         MockWebServer().use { proxy ->
-            proxy.dispatcher = pausingProxy(proxyClient, firstReindex, releaseFirstReindex)
+            proxy.dispatcher = pausingProxy(firstReindex, releaseFirstReindex)
             proxy.start()
             val migratingReplica = indexer(proxy.url("/").toString().trimEnd('/'))
             val writingReplica = indexer(proxy.url("/").toString().trimEnd('/'))
@@ -183,8 +185,6 @@ class OpenSearchIndexerIntegrationTest {
             } finally {
                 releaseFirstReindex.countDown()
                 executor.shutdownNow()
-                proxyClient.dispatcher.executorService.shutdown()
-                proxyClient.connectionPool.evictAll()
             }
         }
 
@@ -204,10 +204,8 @@ class OpenSearchIndexerIntegrationTest {
         val secondReindex = CountDownLatch(1)
         val releaseFirstReindex = CountDownLatch(1)
         val reindexCalls = AtomicInteger()
-        val proxyClient = OkHttpClient()
         MockWebServer().use { proxy ->
             proxy.dispatcher = pausingProxy(
-                proxyClient,
                 firstReindex,
                 releaseFirstReindex,
                 reindexCalls,
@@ -242,8 +240,6 @@ class OpenSearchIndexerIntegrationTest {
             } finally {
                 releaseFirstReindex.countDown()
                 executor.shutdownNow()
-                proxyClient.dispatcher.executorService.shutdown()
-                proxyClient.connectionPool.evictAll()
             }
         }
 
@@ -272,7 +268,15 @@ class OpenSearchIndexerIntegrationTest {
     }
 
     private fun indexer(url: String = baseUrl): OpenSearchIndexer = OpenSearchIndexer(
-        OnyxProperties(opensearch = OnyxProperties.OpenSearch(baseUrl = url, index = index)),
+        OnyxProperties(
+            opensearch = OnyxProperties.OpenSearch(
+                baseUrl = url,
+                index = index,
+                username = ADMIN_USERNAME,
+                password = ADMIN_PASSWORD,
+                verifyCerts = false,
+            ),
+        ),
         WebClient.builder(),
         mapper,
         externalWrites,
@@ -337,7 +341,6 @@ class OpenSearchIndexerIntegrationTest {
     )
 
     private fun pausingProxy(
-        proxyClient: OkHttpClient,
         firstReindex: CountDownLatch,
         releaseFirstReindex: CountDownLatch,
         reindexCalls: AtomicInteger = AtomicInteger(),
@@ -355,26 +358,34 @@ class OpenSearchIndexerIntegrationTest {
                     }
                 }
                 val method = requireNotNull(request.method)
-                val contentType = request.getHeader("Content-Type")?.toMediaTypeOrNull()
-                val requestBody = if (method in setOf("POST", "PUT", "PATCH")) {
-                    request.body.clone().readByteArray().toRequestBody(contentType)
+                val upstream = client.method(HttpMethod.valueOf(method)).uri(baseUrl + requireNotNull(request.path))
+                val contentType = request.getHeader("Content-Type")
+                if (contentType != null) upstream.header("Content-Type", contentType)
+                val response = (if (method in setOf("POST", "PUT", "PATCH")) {
+                    upstream.bodyValue(request.body.clone().readByteArray())
                 } else {
-                    null
-                }
-                val upstreamRequest = Request.Builder()
-                    .url(baseUrl + requireNotNull(request.path))
-                    .method(method, requestBody)
-                    .apply { request.getHeader("Content-Type")?.let { header("Content-Type", it) } }
-                    .build()
-                return proxyClient.newCall(upstreamRequest).execute().use { response ->
-                    MockResponse().setResponseCode(response.code)
-                        .apply {
-                            response.header("Content-Type")?.let { setHeader("Content-Type", it) }
-                            response.body?.bytes()?.let { setBody(Buffer().write(it)) }
-                        }
+                    upstream
+                }).exchangeToMono { result ->
+                    result.bodyToMono(ByteArray::class.java).defaultIfEmpty(ByteArray(0)).map { body ->
+                        Triple(result.statusCode().value(), result.headers().asHttpHeaders().contentType, body)
+                    }
+                }.block(Duration.ofSeconds(30)) ?: error("OpenSearch proxy returned no response")
+                return MockResponse().setResponseCode(response.first).apply {
+                    response.second?.let { setHeader("Content-Type", it.toString()) }
+                    setBody(Buffer().write(response.third))
                 }
             }
         }
+    }
+
+    private fun insecureClient(): WebClient {
+        val sslContext = SslContextBuilder.forClient()
+            .trustManager(InsecureTrustManagerFactory.INSTANCE)
+            .build()
+        return WebClient.builder()
+            .defaultHeaders { it.setBasicAuth(ADMIN_USERNAME, ADMIN_PASSWORD) }
+            .clientConnector(ReactorClientHttpConnector(HttpClient.create().secure { it.sslContext(sslContext) }))
+            .build()
     }
 
     private fun mappingProperties(): JsonNode = get("/$index/_mapping").fields().next().value
@@ -385,25 +396,33 @@ class OpenSearchIndexerIntegrationTest {
     )
 
     companion object {
+        private const val ADMIN_USERNAME = "admin"
+        private const val ADMIN_PASSWORD = "OpenSearchTest1!"
+
         @Container
         @JvmStatic
         val openSearch: GenericContainer<Nothing> = GenericContainer<Nothing>(
             DockerImageName.parse("opensearchproject/opensearch:3.6.0"),
         ).apply {
             withEnv("discovery.type", "single-node")
-            withEnv("DISABLE_SECURITY_PLUGIN", "true")
+            withEnv("OPENSEARCH_INITIAL_ADMIN_PASSWORD", ADMIN_PASSWORD)
             withEnv("OPENSEARCH_JAVA_OPTS", "-Xms512m -Xmx512m")
             withCreateContainerCmdModifier { command ->
                 command.withHostConfig(
                     requireNotNull(command.hostConfig)
-                        .withMemory(2L * 1024 * 1024 * 1024)
-                        .withMemorySwap(2L * 1024 * 1024 * 1024)
+                        .withMemory(1536L * 1024 * 1024)
+                        .withMemorySwap(1536L * 1024 * 1024)
                         .withNanoCPUs(1_000_000_000L)
-                        .withPidsLimit(256L),
+                        .withPidsLimit(512L),
                 )
             }
             withExposedPorts(9200)
-            waitingFor(Wait.forHttp("/_cluster/health"))
+            waitingFor(
+                Wait.forSuccessfulCommand(
+                    "curl -fkSs -u admin:${'$'}OPENSEARCH_INITIAL_ADMIN_PASSWORD " +
+                        "https://localhost:9200/_cluster/health >/dev/null",
+                ),
+            )
             withStartupTimeout(Duration.ofMinutes(2))
         }
     }

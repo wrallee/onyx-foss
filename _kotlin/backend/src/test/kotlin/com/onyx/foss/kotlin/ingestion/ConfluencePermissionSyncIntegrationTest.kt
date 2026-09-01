@@ -13,7 +13,7 @@ import com.onyx.foss.kotlin.domain.IndexedDocumentEntity
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.domain.PermissionSyncAttemptRepository
 import com.onyx.foss.kotlin.security.CredentialCipher
-import com.onyx.foss.kotlin.support.PostgresIntegrationTest
+import com.onyx.foss.kotlin.support.H2IntegrationTest
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -25,7 +25,7 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
 
-class ConfluencePermissionSyncIntegrationTest : PostgresIntegrationTest() {
+class ConfluencePermissionSyncIntegrationTest : H2IntegrationTest() {
     @Autowired private lateinit var worker: PermissionSyncWorker
     @Autowired private lateinit var mapper: ObjectMapper
     @Autowired private lateinit var cipher: CredentialCipher
@@ -39,10 +39,10 @@ class ConfluencePermissionSyncIntegrationTest : PostgresIntegrationTest() {
 
     @BeforeEach
     fun resetDatabase() {
-        jdbc.execute(
-            "TRUNCATE permission_sync_staging, permission_sync_attempts, ingestion_errors, ingestion_jobs, " +
-                "ingestion_attempts, ingestion_checkpoints, indexed_documents, connector_credential_pairs, " +
-                "connectors, credentials RESTART IDENTITY CASCADE",
+        truncateTables(
+            "permission_sync_staging", "permission_sync_attempts", "ingestion_errors", "ingestion_jobs",
+            "ingestion_attempts", "ingestion_checkpoints", "indexed_documents", "connector_credential_pairs",
+            "connectors", "credentials",
         )
     }
 

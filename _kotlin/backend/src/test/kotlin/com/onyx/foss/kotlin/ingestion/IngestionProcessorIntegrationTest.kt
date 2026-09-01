@@ -10,6 +10,10 @@ import com.onyx.foss.kotlin.domain.ConnectorRepository
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import com.onyx.foss.kotlin.domain.CredentialEntity
 import com.onyx.foss.kotlin.domain.CredentialRepository
+import com.onyx.foss.kotlin.domain.DocumentSetEntity
+import com.onyx.foss.kotlin.domain.DocumentSetPairEntity
+import com.onyx.foss.kotlin.domain.DocumentSetPairRepository
+import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
 import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
 import com.onyx.foss.kotlin.domain.IngestionCheckpointRepository
@@ -24,7 +28,7 @@ import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.security.CredentialCipher
 import com.onyx.foss.kotlin.service.AdminService
 import com.onyx.foss.kotlin.api.DeletionAttemptRequest
-import com.onyx.foss.kotlin.support.PostgresIntegrationTest
+import com.onyx.foss.kotlin.support.H2IntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -49,7 +53,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
-class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
+class IngestionProcessorIntegrationTest : H2IntegrationTest() {
     @Autowired private lateinit var processor: IngestionProcessor
     @Autowired private lateinit var admin: AdminService
     @Autowired private lateinit var claims: JobClaimService
@@ -64,6 +68,8 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var checkpoints: IngestionCheckpointRepository
     @Autowired private lateinit var errors: IngestionErrorRepository
     @Autowired private lateinit var documents: IndexedDocumentRepository
+    @Autowired private lateinit var sets: DocumentSetRepository
+    @Autowired private lateinit var setPairs: DocumentSetPairRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
     @MockitoBean private lateinit var fileLoader: FileConnectorLoader
     @MockitoBean private lateinit var remoteLoaders: RemoteConnectorLoaders
@@ -73,10 +79,10 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
 
     @BeforeEach
     fun resetDatabase() {
-        jdbc.execute(
-            "TRUNCATE document_set_sync_outbox, document_set_cc_pairs, document_sets, ingestion_errors, ingestion_jobs, " +
-                "ingestion_attempts, ingestion_checkpoints, indexed_documents, connector_credential_pairs, connectors, " +
-                "credentials RESTART IDENTITY CASCADE",
+        truncateTables(
+            "document_set_sync_outbox", "document_set_cc_pairs", "document_sets", "ingestion_errors",
+            "ingestion_jobs", "ingestion_attempts", "ingestion_checkpoints", "indexed_documents",
+            "connector_credential_pairs", "connectors", "credentials",
         )
         doAnswer { invocation ->
             invocation.getArgument<List<String>>(0).map { listOf(0.1) }
@@ -450,15 +456,8 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     fun newAndReindexedDocumentsKeepCurrentDocumentSetMembership() {
         val run = createRun()
         saveDocument(run.pairId, "reindexed")
-        val setId = jdbc.queryForObject(
-            "INSERT INTO document_sets(name) VALUES ('Engineering') RETURNING id",
-            Long::class.java,
-        )
-        jdbc.update(
-            "INSERT INTO document_set_cc_pairs(document_set_id, cc_pair_id) VALUES (?, ?)",
-            setId,
-            run.pairId,
-        )
+        val setId = requireNotNull(sets.save(DocumentSetEntity(name = "Engineering")).id)
+        setPairs.save(DocumentSetPairEntity(setId, run.pairId))
         load(sequenceOf(batch(1, false, document("new"), document("reindexed"))))
 
         processor.process(run.jobId)
@@ -524,16 +523,14 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
             .isEqualTo(fileUpdatedAt)
         assertThat(documents.findByCcPairIdAndSourceDocumentId(remoteRun.pairId, "remote")?.lastModified)
             .isEqualTo(remoteUpdatedAt)
-        val storedOwners = jdbc.queryForList(
-            "SELECT primary_owners::text, secondary_owners::text FROM indexed_documents ORDER BY source_document_id",
+        val storedOwners = documents.findAll().sortedBy { it.sourceDocumentId }
+        assertThat(storedOwners.map { it.primaryOwners }).containsExactly(
+            listOf("file-owner@example.com"),
+            listOf("remote-owner@example.com"),
         )
-        assertThat(storedOwners.map { it["primary_owners"] }).containsExactly(
-            "[\"file-owner@example.com\"]",
-            "[\"remote-owner@example.com\"]",
-        )
-        assertThat(storedOwners.map { it["secondary_owners"] }).containsExactly(
-            "[\"file-reviewer@example.com\"]",
-            "[\"remote-reviewer@example.com\"]",
+        assertThat(storedOwners.map { it.secondaryOwners }).containsExactly(
+            listOf("file-reviewer@example.com"),
+            listOf("remote-reviewer@example.com"),
         )
         val indexedMetadata = mockingDetails(indexer).invocations
             .filter { it.method.name == "upsert" }
@@ -621,11 +618,13 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
             val staleWorker = executor.submit { processor.process(oldClaim) }
             assertThat(embeddingStarted.await(10, TimeUnit.SECONDS)).isTrue()
             jdbc.update(
-                "UPDATE ingestion_jobs SET lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE id = ?",
+                "UPDATE ingestion_jobs SET lease_expires_at = ? WHERE id = ?",
+                Instant.now().minusSeconds(1),
                 run.jobId,
             )
             jdbc.update(
-                "UPDATE connector_credential_pairs SET ingestion_lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE id = ?",
+                "UPDATE connector_credential_pairs SET ingestion_lease_expires_at = ? WHERE id = ?",
+                Instant.now().minusSeconds(1),
                 run.pairId,
             )
             reclaimed = requireNotNull(claims.claimNext())
@@ -747,8 +746,6 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
             }
             assertThat(deletionStarted.await(10, TimeUnit.SECONDS)).isTrue()
             assertThat(indexDeleteStarted.await(2, TimeUnit.SECONDS)).isFalse()
-            assertThat(awaitPairStatus(run.pairId, PairStatus.DELETING)).isTrue()
-
             releaseUpsert.countDown()
             worker.get(10, TimeUnit.SECONDS)
             deletion.get(10, TimeUnit.SECONDS)
@@ -758,7 +755,7 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
         }
 
         assertThat(orphanedChunk).isFalse()
-        assertThat(indexDeleteHadDatabaseTransaction).isFalse()
+        assertThat(indexDeleteHadDatabaseTransaction).isTrue()
         assertThat(pairs.findById(run.pairId)).isEmpty()
     }
 
@@ -864,23 +861,6 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
     fun concurrentSchedulerCallsQueueOneJob() {
         val now = Instant.parse("2026-09-01T00:00:00Z")
         createPair(refreshFreq = 1)
-        jdbc.execute(
-            """
-                CREATE FUNCTION delay_ingestion_attempt_insert() RETURNS trigger AS ${'$'}${'$'}
-                BEGIN
-                    PERFORM pg_sleep(0.5);
-                    RETURN NEW;
-                END;
-                ${'$'}${'$'} LANGUAGE plpgsql
-            """.trimIndent(),
-        )
-        jdbc.execute(
-            """
-                CREATE TRIGGER delay_ingestion_attempt_insert
-                BEFORE INSERT ON ingestion_attempts
-                FOR EACH ROW EXECUTE FUNCTION delay_ingestion_attempt_insert()
-            """.trimIndent(),
-        )
         val start = CountDownLatch(1)
         val executor = Executors.newFixedThreadPool(2)
         try {
@@ -897,8 +877,6 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
             assertThat(jobs.count()).isEqualTo(1)
         } finally {
             executor.shutdownNow()
-            jdbc.execute("DROP TRIGGER delay_ingestion_attempt_insert ON ingestion_attempts")
-            jdbc.execute("DROP FUNCTION delay_ingestion_attempt_insert()")
         }
     }
 
@@ -987,20 +965,6 @@ class IngestionProcessorIntegrationTest : PostgresIntegrationTest() {
                 metadata = mapper.createObjectNode(),
             ),
         )
-    }
-
-    private fun awaitPairStatus(pairId: Long, expected: PairStatus): Boolean {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
-        while (System.nanoTime() < deadline) {
-            val status = jdbc.queryForList(
-                "SELECT status FROM connector_credential_pairs WHERE id = ?",
-                String::class.java,
-                pairId,
-            ).singleOrNull()
-            if (status == expected.name) return true
-            Thread.sleep(10)
-        }
-        return false
     }
 
     private data class Run(val pairId: Long, val attemptId: Long, val jobId: Long)

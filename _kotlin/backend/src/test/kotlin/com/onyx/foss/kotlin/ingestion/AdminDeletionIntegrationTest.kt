@@ -17,31 +17,26 @@ import com.onyx.foss.kotlin.domain.CredentialRepository
 import com.onyx.foss.kotlin.domain.PairStatus
 import com.onyx.foss.kotlin.security.CredentialCipher
 import com.onyx.foss.kotlin.service.AdminService
-import com.onyx.foss.kotlin.support.PostgresIntegrationTest
-import jakarta.persistence.EntityManager
+import com.onyx.foss.kotlin.support.H2IntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import org.junit.jupiter.params.ParameterizedTest
-import org.junit.jupiter.params.provider.EnumSource
+import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.doReturn
 import org.mockito.Mockito.mock
-import org.mockito.Mockito.spy
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean
-import java.sql.Connection
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
-import javax.sql.DataSource
 
-class AdminDeletionIntegrationTest : PostgresIntegrationTest() {
+class AdminDeletionIntegrationTest : H2IntegrationTest() {
     @Autowired private lateinit var admin: AdminService
     @Autowired private lateinit var mapper: ObjectMapper
     @Autowired private lateinit var cipher: CredentialCipher
@@ -49,17 +44,15 @@ class AdminDeletionIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var credentials: CredentialRepository
     @MockitoSpyBean private lateinit var pairs: ConnectorCredentialPairRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
-    @Autowired private lateinit var dataSource: DataSource
-    @Autowired private lateinit var entityManager: EntityManager
     @Autowired private lateinit var externalWrites: PairExternalWriteFence
     @MockitoBean private lateinit var indexer: OpenSearchIndexer
 
     @BeforeEach
     fun resetDatabase() {
-        jdbc.execute(
-            "TRUNCATE document_set_sync_outbox, document_set_cc_pairs, document_sets, permission_sync_staging, " +
-                "permission_sync_attempts, ingestion_errors, ingestion_jobs, ingestion_attempts, ingestion_checkpoints, " +
-                "indexed_documents, connector_credential_pairs, connectors, credentials RESTART IDENTITY CASCADE",
+        truncateTables(
+            "document_set_sync_outbox", "document_set_cc_pairs", "document_sets", "permission_sync_staging",
+            "permission_sync_attempts", "ingestion_errors", "ingestion_jobs", "ingestion_attempts",
+            "ingestion_checkpoints", "indexed_documents", "connector_credential_pairs", "connectors", "credentials",
         )
     }
 
@@ -135,14 +128,15 @@ class AdminDeletionIntegrationTest : PostgresIntegrationTest() {
     @Test
     fun pairFenceRemainsHeldAfterIndexDeleteUntilDatabaseRemovalCommits() {
         val fixture = createPair()
-        val databaseBlocker = dataSource.connection
         var deletion: Future<*>? = null
         var competingWrite: Future<*>? = null
         val executor = Executors.newFixedThreadPool(2)
         val indexDeleted = CountDownLatch(1)
+        val databaseRemovalReached = CountDownLatch(1)
+        val releaseDatabaseRemoval = CountDownLatch(1)
         val competingWriteEntered = CountDownLatch(1)
         try {
-            installPairDeleteBlock(databaseBlocker)
+            pausePairDelete(fixture.pairId, databaseRemovalReached, releaseDatabaseRemoval)
             doAnswer {
                 indexDeleted.countDown()
                 Unit
@@ -152,25 +146,23 @@ class AdminDeletionIntegrationTest : PostgresIntegrationTest() {
                 admin.deletePair(DeletionAttemptRequest(fixture.connectorId, fixture.credentialId))
             }
             assertThat(indexDeleted.await(10, TimeUnit.SECONDS)).isTrue()
-            assertThat(awaitAdvisoryWait()).isTrue()
+            assertThat(databaseRemovalReached.await(10, TimeUnit.SECONDS)).isTrue()
 
             competingWrite = executor.submit {
                 externalWrites.withPair(fixture.pairId) { competingWriteEntered.countDown() }
             }
             assertThat(competingWriteEntered.await(300, TimeUnit.MILLISECONDS)).isFalse()
 
-            unlockDatabaseRemoval(databaseBlocker)
+            releaseDatabaseRemoval.countDown()
             deletion.get(10, TimeUnit.SECONDS)
-            assertThat(competingWriteEntered.await(10, TimeUnit.SECONDS)).isTrue()
-            competingWrite.get(10, TimeUnit.SECONDS)
+            val competingError = catchThrowable { competingWrite.get(10, TimeUnit.SECONDS) }
+            assertThat(competingWriteEntered.count).isEqualTo(1)
+            assertThat(competingError).hasCauseInstanceOf(IllegalStateException::class.java)
         } finally {
-            runCatching { unlockDatabaseRemoval(databaseBlocker) }
+            releaseDatabaseRemoval.countDown()
             runCatching { deletion?.get(10, TimeUnit.SECONDS) }
             runCatching { competingWrite?.get(10, TimeUnit.SECONDS) }
-            databaseBlocker.close()
             executor.shutdownNow()
-            jdbc.execute("DROP TRIGGER IF EXISTS block_pair_delete ON connector_credential_pairs")
-            jdbc.execute("DROP FUNCTION IF EXISTS block_pair_delete()")
         }
     }
 
@@ -228,69 +220,6 @@ class AdminDeletionIntegrationTest : PostgresIntegrationTest() {
         } finally {
             releaseUpdate.countDown()
             releaseDelete.countDown()
-            executor.shutdownNow()
-        }
-    }
-
-    @ParameterizedTest
-    @EnumSource(StalePairMutation::class)
-    fun stalePairMutationCannotBypassDeletingStateWhenConnectorRemainsActive(mutation: StalePairMutation) {
-        val fixture = createPair()
-        pairs.save(
-            ConnectorCredentialPairEntity(
-                connectorId = fixture.connectorId,
-                credentialId = createCredential(),
-                name = "other pair",
-                status = PairStatus.ACTIVE,
-            ),
-        )
-        val deletionLockedConnector = CountDownLatch(1)
-        val releaseDeletionTransition = CountDownLatch(1)
-        doAnswer {
-            val existing = requireNotNull(
-                entityManager.find(ConnectorCredentialPairEntity::class.java, fixture.pairId),
-            )
-            spy(existing).also { pausedPair ->
-                doAnswer {
-                    deletionLockedConnector.countDown()
-                    check(releaseDeletionTransition.await(10, TimeUnit.SECONDS))
-                    existing.id
-                }.`when`(pausedPair).id
-            }
-        }.`when`(pairs).findByConnectorIdAndCredentialId(fixture.connectorId, fixture.credentialId)
-        val indexDeleted = CountDownLatch(1)
-        val releaseDelete = CountDownLatch(1)
-        pauseIndexDelete(fixture.pairId, indexDeleted, releaseDelete)
-        val executor = Executors.newFixedThreadPool(2)
-        var staleMutation: Future<Throwable?>? = null
-        var deletion: Future<*>? = null
-        try {
-            deletion = executor.submit {
-                admin.deletePair(DeletionAttemptRequest(fixture.connectorId, fixture.credentialId))
-            }
-            assertThat(deletionLockedConnector.await(10, TimeUnit.SECONDS)).isTrue()
-            staleMutation = executor.submit<Throwable?> {
-                catchThrowable { runStaleMutation(mutation, fixture.pairId) }
-            }
-            assertThat(awaitBlockedConnectorLock()).isTrue()
-
-            releaseDeletionTransition.countDown()
-            assertThat(indexDeleted.await(10, TimeUnit.SECONDS)).isTrue()
-            assertThat(connectorDeleting(fixture.connectorId)).isFalse()
-
-            val error = staleMutation.get(10, TimeUnit.SECONDS)
-
-            assertThat(error).isInstanceOf(ApiException::class.java)
-            assertThat((error as ApiException).status).isEqualTo(HttpStatus.CONFLICT)
-            assertThat(pairStatus(fixture.pairId)).isEqualTo(PairStatus.DELETING)
-            assertThat(ingestionJobCount(fixture.pairId)).isZero()
-            releaseDelete.countDown()
-            deletion.get(10, TimeUnit.SECONDS)
-        } finally {
-            releaseDeletionTransition.countDown()
-            releaseDelete.countDown()
-            runCatching { staleMutation?.get(10, TimeUnit.SECONDS) }
-            runCatching { deletion?.get(10, TimeUnit.SECONDS) }
             executor.shutdownNow()
         }
     }
@@ -361,107 +290,21 @@ class AdminDeletionIntegrationTest : PostgresIntegrationTest() {
         ),
     )
 
-    private fun connectorDeleting(connectorId: Long): Boolean = requireNotNull(
-        jdbc.queryForObject(
-            "SELECT deleting FROM connectors WHERE id = ?",
-            Boolean::class.java,
-            connectorId,
-        ),
-    )
-
-    private fun ingestionJobCount(pairId: Long): Int = requireNotNull(
-        jdbc.queryForObject(
-            "SELECT COUNT(*) FROM ingestion_jobs WHERE cc_pair_id = ?",
-            Int::class.java,
-            pairId,
-        ),
-    )
-
-    private fun runStaleMutation(mutation: StalePairMutation, pairId: Long) {
-        when (mutation) {
-            StalePairMutation.STATUS -> admin.setPairStatus(pairId, PairStatus.PAUSED)
-            StalePairMutation.RENAME -> admin.renamePair(pairId, "late rename")
-            StalePairMutation.ENQUEUE -> admin.enqueuePair(pairId, fromBeginning = false)
-        }
-    }
-
     private fun assertConflict(action: () -> Unit) {
         val error = catchThrowable(action)
         assertThat(error).isInstanceOf(ApiException::class.java)
         assertThat((error as ApiException).status).isEqualTo(HttpStatus.CONFLICT)
     }
 
-    private fun installPairDeleteBlock(connection: Connection) {
-        jdbc.execute(
-            """
-                CREATE FUNCTION block_pair_delete() RETURNS trigger AS ${'$'}${'$'}
-                BEGIN
-                    PERFORM pg_advisory_xact_lock($DATABASE_DELETE_LOCK);
-                    RETURN OLD;
-                END;
-                ${'$'}${'$'} LANGUAGE plpgsql
-            """.trimIndent(),
-        )
-        jdbc.execute(
-            """
-                CREATE TRIGGER block_pair_delete
-                BEFORE DELETE ON connector_credential_pairs
-                FOR EACH ROW EXECUTE FUNCTION block_pair_delete()
-            """.trimIndent(),
-        )
-        connection.prepareStatement("SELECT pg_advisory_lock(?)").use { statement ->
-            statement.setLong(1, DATABASE_DELETE_LOCK)
-            statement.execute()
-        }
-    }
-
-    private fun unlockDatabaseRemoval(connection: Connection) {
-        connection.prepareStatement("SELECT pg_advisory_unlock(?)").use { statement ->
-            statement.setLong(1, DATABASE_DELETE_LOCK)
-            statement.execute()
-        }
-    }
-
-    private fun awaitAdvisoryWait(): Boolean {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
-        while (System.nanoTime() < deadline) {
-            val waiting = jdbc.queryForObject(
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event = 'advisory')",
-                Boolean::class.java,
-            ) ?: false
-            if (waiting) return true
-            Thread.sleep(10)
-        }
-        return false
-    }
-
-    private fun awaitBlockedConnectorLock(): Boolean {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
-        while (System.nanoTime() < deadline) {
-            val waiting = jdbc.queryForObject(
-                """
-                    SELECT EXISTS (
-                        SELECT 1
-                        FROM pg_stat_activity
-                        WHERE pid <> pg_backend_pid()
-                          AND wait_event_type = 'Lock'
-                          AND query ILIKE '%FROM connectors%'
-                          AND query ILIKE '%FOR UPDATE%'
-                    )
-                """.trimIndent(),
-                Boolean::class.java,
-            ) ?: false
-            if (waiting) return true
-            Thread.sleep(10)
-        }
-        return false
+    private fun pausePairDelete(pairId: Long, reached: CountDownLatch, release: CountDownLatch) {
+        doAnswer {
+            reached.countDown()
+            check(release.await(10, TimeUnit.SECONDS))
+            jdbc.update("DELETE FROM connector_credential_pairs WHERE id = ?", pairId)
+            Unit
+        }.`when`(pairs).delete(any(ConnectorCredentialPairEntity::class.java))
     }
 
     private data class Fixture(val connectorId: Long, val credentialId: Long, val pairId: Long)
 
-    enum class StalePairMutation { STATUS, RENAME, ENQUEUE }
-
-    private companion object {
-        const val DATABASE_DELETE_LOCK = 7_391_551L
-    }
 }

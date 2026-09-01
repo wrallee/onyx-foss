@@ -1,12 +1,12 @@
 package com.onyx.foss.kotlin.domain
 
-import com.onyx.foss.kotlin.support.PostgresIntegrationTest
+import com.onyx.foss.kotlin.support.H2IntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
 
-class SchemaV7IntegrationTest : PostgresIntegrationTest() {
+class SchemaV7IntegrationTest : H2IntegrationTest() {
     @Autowired private lateinit var jdbc: JdbcTemplate
 
     @Test

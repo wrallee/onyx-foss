@@ -13,7 +13,7 @@ import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
 import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
 import com.onyx.foss.kotlin.security.CredentialCipher
-import com.onyx.foss.kotlin.support.PostgresIntegrationTest
+import com.onyx.foss.kotlin.support.H2IntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
@@ -26,7 +26,7 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
 
-class PruningServiceTest : PostgresIntegrationTest() {
+class PruningServiceTest : H2IntegrationTest() {
     @Autowired private lateinit var pruning: PruningService
     @Autowired private lateinit var mapper: ObjectMapper
     @Autowired private lateinit var cipher: CredentialCipher
@@ -40,9 +40,9 @@ class PruningServiceTest : PostgresIntegrationTest() {
 
     @BeforeEach
     fun resetDatabase() {
-        jdbc.execute(
-            "TRUNCATE ingestion_errors, ingestion_jobs, ingestion_attempts, ingestion_checkpoints, " +
-                "indexed_documents, connector_credential_pairs, connectors, credentials RESTART IDENTITY CASCADE",
+        truncateTables(
+            "ingestion_errors", "ingestion_jobs", "ingestion_attempts", "ingestion_checkpoints",
+            "indexed_documents", "connector_credential_pairs", "connectors", "credentials",
         )
     }
 

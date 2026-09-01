@@ -43,7 +43,7 @@ cd _kotlin
 python3 scripts/download_models.py --with-rerankers
 cp .env.example .env
 openssl rand -base64 32
-# Paste the result into ONYX_CREDENTIAL_ENCRYPTION_KEY in .env.
+# Set ONYX_CREDENTIAL_ENCRYPTION_KEY and a strong OPENSEARCH_ADMIN_PASSWORD in .env.
 docker compose config -q
 docker compose build
 docker compose up -d
@@ -86,6 +86,9 @@ Open `http://localhost:3000`. Only the Web service is published to the host.
 # Backend
 cd backend
 JAVA_HOME="$HOME/.sdkman/candidates/java/21-zulu" ./gradlew test
+
+# OpenSearch integration profile (starts one shared container)
+JAVA_HOME="$HOME/.sdkman/candidates/java/21-zulu" ./gradlew opensearchIntegrationTest
 cd ..
 
 # Web-to-PostgreSQL-to-OpenSearch File ingestion
