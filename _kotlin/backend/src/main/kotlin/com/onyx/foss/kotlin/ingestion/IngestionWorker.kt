@@ -21,13 +21,17 @@ import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.domain.JobState
 import com.onyx.foss.kotlin.domain.PairStatus
 import com.onyx.foss.kotlin.service.AdminService
+import io.netty.handler.ssl.SslContextBuilder
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory
 import org.springframework.http.MediaType
+import org.springframework.http.client.reactive.ReactorClientHttpConnector
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import org.springframework.web.reactive.function.client.WebClient
 import reactor.core.publisher.Mono
+import reactor.netty.http.client.HttpClient
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Duration
@@ -511,10 +515,20 @@ class ModelServerClient(
 @Service
 class OpenSearchIndexer(
     private val properties: OnyxProperties,
-    private val clientBuilder: WebClient.Builder,
+    clientBuilder: WebClient.Builder,
     private val mapper: ObjectMapper,
     private val externalWrites: PairExternalWriteFence,
 ) {
+    private val client = if (properties.opensearch.verifyCerts) {
+        clientBuilder.build()
+    } else {
+        val sslContext = SslContextBuilder.forClient()
+            .trustManager(InsecureTrustManagerFactory.INSTANCE)
+            .build()
+        clientBuilder.clone()
+            .clientConnector(ReactorClientHttpConnector(HttpClient.create().secure { it.sslContext(sslContext) }))
+            .build()
+    }
     private val indexReady = AtomicBoolean(false)
 
     fun deletePair(pairId: Long) {
@@ -602,7 +616,7 @@ class OpenSearchIndexer(
 
     private fun updateByQuery(body: Map<String, Any>, operation: String, minimumTotal: Int) {
         val response = withMigrationRetry {
-            clientBuilder.build()
+            client
                 .post()
                 .uri(
                     properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index +
@@ -633,7 +647,7 @@ class OpenSearchIndexer(
 
     private fun deleteByQuery(query: Map<String, Any>, operation: String) {
         val response = withMigrationRetry {
-            clientBuilder.build()
+            client
                 .post()
                 .uri(
                     properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index +
@@ -693,7 +707,7 @@ class OpenSearchIndexer(
             "is_public" to false,
         )
         val response = withMigrationRetry {
-            clientBuilder.build()
+            client
                 .put()
                 .uri(properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index + "/_doc/" + documentId + "?refresh=true")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -873,7 +887,7 @@ class OpenSearchIndexer(
     }
 
     private fun indexExists(uri: String, operation: String): Boolean =
-        clientBuilder.build().head().uri(uri).exchangeToMono { response ->
+        client.head().uri(uri).exchangeToMono { response ->
             when {
                 response.statusCode().is2xxSuccessful -> response.releaseBody().thenReturn(true)
                 response.statusCode().value() == 404 -> response.releaseBody().thenReturn(false)
@@ -884,7 +898,7 @@ class OpenSearchIndexer(
         }.block(OPENSEARCH_TIMEOUT) == true
 
     private fun getJson(uri: String, operation: String): JsonNode = requireNotNull(
-        clientBuilder.build().get().uri(uri).exchangeToMono { response ->
+        client.get().uri(uri).exchangeToMono { response ->
             if (response.statusCode().is2xxSuccessful) response.bodyToMono(JsonNode::class.java)
             else response.bodyToMono(String::class.java).flatMap {
                 Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
@@ -893,7 +907,7 @@ class OpenSearchIndexer(
     )
 
     private fun putJson(uri: String, body: Map<String, Any>, operation: String) {
-        val confirmed = clientBuilder.build().put().uri(uri)
+        val confirmed = client.put().uri(uri)
             .contentType(MediaType.APPLICATION_JSON)
             .bodyValue(mapper.valueToTree<JsonNode>(body))
             .exchangeToMono { response ->
@@ -906,7 +920,7 @@ class OpenSearchIndexer(
     }
 
     private fun putWithoutBodyJson(uri: String, operation: String): JsonNode = requireNotNull(
-        clientBuilder.build().put().uri(uri).exchangeToMono { response ->
+        client.put().uri(uri).exchangeToMono { response ->
             if (response.statusCode().is2xxSuccessful) response.bodyToMono(JsonNode::class.java)
             else response.bodyToMono(String::class.java).flatMap {
                 Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
@@ -915,7 +929,7 @@ class OpenSearchIndexer(
     )
 
     private fun postJson(uri: String, body: Map<String, Any>, operation: String): JsonNode = requireNotNull(
-        clientBuilder.build().post().uri(uri)
+        client.post().uri(uri)
             .contentType(MediaType.APPLICATION_JSON)
             .bodyValue(mapper.valueToTree<JsonNode>(body))
             .exchangeToMono { response ->

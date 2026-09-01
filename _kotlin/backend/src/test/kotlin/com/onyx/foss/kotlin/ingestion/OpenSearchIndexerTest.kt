@@ -2,6 +2,8 @@ package com.onyx.foss.kotlin.ingestion
 
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
+import io.netty.handler.ssl.SslContextBuilder
+import io.netty.handler.ssl.util.SelfSignedCertificate
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -13,6 +15,8 @@ import org.mockito.ArgumentMatchers.anyString
 import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.mock
 import org.springframework.web.reactive.function.client.WebClient
+import reactor.core.publisher.Mono
+import reactor.netty.http.server.HttpServer
 import java.time.Duration
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -23,6 +27,42 @@ class OpenSearchIndexerTest {
     private val externalWrites = mock(PairExternalWriteFence::class.java).also { fence ->
         doAnswer { invocation -> invocation.getArgument<() -> Unit>(1).invoke() }
             .`when`(fence).withOpenSearchIndex(anyString(), any<() -> Unit>() ?: {})
+    }
+
+    @Test
+    fun `accepts self-signed OpenSearch certificate when verification is disabled`() {
+        val certificate = SelfSignedCertificate("localhost")
+        val server = HttpServer.create()
+            .host("localhost")
+            .port(0)
+            .secure { ssl ->
+                ssl.sslContext(SslContextBuilder.forServer(certificate.certificate(), certificate.privateKey()).build())
+            }
+            .handle { request, response ->
+                when {
+                    request.method().name() == "HEAD" -> response.send()
+                    request.uri().endsWith("/_mapping") -> response
+                        .header("Content-Type", "application/json")
+                        .sendString(Mono.just(exactMappingResponse()))
+                    else -> response.header("Content-Type", "application/json").sendString(
+                        Mono.just("""{"timed_out":false,"total":0,"deleted":0,"version_conflicts":0,"failures":[]}"""),
+                    )
+                }
+            }
+            .bindNow()
+        try {
+            val properties = OnyxProperties(
+                opensearch = OnyxProperties.OpenSearch(
+                    baseUrl = "https://localhost:${server.port()}",
+                    verifyCerts = false,
+                ),
+            )
+
+            OpenSearchIndexer(properties, WebClient.builder(), mapper, externalWrites).deletePair(1)
+        } finally {
+            server.disposeNow()
+            certificate.delete()
+        }
     }
 
     @Test
