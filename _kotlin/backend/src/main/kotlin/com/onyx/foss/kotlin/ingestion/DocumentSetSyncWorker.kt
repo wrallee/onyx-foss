@@ -3,11 +3,12 @@ package com.onyx.foss.kotlin.ingestion
 import com.fasterxml.jackson.databind.JsonNode
 import com.onyx.foss.kotlin.config.OnyxProperties
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxEntity
+import com.onyx.foss.kotlin.domain.DocumentSetSyncClaimLockRepository
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxRepository
 import com.onyx.foss.kotlin.domain.DocumentSetSyncStatus
 import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
-import org.springframework.jdbc.core.JdbcTemplate
+import org.springframework.data.domain.PageRequest
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import org.springframework.stereotype.Service
@@ -24,21 +25,18 @@ data class DocumentSetSyncClaim(
 @Service
 class DocumentSetSyncClaimService(
     private val outbox: DocumentSetSyncOutboxRepository,
-    private val jdbc: JdbcTemplate,
+    private val claimLock: DocumentSetSyncClaimLockRepository,
 ) {
     @Transactional
     fun claimNext(now: Instant = Instant.now()): DocumentSetSyncClaim? {
-        jdbc.queryForObject(
-            "SELECT id FROM document_set_sync_claim_lock WHERE id = 1 FOR UPDATE",
-            Short::class.java,
-        )
-        val active = outbox.lockOldestInProgress()
+        claimLock.lock()
+        val active = outbox.findFirstByStatusOrderById(DocumentSetSyncStatus.IN_PROGRESS)
         if (active != null) {
             val lockedAt = active.lockedAt
             if (lockedAt != null && !lockedAt.isBefore(now.minusSeconds(LEASE_SECONDS))) return null
             return claim(active, now)
         }
-        return outbox.lockNextPending()?.let { claim(it, now) }
+        return outbox.findFirstByStatusOrderById(DocumentSetSyncStatus.PENDING)?.let { claim(it, now) }
     }
 
     private fun claim(row: DocumentSetSyncOutboxEntity, now: Instant): DocumentSetSyncClaim {
@@ -111,7 +109,11 @@ class DocumentSetSyncWorker(
         val names = documentSets.findNamesByCcPairId(pairId)
         var afterSourceDocumentId = ""
         while (true) {
-            val page = documents.findPageByCcPairId(pairId, afterSourceDocumentId, DOCUMENT_PAGE_SIZE)
+            val page = documents.findAllByCcPairIdAndSourceDocumentIdGreaterThanOrderBySourceDocumentId(
+                pairId,
+                afterSourceDocumentId,
+                PageRequest.of(0, DOCUMENT_PAGE_SIZE),
+            )
             if (page.isEmpty()) return true
             if (!claims.renew(claim.id, claim.token)) return false
             indexer.updateDocumentSets(pairId, page.map { it.sourceDocumentId }.toSet(), names)

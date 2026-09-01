@@ -13,9 +13,11 @@ import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxEntity
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxRepository
 import com.onyx.foss.kotlin.domain.DocumentSetSyncStatus
+import com.onyx.foss.kotlin.domain.IndexedDocumentEntity
+import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.security.CredentialCipher
 import com.onyx.foss.kotlin.service.AdminService
-import com.onyx.foss.kotlin.support.PostgresIntegrationTest
+import com.onyx.foss.kotlin.support.H2IntegrationTest
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.Dispatcher
@@ -35,7 +37,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
-class DocumentSetSyncOutboxIntegrationTest : PostgresIntegrationTest() {
+class DocumentSetSyncOutboxIntegrationTest : H2IntegrationTest() {
     @Autowired private lateinit var admin: AdminService
     @Autowired private lateinit var worker: DocumentSetSyncWorker
     @Autowired private lateinit var claims: DocumentSetSyncClaimService
@@ -47,6 +49,7 @@ class DocumentSetSyncOutboxIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var pairs: ConnectorCredentialPairRepository
     @Autowired private lateinit var sets: DocumentSetRepository
     @Autowired private lateinit var outbox: DocumentSetSyncOutboxRepository
+    @Autowired private lateinit var documents: IndexedDocumentRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
 
     @BeforeEach
@@ -54,10 +57,10 @@ class DocumentSetSyncOutboxIntegrationTest : PostgresIntegrationTest() {
         while (server.takeRequest(1, TimeUnit.MILLISECONDS) != null) {
             // Drain requests from the prior test.
         }
-        jdbc.execute(
-            "TRUNCATE document_set_sync_outbox, ingestion_errors, ingestion_jobs, ingestion_attempts, " +
-                "ingestion_checkpoints, indexed_documents, document_set_cc_pairs, document_sets, " +
-                "connector_credential_pairs, connectors, credentials RESTART IDENTITY CASCADE",
+        truncateTables(
+            "document_set_sync_outbox", "ingestion_errors", "ingestion_jobs", "ingestion_attempts",
+            "ingestion_checkpoints", "indexed_documents", "document_set_cc_pairs", "document_sets",
+            "connector_credential_pairs", "connectors", "credentials",
         )
         primeOpenSearchIndex()
     }
@@ -392,15 +395,16 @@ class DocumentSetSyncOutboxIntegrationTest : PostgresIntegrationTest() {
     }
 
     private fun saveDocuments(pairId: Long, count: Int) {
-        jdbc.update(
-            """
-                INSERT INTO indexed_documents
-                    (cc_pair_id, source_document_id, title, content_hash, metadata)
-                SELECT ?, 'document-' || generate_series, 'title', 'hash', '{}'::jsonb
-                FROM generate_series(1, ?)
-            """.trimIndent(),
-            pairId,
-            count,
+        documents.saveAll(
+            (1..count).map { number ->
+                IndexedDocumentEntity(
+                    ccPairId = pairId,
+                    sourceDocumentId = "document-$number",
+                    title = "title",
+                    contentHash = "hash",
+                    metadata = mapper.createObjectNode(),
+                )
+            },
         )
     }
 

@@ -23,9 +23,12 @@ import com.onyx.foss.kotlin.domain.ConnectorSource
 import com.onyx.foss.kotlin.domain.CredentialEntity
 import com.onyx.foss.kotlin.domain.CredentialRepository
 import com.onyx.foss.kotlin.domain.DocumentSetEntity
+import com.onyx.foss.kotlin.domain.DocumentSetPairEntity
+import com.onyx.foss.kotlin.domain.DocumentSetPairRepository
 import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxEntity
 import com.onyx.foss.kotlin.domain.DocumentSetSyncOutboxRepository
+import com.onyx.foss.kotlin.domain.DocumentSetSyncStatus
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.domain.IngestionAttemptEntity
 import com.onyx.foss.kotlin.domain.IngestionAttemptRepository
@@ -38,7 +41,6 @@ import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
 import com.onyx.foss.kotlin.ingestion.PairExternalWriteFence
 import com.onyx.foss.kotlin.security.CredentialCipher
 import org.springframework.http.HttpStatus
-import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import org.springframework.transaction.support.TransactionTemplate
@@ -51,13 +53,13 @@ class AdminService(
     private val connectors: ConnectorRepository,
     private val pairs: ConnectorCredentialPairRepository,
     private val sets: DocumentSetRepository,
+    private val setPairs: DocumentSetPairRepository,
     private val documentSetSyncOutbox: DocumentSetSyncOutboxRepository,
     private val attempts: IngestionAttemptRepository,
     private val permissionAttempts: PermissionSyncAttemptRepository,
     private val jobs: IngestionJobRepository,
     private val documents: IndexedDocumentRepository,
     private val indexer: OpenSearchIndexer,
-    private val jdbc: JdbcTemplate,
     private val externalWrites: PairExternalWriteFence,
     private val transactions: TransactionTemplate,
 ) {
@@ -447,7 +449,7 @@ class AdminService(
     fun deleteSet(setId: Long) {
         if (!sets.existsById(setId)) throw ApiException(HttpStatus.NOT_FOUND, "Document set not found")
         val pairIds = setPairIds(setId)
-        jdbc.update("DELETE FROM document_set_cc_pairs WHERE document_set_id = ?", setId)
+        setPairs.deleteAllByDocumentSetId(setId)
         sets.deleteById(setId)
         sets.flush()
         enqueueDocumentSetSync(pairIds, setId)
@@ -457,18 +459,14 @@ class AdminService(
 
     fun setSnapshot(set: DocumentSetEntity): Map<String, Any?> {
         val setId = id(set)
-        val pairIds = jdbc.queryForList(
-            "SELECT cc_pair_id FROM document_set_cc_pairs WHERE document_set_id = ? ORDER BY cc_pair_id",
-            Long::class.java,
-            setId,
-        )
+        val pairIds = setPairIds(setId)
         return mapOf(
             "id" to setId,
             "name" to set.name,
             "description" to set.description,
             "cc_pair_summaries" to pairIds.map(::pairSummary),
             "cc_pair_descriptors" to pairIds.map(::pairDescriptor),
-            "is_up_to_date" to !documentSetSyncOutbox.existsActiveForDocumentSet(setId),
+            "is_up_to_date" to !hasActiveDocumentSetSync(setId),
             "is_public" to true,
             "users" to emptyList<String>(),
             "groups" to emptyList<Long>(),
@@ -495,15 +493,16 @@ class AdminService(
     }
 
     private fun replaceSetPairs(setId: Long, pairIds: List<Long>) {
-        jdbc.update("DELETE FROM document_set_cc_pairs WHERE document_set_id = ?", setId)
-        pairIds.distinct().forEach { jdbc.update("INSERT INTO document_set_cc_pairs(document_set_id, cc_pair_id) VALUES (?, ?)", setId, it) }
+        setPairs.deleteAllByDocumentSetId(setId)
+        setPairs.saveAll(pairIds.distinct().map { DocumentSetPairEntity(setId, it) })
     }
 
-    private fun setPairIds(setId: Long): List<Long> = jdbc.queryForList(
-        "SELECT cc_pair_id FROM document_set_cc_pairs WHERE document_set_id = ? ORDER BY cc_pair_id",
-        Long::class.java,
-        setId,
-    )
+    private fun setPairIds(setId: Long): List<Long> =
+        setPairs.findAllByDocumentSetIdOrderByCcPairId(setId).map { it.ccPairId }
+
+    private fun hasActiveDocumentSetSync(setId: Long): Boolean = documentSetSyncOutbox.findAllByStatusIn(
+        listOf(DocumentSetSyncStatus.PENDING, DocumentSetSyncStatus.IN_PROGRESS),
+    ).any { row -> row.documentSetIds?.let { ids -> ids.any { it.asLong() == setId } } ?: true }
 
     private fun enqueueDocumentSetSync(pairIds: Collection<Long>, documentSetId: Long) {
         val distinctPairIds = pairIds.distinct()

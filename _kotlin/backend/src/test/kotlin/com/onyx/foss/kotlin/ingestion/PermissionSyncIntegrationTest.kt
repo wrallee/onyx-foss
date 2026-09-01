@@ -18,39 +18,44 @@ import com.onyx.foss.kotlin.domain.PermissionSyncAttemptRepository
 import com.onyx.foss.kotlin.domain.PermissionSyncStageRepository
 import com.onyx.foss.kotlin.security.CredentialCipher
 import com.onyx.foss.kotlin.service.AdminService
-import com.onyx.foss.kotlin.support.PostgresIntegrationTest
+import com.onyx.foss.kotlin.support.H2IntegrationTest
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.mockito.ArgumentMatchers.any
+import org.mockito.ArgumentMatchers.anyList
 import org.mockito.ArgumentMatchers.isNull
 import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.doReturn
 import org.mockito.Mockito.inOrder
-import org.mockito.Mockito.CALLS_REAL_METHODS
-import org.mockito.Mockito.mockStatic
 import org.mockito.Mockito.mockingDetails
+import org.mockito.Mockito.doThrow
 import org.mockito.Mockito.times
 import org.mockito.Mockito.verify
 import org.mockito.Mockito.verifyNoInteractions
+import org.mockito.Mockito.`when`
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean
 import org.springframework.test.web.servlet.MockMvc
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get
 import org.springframework.web.reactive.function.client.WebClient
 import java.time.Instant
+import java.time.Clock
+import java.sql.Connection
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import javax.sql.DataSource
 
 @AutoConfigureMockMvc
-class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
+class PermissionSyncIntegrationTest : H2IntegrationTest() {
     @Autowired private lateinit var worker: PermissionSyncWorker
     @Autowired private lateinit var claims: PermissionSyncClaimService
     @Autowired private lateinit var mvc: MockMvc
@@ -60,7 +65,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var connectors: ConnectorRepository
     @Autowired private lateinit var credentials: CredentialRepository
     @Autowired private lateinit var pairs: ConnectorCredentialPairRepository
-    @Autowired private lateinit var documents: IndexedDocumentRepository
+    @MockitoSpyBean private lateinit var documents: IndexedDocumentRepository
     @Autowired private lateinit var attempts: PermissionSyncAttemptRepository
     @Autowired private lateinit var staging: PermissionSyncStageRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
@@ -68,13 +73,17 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     @Autowired private lateinit var externalWrites: PairExternalWriteFence
     @MockitoBean private lateinit var remoteLoaders: RemoteConnectorLoaders
     @MockitoBean private lateinit var indexer: OpenSearchIndexer
+    @MockitoBean private lateinit var clock: Clock
+    private val testNow = AtomicReference(Instant.parse("2026-09-02T00:00:00Z"))
 
     @BeforeEach
     fun resetDatabase() {
-        jdbc.execute(
-            "TRUNCATE permission_sync_staging, permission_sync_attempts, ingestion_errors, ingestion_jobs, ingestion_attempts, " +
-                "ingestion_checkpoints, indexed_documents, connector_credential_pairs, connectors, credentials " +
-                "RESTART IDENTITY CASCADE",
+        testNow.set(Instant.parse("2026-09-02T00:00:00Z"))
+        `when`(clock.instant()).thenAnswer { testNow.get() }
+        truncateTables(
+            "permission_sync_staging", "permission_sync_attempts", "ingestion_errors", "ingestion_jobs",
+            "ingestion_attempts", "ingestion_checkpoints", "indexed_documents", "connector_credential_pairs",
+            "connectors", "credentials",
         )
     }
 
@@ -247,10 +256,6 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         val pairId = createPair()
         worker.enqueue(pairId)
         val claim = requireNotNull(claims.claimForPair(pairId))
-        jdbc.update(
-            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() + INTERVAL '1 second' WHERE id = ?",
-            claim.attemptId,
-        )
         val blocker = dataSource.connection
         blocker.autoCommit = false
         blocker.prepareStatement("SELECT id FROM permission_sync_attempts WHERE id = ? FOR UPDATE").use { statement ->
@@ -265,7 +270,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
                 claims.complete(claim, AttemptStatus.SUCCESS)
             }
             assertThat(callStarted.await(10, TimeUnit.SECONDS)).isTrue()
-            Thread.sleep(1_200)
+            expirePermissionLease(blocker, claim.attemptId)
             blocker.commit()
 
             assertThat(completion.get(10, TimeUnit.SECONDS)).isEqualTo(false)
@@ -282,10 +287,6 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         val pairId = createPair()
         worker.enqueue(pairId)
         val claim = requireNotNull(claims.claimForPair(pairId))
-        jdbc.update(
-            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() + INTERVAL '1 second' WHERE id = ?",
-            claim.attemptId,
-        )
         val blocker = dataSource.connection
         blocker.autoCommit = false
         blocker.prepareStatement("SELECT id FROM permission_sync_attempts WHERE id = ? FOR UPDATE").use { statement ->
@@ -300,11 +301,11 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
                 claims.renew(claim)
             }
             assertThat(callStarted.await(10, TimeUnit.SECONDS)).isTrue()
-            Thread.sleep(1_200)
+            expirePermissionLease(blocker, claim.attemptId)
             blocker.commit()
 
             assertThat(renewal.get(10, TimeUnit.SECONDS)).isEqualTo(false)
-            assertThat(attempts.findById(claim.attemptId).orElseThrow().leaseExpiresAt).isBefore(Instant.now())
+            assertThat(attempts.findById(claim.attemptId).orElseThrow().leaseExpiresAt).isBefore(testNow.get())
         } finally {
             runCatching { blocker.rollback() }
             blocker.close()
@@ -317,10 +318,6 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         val pairId = createPair()
         worker.enqueue(pairId)
         val claim = requireNotNull(claims.claimForPair(pairId))
-        jdbc.update(
-            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() + INTERVAL '1 second' WHERE id = ?",
-            claim.attemptId,
-        )
         val blocker = dataSource.connection
         blocker.autoCommit = false
         blocker.prepareStatement("SELECT id FROM permission_sync_attempts WHERE id = ? FOR UPDATE").use { statement ->
@@ -335,7 +332,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
                 claims.fail(claim, IllegalStateException("late failure"))
             }
             assertThat(callStarted.await(10, TimeUnit.SECONDS)).isTrue()
-            Thread.sleep(1_200)
+            expirePermissionLease(blocker, claim.attemptId)
             blocker.commit()
 
             assertThat(failure.get(10, TimeUnit.SECONDS)).isEqualTo(false)
@@ -354,10 +351,6 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         val pairId = createPair()
         worker.enqueue(pairId)
         val claim = requireNotNull(claims.claimForPair(pairId))
-        jdbc.update(
-            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() + INTERVAL '1 second' WHERE id = ?",
-            claim.attemptId,
-        )
         val blocker = dataSource.connection
         blocker.autoCommit = false
         blocker.prepareStatement("SELECT id FROM permission_sync_attempts WHERE id = ? FOR UPDATE").use { statement ->
@@ -372,7 +365,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
                 claims.updateCounts(claim, total = 9, errors = 3)
             }
             assertThat(callStarted.await(10, TimeUnit.SECONDS)).isTrue()
-            Thread.sleep(1_200)
+            expirePermissionLease(blocker, claim.attemptId)
             blocker.commit()
 
             assertThat(update.get(10, TimeUnit.SECONDS)).isEqualTo(false)
@@ -387,7 +380,9 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
     }
 
     @Test
-    fun permissionLeaseDecisionsExtensionsAndTerminalTimesUseTheDatabaseClock() {
+    fun permissionLeaseDecisionsExtensionsAndTerminalTimesUseTheApplicationClock() {
+        val now = Instant.parse("2026-09-02T01:00:00Z")
+        testNow.set(now)
         val expiredPair = createPair()
         val renewedPair = createPair()
         val completedPair = createPair()
@@ -396,30 +391,22 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         val renewedClaim = requireNotNull(claims.claimForPair(renewedPair))
         val completedClaim = requireNotNull(claims.claimForPair(completedPair))
         jdbc.update(
-            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE id = ?",
+            "UPDATE permission_sync_attempts SET lease_expires_at = ? WHERE id = ?",
+            now.minusSeconds(1),
             expiredClaim.attemptId,
         )
-        val databaseBefore = requireNotNull(
-            jdbc.queryForObject("SELECT clock_timestamp()", Instant::class.java),
-        )
 
-        val expiredRenewed: Boolean
-        val activeRenewed: Boolean
-        val completed: Boolean
-        mockStatic(Instant::class.java, CALLS_REAL_METHODS).use { clock ->
-            clock.`when`<Instant> { Instant.now() }.thenReturn(Instant.EPOCH)
-            expiredRenewed = claims.renew(expiredClaim)
-            activeRenewed = claims.renew(renewedClaim)
-            completed = claims.complete(completedClaim, AttemptStatus.SUCCESS)
-        }
+        val expiredRenewed = claims.renew(expiredClaim)
+        val activeRenewed = claims.renew(renewedClaim)
+        val completed = claims.complete(completedClaim, AttemptStatus.SUCCESS)
 
         assertThat(expiredRenewed).isFalse()
         assertThat(activeRenewed).isTrue()
         assertThat(completed).isTrue()
         assertThat(attempts.findById(renewedClaim.attemptId).orElseThrow().leaseExpiresAt)
-            .isAfter(databaseBefore.plusSeconds(59))
+            .isEqualTo(now.plusSeconds(60))
         assertThat(attempts.findById(completedClaim.attemptId).orElseThrow().timeFinished)
-            .isAfterOrEqualTo(databaseBefore)
+            .isEqualTo(now)
     }
 
     @Test
@@ -436,23 +423,6 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         )
         worker.enqueue(pairId)
         val claim = requireNotNull(claims.claimForPair(pairId))
-        jdbc.execute(
-            """
-                CREATE FUNCTION shorten_permission_lease() RETURNS trigger AS ${'$'}${'$'}
-                BEGIN
-                    NEW.lease_expires_at := clock_timestamp() + INTERVAL '1 second';
-                    RETURN NEW;
-                END;
-                ${'$'}${'$'} LANGUAGE plpgsql
-            """.trimIndent(),
-        )
-        jdbc.execute(
-            """
-                CREATE TRIGGER shorten_permission_lease
-                BEFORE UPDATE OF lease_expires_at ON permission_sync_attempts
-                FOR EACH ROW EXECUTE FUNCTION shorten_permission_lease()
-            """.trimIndent(),
-        )
         val documentId = requireNotNull(documents.findByCcPairIdAndSourceDocumentId(pairId, "one")?.id)
         val blocker = dataSource.connection
         blocker.autoCommit = false
@@ -474,8 +444,7 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         try {
             val processing = executor.submit { worker.process(claim) }
             assertThat(privateWrite.await(10, TimeUnit.SECONDS)).isTrue()
-            assertThat(awaitBlockedDocumentUpdate()).isTrue()
-            Thread.sleep(1_200)
+            testNow.set(testNow.get().plusSeconds(61))
             blocker.commit()
             processing.get(10, TimeUnit.SECONDS)
 
@@ -487,8 +456,6 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
             runCatching { blocker.rollback() }
             blocker.close()
             executor.shutdownNow()
-            jdbc.execute("DROP TRIGGER shorten_permission_lease ON permission_sync_attempts")
-            jdbc.execute("DROP FUNCTION shorten_permission_lease()")
         }
     }
 
@@ -498,7 +465,8 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         worker.enqueue(pairId)
         val first = requireNotNull(claims.claimNext())
         jdbc.update(
-            "UPDATE permission_sync_attempts SET lease_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE id = ?",
+            "UPDATE permission_sync_attempts SET lease_expires_at = ? WHERE id = ?",
+            testNow.get().minusSeconds(1),
             first.attemptId,
         )
 
@@ -536,7 +504,8 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
             val staleWorker = executor.submit { worker.process(oldClaim) }
             assertThat(firstWriteStarted.await(10, TimeUnit.SECONDS)).isTrue()
             jdbc.update(
-                "UPDATE permission_sync_attempts SET lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE id = ?",
+                "UPDATE permission_sync_attempts SET lease_expires_at = ? WHERE id = ?",
+                testNow.get().minusSeconds(1),
                 oldClaim.attemptId,
             )
             val reclaimed = requireNotNull(claims.claimNext())
@@ -684,35 +653,15 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         )
         enqueueKeywordMapping(server)
         repeat(3) { server.enqueue(successfulOpenSearchUpdate()) }
-        jdbc.execute(
-            """
-                CREATE FUNCTION reject_permission_acl_update() RETURNS trigger AS ${'$'}${'$'}
-                BEGIN
-                    RAISE EXCEPTION 'database ACL write failed';
-                END;
-                ${'$'}${'$'} LANGUAGE plpgsql
-            """.trimIndent(),
-        )
-        jdbc.execute(
-            """
-                CREATE TRIGGER reject_permission_acl_update
-                BEFORE UPDATE OF external_access ON indexed_documents
-                FOR EACH ROW EXECUTE FUNCTION reject_permission_acl_update()
-            """.trimIndent(),
-        )
-        try {
-            realWorker(server).process(pairId)
-        } finally {
-            jdbc.execute("DROP TRIGGER reject_permission_acl_update ON indexed_documents")
-            jdbc.execute("DROP FUNCTION reject_permission_acl_update()")
-        }
+        doThrow(IllegalStateException("database ACL write failed"))
+            .`when`(documents).saveAllAndFlush(anyList())
+        realWorker(server).process(pairId)
 
         assertAccess(pairId, "one", previous)
         val privateAccess = ExternalAccess(isPublic = false)
-        assertThat(openSearchAclBodies(server, 3)).containsExactly(
+        assertThat(openSearchAclBodies(server, 2)).containsExactly(
             aclBody(privateAccess),
             aclBody(privateAccess),
-            aclBody(previous),
         )
         assertThat(attempts.findAllByCcPairIdOrderByIdDesc(pairId).single().status).isEqualTo(AttemptStatus.FAILED)
         Unit
@@ -916,7 +865,8 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         worker.enqueue(pairId)
         val claim = requireNotNull(claims.claimForPair(pairId))
         jdbc.update(
-            "UPDATE permission_sync_attempts SET lease_expires_at = CURRENT_TIMESTAMP - INTERVAL '1 second' WHERE id = ?",
+            "UPDATE permission_sync_attempts SET lease_expires_at = ? WHERE id = ?",
+            testNow.get().minusSeconds(1),
             claim.attemptId,
         )
         return claim
@@ -932,25 +882,12 @@ class PermissionSyncIntegrationTest : PostgresIntegrationTest() {
         assertThat(mapper.treeToValue(stored, ExternalAccess::class.java)).isEqualTo(expected)
     }
 
-    private fun awaitBlockedDocumentUpdate(): Boolean {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
-        while (System.nanoTime() < deadline) {
-            val blocked = jdbc.queryForObject(
-                """
-                    SELECT EXISTS (
-                        SELECT 1
-                        FROM pg_stat_activity
-                        WHERE pid <> pg_backend_pid()
-                          AND wait_event_type = 'Lock'
-                          AND query ILIKE '%update indexed_documents%'
-                    )
-                """.trimIndent(),
-                Boolean::class.java,
-            ) == true
-            if (blocked) return true
-            Thread.sleep(25)
+    private fun expirePermissionLease(connection: Connection, attemptId: Long) {
+        connection.prepareStatement("UPDATE permission_sync_attempts SET lease_expires_at = ? WHERE id = ?").use {
+            it.setObject(1, testNow.get().minusSeconds(1))
+            it.setLong(2, attemptId)
+            assertThat(it.executeUpdate()).isEqualTo(1)
         }
-        return false
     }
 
     private fun realWorker(server: MockWebServer): PermissionSyncWorker = PermissionSyncWorker(

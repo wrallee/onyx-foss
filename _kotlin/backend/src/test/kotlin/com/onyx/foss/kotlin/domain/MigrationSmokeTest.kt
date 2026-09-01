@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.domain
 
-import com.onyx.foss.kotlin.support.PostgresIntegrationTest
+import com.onyx.foss.kotlin.support.H2IntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.flywaydb.core.Flyway
 import org.flywaydb.core.api.MigrationVersion
@@ -10,7 +10,7 @@ import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.jdbc.datasource.DriverManagerDataSource
 import java.util.UUID
 
-class MigrationSmokeTest : PostgresIntegrationTest() {
+class MigrationSmokeTest : H2IntegrationTest() {
     @Autowired
     lateinit var jdbc: JdbcTemplate
 
@@ -36,7 +36,7 @@ class MigrationSmokeTest : PostgresIntegrationTest() {
         try {
             flyway(schema, MigrationVersion.fromVersion("7")).migrate()
             val legacy = JdbcTemplate(
-                DriverManagerDataSource(scopedDatabaseUrl(schema), postgres.username, postgres.password),
+                DriverManagerDataSource(scopedDatabaseUrl(schema), databaseUsername, databasePassword),
             )
             legacy.update(
                 "INSERT INTO credentials(id, source, secret_json) VALUES (101, 'file', 'encrypted')",
@@ -72,7 +72,7 @@ class MigrationSmokeTest : PostgresIntegrationTest() {
                 "INSERT INTO permission_sync_attempts(cc_pair_id) VALUES (101)",
             )
             legacy.update(
-                "INSERT INTO document_set_sync_outbox(cc_pair_ids) VALUES ('[101]'::jsonb)",
+                "INSERT INTO document_set_sync_outbox(cc_pair_ids) VALUES ('[101]')",
             )
 
             flyway(schema).migrate()
@@ -122,7 +122,8 @@ class MigrationSmokeTest : PostgresIntegrationTest() {
             ).isTrue()
             assertThat(
                 legacy.queryForObject(
-                    "SELECT primary_owners::text || secondary_owners::text FROM indexed_documents WHERE source_document_id = 'legacy-document'",
+                    "SELECT CAST(primary_owners AS VARCHAR) || CAST(secondary_owners AS VARCHAR) " +
+                        "FROM indexed_documents WHERE source_document_id = 'legacy-document'",
                     String::class.java,
                 ),
             ).isEqualTo("[][]")
@@ -148,7 +149,7 @@ class MigrationSmokeTest : PostgresIntegrationTest() {
 
     private fun flyway(schema: String, target: MigrationVersion? = null): Flyway {
         val configuration = Flyway.configure()
-            .dataSource(scopedDatabaseUrl(schema), postgres.username, postgres.password)
+            .dataSource(scopedDatabaseUrl(schema), databaseUsername, databasePassword)
             .locations("classpath:db/migration")
             .schemas(schema)
         if (target != null) configuration.target(target)
@@ -156,7 +157,6 @@ class MigrationSmokeTest : PostgresIntegrationTest() {
     }
 
     private fun scopedDatabaseUrl(schema: String): String {
-        val separator = if ('?' in postgres.jdbcUrl) '&' else '?'
-        return "${postgres.jdbcUrl}$separator" + "currentSchema=$schema"
+        return "$databaseUrl;SCHEMA=$schema"
     }
 }

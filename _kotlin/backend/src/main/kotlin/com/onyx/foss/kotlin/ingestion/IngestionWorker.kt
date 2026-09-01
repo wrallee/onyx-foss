@@ -23,6 +23,7 @@ import com.onyx.foss.kotlin.domain.PairStatus
 import com.onyx.foss.kotlin.service.AdminService
 import io.netty.handler.ssl.SslContextBuilder
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory
+import org.springframework.data.domain.PageRequest
 import org.springframework.http.MediaType
 import org.springframework.http.client.reactive.ReactorClientHttpConnector
 import org.springframework.scheduling.annotation.Scheduled
@@ -61,29 +62,24 @@ class JobClaimService(
     private val errors: IngestionErrorRepository,
 ) {
     @Transactional
-    fun claimNext(now: Instant = Instant.now()): IngestionClaim? =
-        jobs.lockNextClaimable(now)?.let { claim(it, now) }
+    fun claimNext(now: Instant = Instant.now()): IngestionClaim? = jobs
+        .findClaimableIds(now, PageRequest.of(0, CLAIM_CANDIDATE_LIMIT))
+        .firstNotNullOfOrNull { claim(it, now) }
 
     @Transactional
-    fun claimJob(jobId: Long, now: Instant = Instant.now()): IngestionClaim? =
-        jobs.lockClaimableById(jobId, now)?.let { claim(it, now) }
+    fun claimJob(jobId: Long, now: Instant = Instant.now()): IngestionClaim? = claim(jobId, now)
 
-    private fun claim(job: IngestionJobEntity, now: Instant): IngestionClaim? {
+    private fun claim(jobId: Long, now: Instant): IngestionClaim? {
+        val job = jobs.findById(jobId).orElse(null) ?: return null
         val pair = pairs.lockById(job.ccPairId) ?: return null
         if (pair.status == PairStatus.DELETING || pair.ingestionLeaseExpiresAt?.isAfter(now) == true) return null
         val token = UUID.randomUUID()
         val leaseExpiresAt = now.plus(INGESTION_LEASE)
-        job.state = JobState.RUNNING
-        job.lockedAt = now
-        job.lockedBy = "spring-worker"
-        job.attempts += 1
-        job.claimToken = token
-        job.leaseExpiresAt = leaseExpiresAt
+        if (jobs.claim(jobId, now, "spring-worker", token, leaseExpiresAt) != 1) return null
         pair.ingestionClaimToken = token
         pair.ingestionLeaseExpiresAt = leaseExpiresAt
-        jobs.saveAndFlush(job)
         pairs.saveAndFlush(pair)
-        return IngestionClaim(requireNotNull(job.id), job.ccPairId, job.attemptId, token)
+        return IngestionClaim(jobId, job.ccPairId, job.attemptId, token)
     }
 
     @Transactional
@@ -133,6 +129,7 @@ class JobClaimService(
         releasePair(ownership.pair)
         pairs.save(ownership.pair)
         ownership.job.state = JobState.SUCCEEDED
+        ownership.job.activeMarker = null
         releaseJob(ownership.job)
         jobs.save(ownership.job)
         return true
@@ -147,6 +144,7 @@ class JobClaimService(
         releasePair(ownership.pair)
         pairs.save(ownership.pair)
         ownership.job.state = JobState.SUCCEEDED
+        ownership.job.activeMarker = null
         releaseJob(ownership.job)
         jobs.save(ownership.job)
         return true
@@ -174,6 +172,7 @@ class JobClaimService(
         releasePair(ownership.pair)
         pairs.save(ownership.pair)
         ownership.job.state = JobState.FAILED
+        ownership.job.activeMarker = null
         ownership.job.lastError = attempt.errorMessage
         releaseJob(ownership.job)
         jobs.save(ownership.job)
@@ -196,6 +195,10 @@ class JobClaimService(
     private fun releasePair(pair: com.onyx.foss.kotlin.domain.ConnectorCredentialPairEntity) {
         pair.ingestionClaimToken = null
         pair.ingestionLeaseExpiresAt = null
+    }
+
+    private companion object {
+        const val CLAIM_CANDIDATE_LIMIT = 10
     }
 }
 

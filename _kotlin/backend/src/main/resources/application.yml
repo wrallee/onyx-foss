@@ -45,7 +45,7 @@ onyx:
     index: ${OPENSEARCH_INDEX:onyx-kotlin-chunks}
     username: ${OPENSEARCH_ADMIN_USERNAME:}
     password: ${OPENSEARCH_ADMIN_PASSWORD:}
-    verify-certs: false
+    verify-certs: ${OPENSEARCH_VERIFY_CERTS:false}
   worker:
     enabled: ${ONYX_WORKER_ENABLED:false}
     poll-delay-ms: ${ONYX_WORKER_POLL_DELAY_MS:1000}

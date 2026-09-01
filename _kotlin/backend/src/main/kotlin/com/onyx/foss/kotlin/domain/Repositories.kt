@@ -1,15 +1,15 @@
 package com.onyx.foss.kotlin.domain
 
 import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
+import jakarta.persistence.LockModeType
+import org.springframework.data.domain.Pageable
 import org.springframework.data.jpa.repository.JpaRepository
+import org.springframework.data.jpa.repository.Lock
 import org.springframework.data.jpa.repository.Modifying
 import org.springframework.data.jpa.repository.Query
 import org.springframework.data.repository.query.Param
-import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.stereotype.Repository
 import org.springframework.transaction.annotation.Transactional
-import java.sql.Types
 import java.time.Instant
 import java.util.UUID
 
@@ -18,7 +18,8 @@ interface CredentialRepository : JpaRepository<CredentialEntity, Long> {
 }
 
 interface ConnectorRepository : JpaRepository<ConnectorEntity, Long> {
-    @Query(value = "SELECT * FROM connectors WHERE id = :id FOR UPDATE", nativeQuery = true)
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT connector FROM ConnectorEntity connector WHERE connector.id = :id")
     fun lockById(@Param("id") id: Long): ConnectorEntity?
 }
 
@@ -27,46 +28,27 @@ interface ConnectorCredentialPairRepository : JpaRepository<ConnectorCredentialP
     fun findAllByCredentialId(credentialId: Long): List<ConnectorCredentialPairEntity>
     fun findByConnectorIdAndCredentialId(connectorId: Long, credentialId: Long): ConnectorCredentialPairEntity?
 
-    @Query(value = "SELECT connector_id FROM connector_credential_pairs WHERE id = :id", nativeQuery = true)
+    @Query("SELECT pair.connectorId FROM ConnectorCredentialPairEntity pair WHERE pair.id = :id")
     fun findConnectorIdById(@Param("id") id: Long): Long?
 
-    @Query(value = "SELECT * FROM connector_credential_pairs WHERE id = :id FOR UPDATE", nativeQuery = true)
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT pair FROM ConnectorCredentialPairEntity pair WHERE pair.id = :id")
     fun lockById(@Param("id") id: Long): ConnectorCredentialPairEntity?
 
     @Query(
-        value = """
-            SELECT pair.id AS "pairId",
-                   connector.refresh_freq AS "refreshFreq",
-                   connector.prune_freq AS "pruneFreq",
-                   pair.last_pruned_at AS "lastPrunedAt",
-                   (
-                       SELECT MAX(attempt.time_updated)
-                       FROM ingestion_attempts attempt
-                       WHERE attempt.cc_pair_id = pair.id
-                         AND attempt.prune_only = FALSE
-                   ) AS "lastAttemptAt"
-            FROM connector_credential_pairs pair
-            JOIN connectors connector ON connector.id = pair.connector_id
-            WHERE pair.status IN ('SCHEDULED', 'INITIAL_INDEXING', 'ACTIVE')
+        """
+            SELECT pair FROM ConnectorCredentialPairEntity pair
+            WHERE pair.status IN :statuses
               AND NOT EXISTS (
-                  SELECT 1
-                  FROM ingestion_attempts active_attempt
-                  JOIN ingestion_jobs active_job ON active_job.attempt_id = active_attempt.id
-                  WHERE active_attempt.cc_pair_id = pair.id
-                    AND active_job.state IN ('QUEUED', 'RUNNING')
+                  SELECT job.id FROM IngestionJobEntity job
+                  WHERE job.ccPairId = pair.id AND job.state IN :activeStates
               )
         """,
-        nativeQuery = true,
     )
-    fun findSchedulable(): List<IngestionScheduleCandidate>
-}
-
-interface IngestionScheduleCandidate {
-    val pairId: Long
-    val refreshFreq: Long?
-    val pruneFreq: Long?
-    val lastPrunedAt: Instant?
-    val lastAttemptAt: Instant?
+    fun findSchedulable(
+        @Param("statuses") statuses: Collection<PairStatus>,
+        @Param("activeStates") activeStates: Collection<JobState>,
+    ): List<ConnectorCredentialPairEntity>
 }
 
 interface DocumentSetRepository : JpaRepository<DocumentSetEntity, Long> {
@@ -74,71 +56,39 @@ interface DocumentSetRepository : JpaRepository<DocumentSetEntity, Long> {
     fun existsByNameAndIdNot(name: String, id: Long): Boolean
 
     @Query(
-        value = """
-            SELECT document_set.name
-            FROM document_sets document_set
-            JOIN document_set_cc_pairs membership ON membership.document_set_id = document_set.id
-            WHERE membership.cc_pair_id = :ccPairId
-            ORDER BY document_set.name
+        """
+            SELECT documentSet.name
+            FROM DocumentSetEntity documentSet, DocumentSetPairEntity membership
+            WHERE membership.documentSetId = documentSet.id
+              AND membership.ccPairId = :ccPairId
+            ORDER BY documentSet.name
         """,
-        nativeQuery = true,
     )
     fun findNamesByCcPairId(@Param("ccPairId") ccPairId: Long): List<String>
 }
 
+interface DocumentSetPairRepository : JpaRepository<DocumentSetPairEntity, DocumentSetPairId> {
+    fun findAllByDocumentSetIdOrderByCcPairId(documentSetId: Long): List<DocumentSetPairEntity>
+    fun deleteAllByDocumentSetId(documentSetId: Long)
+    fun deleteAllByCcPairId(ccPairId: Long)
+}
+
 interface DocumentSetSyncOutboxRepository : JpaRepository<DocumentSetSyncOutboxEntity, Long> {
-    @Query(
-        value = """
-            SELECT EXISTS (
-                SELECT 1
-                FROM document_set_sync_outbox
-                WHERE status IN ('PENDING', 'IN_PROGRESS')
-                  AND (
-                      document_set_ids IS NULL
-                      OR document_set_ids @> jsonb_build_array(CAST(:documentSetId AS BIGINT))
-                  )
-            )
-        """,
-        nativeQuery = true,
-    )
-    fun existsActiveForDocumentSet(@Param("documentSetId") documentSetId: Long): Boolean
+    fun findAllByStatusIn(statuses: Collection<DocumentSetSyncStatus>): List<DocumentSetSyncOutboxEntity>
 
-    @Query(
-        value = """
-            SELECT * FROM document_set_sync_outbox
-            WHERE status = 'IN_PROGRESS'
-            ORDER BY id
-            FOR UPDATE
-            LIMIT 1
-        """,
-        nativeQuery = true,
-    )
-    fun lockOldestInProgress(): DocumentSetSyncOutboxEntity?
-
-    @Query(
-        value = """
-            SELECT * FROM document_set_sync_outbox
-            WHERE status = 'PENDING'
-            ORDER BY id
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
-        """,
-        nativeQuery = true,
-    )
-    fun lockNextPending(): DocumentSetSyncOutboxEntity?
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    fun findFirstByStatusOrderById(status: DocumentSetSyncStatus): DocumentSetSyncOutboxEntity?
 
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query(
-        value = """
-            UPDATE document_set_sync_outbox
-            SET locked_at = :now,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = :id
-              AND claim_token = :token
-              AND status = 'IN_PROGRESS'
+        """
+            UPDATE DocumentSetSyncOutboxEntity row
+            SET row.lockedAt = :now
+            WHERE row.id = :id
+              AND row.claimToken = :token
+              AND row.status = com.onyx.foss.kotlin.domain.DocumentSetSyncStatus.IN_PROGRESS
         """,
-        nativeQuery = true,
     )
     fun renewOwned(
         @Param("id") id: Long,
@@ -149,42 +99,50 @@ interface DocumentSetSyncOutboxRepository : JpaRepository<DocumentSetSyncOutboxE
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query(
-        value = """
-            UPDATE document_set_sync_outbox
-            SET status = 'DONE',
-                claim_token = NULL,
-                locked_at = NULL,
-                last_error = NULL,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = :id
-              AND claim_token = :token
-              AND status = 'IN_PROGRESS'
+        """
+            UPDATE DocumentSetSyncOutboxEntity row
+            SET row.status = com.onyx.foss.kotlin.domain.DocumentSetSyncStatus.DONE,
+                row.claimToken = NULL,
+                row.lockedAt = NULL,
+                row.lastError = NULL
+            WHERE row.id = :id
+              AND row.claimToken = :token
+              AND row.status = com.onyx.foss.kotlin.domain.DocumentSetSyncStatus.IN_PROGRESS
         """,
-        nativeQuery = true,
     )
     fun completeOwned(@Param("id") id: Long, @Param("token") token: UUID): Int
 
     @Transactional
     @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query(
-        value = """
-            UPDATE document_set_sync_outbox
-            SET status = 'PENDING',
-                claim_token = NULL,
-                locked_at = NULL,
-                last_error = :message,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = :id
-              AND claim_token = :token
-              AND status = 'IN_PROGRESS'
+        """
+            UPDATE DocumentSetSyncOutboxEntity row
+            SET row.status = com.onyx.foss.kotlin.domain.DocumentSetSyncStatus.PENDING,
+                row.claimToken = NULL,
+                row.lockedAt = NULL,
+                row.lastError = :message
+            WHERE row.id = :id
+              AND row.claimToken = :token
+              AND row.status = com.onyx.foss.kotlin.domain.DocumentSetSyncStatus.IN_PROGRESS
         """,
-        nativeQuery = true,
     )
     fun retryOwned(
         @Param("id") id: Long,
         @Param("token") token: UUID,
         @Param("message") message: String,
     ): Int
+}
+
+interface DocumentSetSyncClaimLockRepository : JpaRepository<DocumentSetSyncClaimLockEntity, Short> {
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT lock FROM DocumentSetSyncClaimLockEntity lock WHERE lock.id = 1")
+    fun lock(): DocumentSetSyncClaimLockEntity
+}
+
+interface OpenSearchIndexMigrationLockRepository : JpaRepository<OpenSearchIndexMigrationLockEntity, Short> {
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT lock FROM OpenSearchIndexMigrationLockEntity lock WHERE lock.id = 1")
+    fun lock(): OpenSearchIndexMigrationLockEntity
 }
 
 interface FileAssetRepository : JpaRepository<FileAssetEntity, String>
@@ -196,6 +154,7 @@ interface IngestionAttemptRepository : JpaRepository<IngestionAttemptEntity, Lon
         ccPairId: Long,
         statuses: Collection<AttemptStatus>,
     ): IngestionAttemptEntity?
+    fun findFirstByCcPairIdAndPruneOnlyFalseOrderByTimeUpdatedDescIdDesc(ccPairId: Long): IngestionAttemptEntity?
 }
 
 interface IngestionCheckpointRepository : JpaRepository<IngestionCheckpointEntity, Long>
@@ -207,39 +166,51 @@ interface IngestionJobRepository : JpaRepository<IngestionJobEntity, Long> {
     ): IngestionJobEntity?
 
     @Query(
-        value = """
-            SELECT job.*
-            FROM ingestion_jobs job
-            JOIN connector_credential_pairs pair ON pair.id = job.cc_pair_id
-            WHERE pair.status <> 'DELETING'
-              AND (pair.ingestion_lease_expires_at IS NULL OR pair.ingestion_lease_expires_at < :now)
+        """
+            SELECT job.id
+            FROM IngestionJobEntity job, ConnectorCredentialPairEntity pair
+            WHERE pair.id = job.ccPairId
+              AND pair.status <> com.onyx.foss.kotlin.domain.PairStatus.DELETING
+              AND (pair.ingestionLeaseExpiresAt IS NULL OR pair.ingestionLeaseExpiresAt < :now)
               AND (
-                  (job.state = 'QUEUED' AND job.run_after <= :now)
-                  OR (job.state = 'RUNNING' AND (job.lease_expires_at IS NULL OR job.lease_expires_at < :now))
+                  (job.state = com.onyx.foss.kotlin.domain.JobState.QUEUED AND job.runAfter <= :now)
+                  OR (job.state = com.onyx.foss.kotlin.domain.JobState.RUNNING
+                      AND (job.leaseExpiresAt IS NULL OR job.leaseExpiresAt < :now))
               )
-            ORDER BY job.run_after, job.id
-            FOR UPDATE OF job SKIP LOCKED
-            LIMIT 1
+            ORDER BY job.runAfter, job.id
         """,
-        nativeQuery = true,
     )
-    fun lockNextClaimable(@Param("now") now: Instant): IngestionJobEntity?
+    fun findClaimableIds(@Param("now") now: Instant, pageable: Pageable): List<Long>
 
+    @Transactional
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
     @Query(
-        value = """
-            SELECT * FROM ingestion_jobs
-            WHERE id = :id
+        """
+            UPDATE IngestionJobEntity job
+            SET job.state = com.onyx.foss.kotlin.domain.JobState.RUNNING,
+                job.lockedAt = :now,
+                job.lockedBy = :worker,
+                job.attempts = job.attempts + 1,
+                job.claimToken = :token,
+                job.leaseExpiresAt = :leaseExpiresAt
+            WHERE job.id = :id
               AND (
-                  (state = 'QUEUED' AND run_after <= :now)
-                  OR (state = 'RUNNING' AND (lease_expires_at IS NULL OR lease_expires_at < :now))
+                  (job.state = com.onyx.foss.kotlin.domain.JobState.QUEUED AND job.runAfter <= :now)
+                  OR (job.state = com.onyx.foss.kotlin.domain.JobState.RUNNING
+                      AND (job.leaseExpiresAt IS NULL OR job.leaseExpiresAt < :now))
               )
-            FOR UPDATE
         """,
-        nativeQuery = true,
     )
-    fun lockClaimableById(@Param("id") id: Long, @Param("now") now: Instant): IngestionJobEntity?
+    fun claim(
+        @Param("id") id: Long,
+        @Param("now") now: Instant,
+        @Param("worker") worker: String,
+        @Param("token") token: UUID,
+        @Param("leaseExpiresAt") leaseExpiresAt: Instant,
+    ): Int
 
-    @Query(value = "SELECT * FROM ingestion_jobs WHERE id = :id FOR UPDATE", nativeQuery = true)
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT job FROM IngestionJobEntity job WHERE job.id = :id")
     fun lockById(@Param("id") id: Long): IngestionJobEntity?
 }
 
@@ -250,20 +221,10 @@ interface IndexedDocumentRepository : JpaRepository<IndexedDocumentEntity, Long>
         ccPairId: Long,
         sourceDocumentIds: Collection<String>,
     ): List<IndexedDocumentEntity>
-    @Query(
-        value = """
-            SELECT * FROM indexed_documents
-            WHERE cc_pair_id = :ccPairId
-              AND source_document_id > :afterSourceDocumentId
-            ORDER BY source_document_id
-            LIMIT :limit
-        """,
-        nativeQuery = true,
-    )
-    fun findPageByCcPairId(
-        @Param("ccPairId") ccPairId: Long,
-        @Param("afterSourceDocumentId") afterSourceDocumentId: String,
-        @Param("limit") limit: Int,
+    fun findAllByCcPairIdAndSourceDocumentIdGreaterThanOrderBySourceDocumentId(
+        ccPairId: Long,
+        afterSourceDocumentId: String,
+        pageable: Pageable,
     ): List<IndexedDocumentEntity>
     fun countByCcPairId(ccPairId: Long): Long
     fun deleteAllByCcPairId(ccPairId: Long)
@@ -309,67 +270,33 @@ interface PermissionSyncAttemptRepository : JpaRepository<PermissionSyncAttemptE
         ccPairId: Long,
         statuses: Collection<AttemptStatus>,
     ): PermissionSyncAttemptEntity?
+    fun findFirstByCcPairIdAndActiveMarkerOrderById(ccPairId: Long, activeMarker: Short): PermissionSyncAttemptEntity?
 
     @Query(
-        value = """
-            SELECT * FROM permission_sync_attempts
-            WHERE status = 'NOT_STARTED'
-               OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp()))
-            ORDER BY created_at, id
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
+        """
+            SELECT attempt.id FROM PermissionSyncAttemptEntity attempt
+            WHERE attempt.status = com.onyx.foss.kotlin.domain.AttemptStatus.NOT_STARTED
+               OR (attempt.status = com.onyx.foss.kotlin.domain.AttemptStatus.IN_PROGRESS
+                   AND (attempt.leaseExpiresAt IS NULL OR attempt.leaseExpiresAt <= :now))
+            ORDER BY attempt.createdAt, attempt.id
         """,
-        nativeQuery = true,
     )
-    fun lockNextClaimable(): PermissionSyncAttemptEntity?
+    fun findClaimableIds(@Param("now") now: Instant, pageable: Pageable): List<Long>
 
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT attempt FROM PermissionSyncAttemptEntity attempt WHERE attempt.id = :id")
+    fun lockById(@Param("id") id: Long): PermissionSyncAttemptEntity?
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query(
-        value = """
-            SELECT * FROM permission_sync_attempts
-            WHERE cc_pair_id = :ccPairId
-              AND (
-                  status = 'NOT_STARTED'
-                  OR (status = 'IN_PROGRESS' AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp()))
-              )
-            ORDER BY created_at, id
-            FOR UPDATE SKIP LOCKED
-            LIMIT 1
+        """
+            SELECT attempt FROM PermissionSyncAttemptEntity attempt
+            WHERE attempt.id = :id
+              AND attempt.claimToken = :token
+              AND attempt.status = com.onyx.foss.kotlin.domain.AttemptStatus.IN_PROGRESS
         """,
-        nativeQuery = true,
-    )
-    fun lockClaimableForPair(
-        @Param("ccPairId") ccPairId: Long,
-    ): PermissionSyncAttemptEntity?
-
-    @Query(value = "SELECT clock_timestamp()", nativeQuery = true)
-    fun databaseNow(): Instant
-
-    @Query(
-        value = """
-            SELECT * FROM permission_sync_attempts
-            WHERE id = :id
-              AND claim_token = :token
-              AND status = 'IN_PROGRESS'
-            FOR UPDATE
-        """,
-        nativeQuery = true,
     )
     fun lockOwned(@Param("id") id: Long, @Param("token") token: UUID): PermissionSyncAttemptEntity?
-
-    @Transactional
-    @Modifying
-    @Query(
-        value = """
-            INSERT INTO permission_sync_attempts (cc_pair_id, status)
-            VALUES (:ccPairId, 'NOT_STARTED')
-            ON CONFLICT (cc_pair_id) WHERE status IN ('NOT_STARTED', 'IN_PROGRESS') DO UPDATE
-            SET follow_up_requested = permission_sync_attempts.follow_up_requested
-                    OR permission_sync_attempts.status = 'IN_PROGRESS',
-                updated_at = CURRENT_TIMESTAMP
-        """,
-        nativeQuery = true,
-    )
-    fun createOrCoalesce(@Param("ccPairId") ccPairId: Long): Int
 }
 
 data class PermissionSyncStageRow(
@@ -380,179 +307,142 @@ data class PermissionSyncStageRow(
 
 @Repository
 class PermissionSyncStageRepository(
-    private val jdbc: JdbcTemplate,
-    private val mapper: ObjectMapper,
+    private val rows: PermissionSyncStageJpaRepository,
+    private val attempts: PermissionSyncAttemptRepository,
 ) {
     @Transactional
     fun upsert(attemptId: Long, rows: Collection<PermissionSyncStageRow>) {
         if (rows.isEmpty()) return
-        jdbc.batchUpdate(
-            """
-                INSERT INTO permission_sync_staging
-                    (attempt_id, source_document_id, external_access, has_error)
-                VALUES (?, ?, ?::jsonb, ?)
-                ON CONFLICT (attempt_id, source_document_id) DO UPDATE
-                SET external_access = CASE
-                        WHEN permission_sync_staging.has_error THEN permission_sync_staging.external_access
-                        ELSE EXCLUDED.external_access
-                    END,
-                    has_error = permission_sync_staging.has_error OR EXCLUDED.has_error
-            """.trimIndent(),
-            rows,
-            rows.size,
-        ) { statement, row ->
-            statement.setLong(1, attemptId)
-            statement.setString(2, row.sourceDocumentId)
-            statement.setObject(3, mapper.writeValueAsString(row.externalAccess), Types.OTHER)
-            statement.setBoolean(4, row.hasError)
+        val ids = rows.map { it.sourceDocumentId }.distinct()
+        val merged = this.rows.findAllByAttemptIdAndSourceDocumentIdIn(attemptId, ids)
+            .associateByTo(linkedMapOf()) { it.sourceDocumentId }
+        rows.forEach { row ->
+            val current = merged[row.sourceDocumentId]
+            merged[row.sourceDocumentId] = PermissionSyncStageEntity(
+                attemptId = attemptId,
+                sourceDocumentId = row.sourceDocumentId,
+                externalAccess = if (current?.hasError == true) current.externalAccess else row.externalAccess,
+                hasError = current?.hasError == true || row.hasError,
+            )
         }
+        this.rows.saveAll(merged.values)
     }
 
     fun findPage(attemptId: Long, afterSourceDocumentId: String, limit: Int): List<PermissionSyncStageRow> =
-        jdbc.query(
-            """
-                SELECT source_document_id, external_access, has_error
-                FROM permission_sync_staging
-                WHERE attempt_id = ? AND source_document_id > ?
-                ORDER BY source_document_id
-                LIMIT ?
-            """.trimIndent(),
-            { result, _ ->
-                PermissionSyncStageRow(
-                    sourceDocumentId = result.getString("source_document_id"),
-                    externalAccess = mapper.readTree(result.getString("external_access")),
-                    hasError = result.getBoolean("has_error"),
-                )
-            },
+        rows.findAllByAttemptIdAndSourceDocumentIdGreaterThanOrderBySourceDocumentId(
             attemptId,
             afterSourceDocumentId,
-            limit,
-        )
+            org.springframework.data.domain.PageRequest.of(0, limit),
+        ).map { PermissionSyncStageRow(it.sourceDocumentId, requireNotNull(it.externalAccess), it.hasError) }
 
-    fun countForAttempt(attemptId: Long): Long = jdbc.queryForObject(
-        "SELECT COUNT(*) FROM permission_sync_staging WHERE attempt_id = ?",
-        Long::class.java,
-        attemptId,
-    ) ?: 0
+    fun countForAttempt(attemptId: Long): Long = rows.countByAttemptId(attemptId)
 
-    fun countErrorsForAttempt(attemptId: Long): Long = jdbc.queryForObject(
-        "SELECT COUNT(*) FROM permission_sync_staging WHERE attempt_id = ? AND has_error = TRUE",
-        Long::class.java,
-        attemptId,
-    ) ?: 0
+    fun countErrorsForAttempt(attemptId: Long): Long = rows.countByAttemptIdAndHasErrorTrue(attemptId)
 
     @Transactional
     fun deleteAllForAttempt(attemptId: Long) {
-        jdbc.update("DELETE FROM permission_sync_staging WHERE attempt_id = ?", attemptId)
+        rows.deleteAllByAttemptId(attemptId)
     }
 
     @Transactional
     fun deleteTerminalForPair(pairId: Long) {
-        jdbc.update(
-            """
-                DELETE FROM permission_sync_staging staging
-                USING permission_sync_attempts attempt
-                WHERE staging.attempt_id = attempt.id
-                  AND attempt.cc_pair_id = ?
-                  AND attempt.status IN ('SUCCESS', 'FAILED', 'COMPLETED_WITH_ERRORS')
-            """.trimIndent(),
-            pairId,
+        rows.deleteAllByAttemptIdIn(
+            attempts.findAllByCcPairIdOrderByIdDesc(pairId)
+                .filter { it.status in TERMINAL_PERMISSION_STATUSES }
+                .mapNotNull { it.id },
+        )
+    }
+
+    private companion object {
+        val TERMINAL_PERMISSION_STATUSES = setOf(
+            AttemptStatus.SUCCESS,
+            AttemptStatus.FAILED,
+            AttemptStatus.COMPLETED_WITH_ERRORS,
         )
     }
 }
 
+interface PermissionSyncStageJpaRepository : JpaRepository<PermissionSyncStageEntity, PermissionSyncStageId> {
+    fun findAllByAttemptIdAndSourceDocumentIdIn(
+        attemptId: Long,
+        sourceDocumentIds: Collection<String>,
+    ): List<PermissionSyncStageEntity>
+    fun findAllByAttemptIdAndSourceDocumentIdGreaterThanOrderBySourceDocumentId(
+        attemptId: Long,
+        sourceDocumentId: String,
+        pageable: Pageable,
+    ): List<PermissionSyncStageEntity>
+    fun countByAttemptId(attemptId: Long): Long
+    fun countByAttemptIdAndHasErrorTrue(attemptId: Long): Long
+    fun deleteAllByAttemptId(attemptId: Long)
+    fun deleteAllByAttemptIdIn(attemptIds: Collection<Long>)
+}
+
 @Repository
 class IngestionEnumerationRepository(
-    private val jdbc: JdbcTemplate,
+    private val rows: IngestionEnumerationJpaRepository,
 ) {
     @Transactional
     fun registerDocuments(attemptId: Long, sourceDocumentIds: Collection<String>): Set<String> {
         val ids = sourceDocumentIds.filter(String::isNotBlank).distinct()
-        jdbc.batchUpdate(
-            """
-                INSERT INTO ingestion_enumerated_documents(attempt_id, source_document_id)
-                VALUES (?, ?)
-                ON CONFLICT DO NOTHING
-            """.trimIndent(),
-            ids,
-            ENUMERATION_PAGE_SIZE,
-        ) { statement, sourceDocumentId ->
-            statement.setLong(1, attemptId)
-            statement.setString(2, sourceDocumentId)
-        }
-        return ids.chunked(ENUMERATION_PAGE_SIZE).flatMapTo(mutableSetOf()) { page ->
-            val placeholders = List(page.size) { "?" }.joinToString()
-            val parameters: Array<Any> = arrayOf(attemptId, *page.toTypedArray())
-            jdbc.queryForList(
-                """
-                    SELECT source_document_id
-                    FROM ingestion_enumerated_documents
-                    WHERE attempt_id = ?
-                      AND processed = FALSE
-                      AND source_document_id IN ($placeholders)
-                """.trimIndent(),
-                String::class.java,
-                *parameters,
-            )
-        }
+        val existing = rows.findAllByAttemptIdAndSourceDocumentIdIn(attemptId, ids)
+            .associateBy { it.sourceDocumentId }
+        rows.saveAll(ids.filterNot(existing::containsKey).map { IngestionEnumeratedDocumentEntity(attemptId, it) })
+        return ids.filterTo(mutableSetOf()) { existing[it]?.processed != true }
     }
 
     @Transactional
     fun markProcessed(attemptId: Long, sourceDocumentId: String) {
-        check(
-            jdbc.update(
-                """
-                    UPDATE ingestion_enumerated_documents
-                    SET processed = TRUE
-                    WHERE attempt_id = ? AND source_document_id = ?
-                """.trimIndent(),
-                attemptId,
-                sourceDocumentId,
-            ) == 1,
-        ) { "Enumerated document disappeared before processing completed" }
+        val row = rows.findById(IngestionEnumeratedDocumentId(attemptId, sourceDocumentId)).orElseThrow {
+            IllegalStateException("Enumerated document disappeared before processing completed")
+        }
+        row.processed = true
+        rows.save(row)
     }
 
     @Transactional
     fun protectFailures(attemptId: Long, sourceDocumentIds: Collection<String>) {
         val ids = sourceDocumentIds.filter(String::isNotBlank).distinct()
-        jdbc.batchUpdate(
-            """
-                INSERT INTO ingestion_enumerated_documents(attempt_id, source_document_id)
-                VALUES (?, ?)
-                ON CONFLICT DO NOTHING
-            """.trimIndent(),
-            ids,
-            ENUMERATION_PAGE_SIZE,
-        ) { statement, sourceDocumentId ->
-            statement.setLong(1, attemptId)
-            statement.setString(2, sourceDocumentId)
+        val existing = rows.findAllByAttemptIdAndSourceDocumentIdIn(attemptId, ids).mapTo(mutableSetOf()) {
+            it.sourceDocumentId
         }
+        rows.saveAll(ids.filterNot(existing::contains).map { IngestionEnumeratedDocumentEntity(attemptId, it) })
     }
 
     fun findMissingPage(pairId: Long, attemptId: Long, afterSourceDocumentId: String, limit: Int): List<String> =
-        jdbc.queryForList(
-            """
-                SELECT document.source_document_id
-                FROM indexed_documents document
-                WHERE document.cc_pair_id = ?
-                  AND document.source_document_id > ?
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM ingestion_enumerated_documents enumerated
-                      WHERE enumerated.attempt_id = ?
-                        AND enumerated.source_document_id = document.source_document_id
-                  )
-                ORDER BY document.source_document_id
-                LIMIT ?
-            """.trimIndent(),
-            String::class.java,
+        rows.findMissingSourceDocumentIds(
             pairId,
-            afterSourceDocumentId,
             attemptId,
-            limit,
+            afterSourceDocumentId,
+            org.springframework.data.domain.PageRequest.of(0, limit),
         )
+}
 
-    private companion object {
-        const val ENUMERATION_PAGE_SIZE = 500
-    }
+interface IngestionEnumerationJpaRepository :
+    JpaRepository<IngestionEnumeratedDocumentEntity, IngestionEnumeratedDocumentId> {
+    fun findAllByAttemptIdAndSourceDocumentIdIn(
+        attemptId: Long,
+        sourceDocumentIds: Collection<String>,
+    ): List<IngestionEnumeratedDocumentEntity>
+
+    @Query(
+        """
+            SELECT document.sourceDocumentId
+            FROM IndexedDocumentEntity document
+            WHERE document.ccPairId = :pairId
+              AND document.sourceDocumentId > :afterSourceDocumentId
+              AND NOT EXISTS (
+                  SELECT enumerated.sourceDocumentId FROM IngestionEnumeratedDocumentEntity enumerated
+                  WHERE enumerated.attemptId = :attemptId
+                    AND enumerated.sourceDocumentId = document.sourceDocumentId
+              )
+            ORDER BY document.sourceDocumentId
+        """,
+    )
+    fun findMissingSourceDocumentIds(
+        @Param("pairId") pairId: Long,
+        @Param("attemptId") attemptId: Long,
+        @Param("afterSourceDocumentId") afterSourceDocumentId: String,
+        pageable: Pageable,
+    ): List<String>
 }
