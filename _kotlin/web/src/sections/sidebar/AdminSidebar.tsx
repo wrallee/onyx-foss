@@ -51,7 +51,11 @@ export default function AdminSidebar() {
 
   return (
     <SidebarLayouts.Root>
-      <SidebarLayouts.Header renderAppLogo={renderSidebarLogo} showLogoWhenFolded>
+      <SidebarLayouts.Header
+        renderAppLogo={renderSidebarLogo}
+        logoHref="/"
+        showLogoWhenFolded
+      >
         {folded ? (
           <SidebarTab
             icon={SvgSearch}
@@ -79,9 +83,7 @@ export default function AdminSidebar() {
           <React.Fragment key={index}>
             <SidebarLayouts.Section
               title={
-                group.sectionId
-                  ? SECTION_LABELS[group.sectionId]
-                  : undefined
+                group.sectionId ? SECTION_LABELS[group.sectionId] : undefined
               }
             >
               {group.items.map(({ disabled, icon, label, link, nameId }) => (
