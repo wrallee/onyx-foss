@@ -3,10 +3,12 @@ package com.onyx.foss.kotlin.ingestion
 import com.onyx.foss.kotlin.config.OnyxProperties
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
-import org.springframework.web.reactive.function.client.WebClientRequestException
 import org.springframework.web.reactive.function.client.WebClient
+import org.springframework.web.reactive.function.client.WebClientRequestException
+import org.springframework.web.reactive.function.client.WebClientResponseException
 import java.util.concurrent.TimeUnit
 
 class ModelServerClientTest {
@@ -19,18 +21,60 @@ class ModelServerClientTest {
                 .setBody("""{"embeddings":[[0.1]]}"""),
         )
         server.start()
-        val client = ModelServerClient(
-            properties = OnyxProperties(
-                modelServer = OnyxProperties.ModelServer(
-                    baseUrl = server.url("/").toString(),
-                    modelName = "test-model",
-                    connectTimeoutMs = 1_000,
-                    readTimeoutMs = 50,
-                ),
-            ),
-            clientBuilder = WebClient.builder(),
+        val client = client(
+            server,
+            connectTimeoutMs = 1_000,
+            readTimeoutMs = 50,
         )
 
         assertThrows(WebClientRequestException::class.java) { client.embed(listOf("text")) }
     }
+
+    @Test
+    fun `embed retries on a 502 and succeeds once connection recovers`() = MockWebServer().use { server ->
+        server.enqueue(MockResponse().setResponseCode(502))
+        server.enqueue(MockResponse().setResponseCode(502))
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setBody("""{"embeddings":[[0.1,0.2]]}"""),
+        )
+        server.start()
+
+        val result = client(server, embedMaxRetries = 2, embedRetryInitialBackoffMs = 5).embed(listOf("hello"))
+
+        assertEquals(listOf(listOf(0.1, 0.2)), result)
+        assertEquals(3, server.requestCount)
+    }
+
+    @Test
+    fun `embed gives up after exhausting retries`() = MockWebServer().use { server ->
+        repeat(3) { server.enqueue(MockResponse().setResponseCode(502)) }
+        server.start()
+
+        assertThrows(WebClientResponseException::class.java) {
+            client(server, embedMaxRetries = 2, embedRetryInitialBackoffMs = 5).embed(listOf("hello"))
+        }
+        assertEquals(3, server.requestCount)
+    }
+
+    private fun client(
+        server: MockWebServer,
+        connectTimeoutMs: Long = 1_000,
+        readTimeoutMs: Long = 30_000,
+        embedMaxRetries: Int = 0,
+        embedRetryInitialBackoffMs: Long = 0,
+    ) = ModelServerClient(
+        properties = OnyxProperties(
+            modelServer = OnyxProperties.ModelServer(
+                baseUrl = server.url("/").toString(),
+                modelName = "test-model",
+                connectTimeoutMs = connectTimeoutMs,
+                readTimeoutMs = readTimeoutMs,
+                embedMaxRetries = embedMaxRetries,
+                embedRetryInitialBackoffMs = embedRetryInitialBackoffMs,
+            ),
+        ),
+        clientBuilder = WebClient.builder(),
+    )
 }
