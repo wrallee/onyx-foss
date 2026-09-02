@@ -68,6 +68,10 @@ const nextConfig = {
   async rewrites() {
     return [
       {
+        source: "/mcp",
+        destination: "/api/mcp",
+      },
+      {
         source: "/api/build/sessions/:sessionId/webapp/_next/webpack-hmr",
         destination: `${
           process.env.INTERNAL_URL || "http://localhost:8080"

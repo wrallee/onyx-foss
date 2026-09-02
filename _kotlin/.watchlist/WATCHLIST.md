@@ -107,6 +107,20 @@ This file records deferred checks. It does not schedule work.
 - result:
 - next_step_on_fail: 공식 client에 typed API가 없는 작업만 generic transport로 분리한다.
 
+### WL-20260902-001 — Spring 업그레이드와 Spring AI 도입 검토
+- status: open
+- priority: P2
+- owner: both
+- due_at: unscheduled
+- created_at: 2026-09-02T10:36:44+09:00
+- source: backend/build.gradle.kts; Kotlin 검색·MCP 구현 대화
+- trigger: 벡터 데이터베이스 검색을 직접 구현하기 전에 Spring AI의 Vector Store 지원을 활용할 수 있는지 확인해야 한다.
+- action: Spring Boot를 호환 버전으로 올리고 Spring AI를 추가하는 방안을 우선 검토한다.
+- done_when: 호환 버전과 마이그레이션 범위가 정해지고 Spring AI 기반 벡터 검색 도입 여부가 검증 결과와 함께 결정된다.
+- last_checked_at:
+- result:
+- next_step_on_fail: 현재 OpenSearch REST 구현을 유지하고 필요한 검색 기능만 최소 구현한다.
+
 ## Done
 
 ## Archive

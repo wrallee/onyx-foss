@@ -1,8 +1,10 @@
 package com.onyx.foss.kotlin.ingestion
 
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
@@ -12,6 +14,33 @@ import org.springframework.web.reactive.function.client.WebClientResponseExcepti
 import java.util.concurrent.TimeUnit
 
 class ModelServerClientTest {
+    @Test
+    fun `query embedding sends query text type`() {
+        MockWebServer().use { server ->
+            server.enqueue(
+                MockResponse().setHeader("Content-Type", "application/json")
+                    .setBody("""{"embeddings":[[0.1,0.2]]}"""),
+            )
+            server.start()
+            val client = ModelServerClient(
+                OnyxProperties(
+                    modelServer = OnyxProperties.ModelServer(
+                        baseUrl = server.url("/").toString(),
+                        modelName = "embedding-model",
+                    ),
+                ),
+                WebClient.builder(),
+            )
+
+            assertThat(client.embedQuery("search terms")).containsExactly(0.1, 0.2)
+
+            val request = server.takeRequest()
+            val body = jacksonObjectMapper().readTree(request.body.readUtf8())
+            assertThat(request.path).isEqualTo("/encoder/bi-encoder-embed")
+            assertThat(body.path("texts").map { it.asText() }).containsExactly("search terms")
+            assertThat(body.path("text_type").asText()).isEqualTo("query")
+        }
+    }
     @Test
     fun readTimeoutAppliesToEmbeddingResponse() = MockWebServer().use { server ->
         server.enqueue(

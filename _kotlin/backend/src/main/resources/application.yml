@@ -33,13 +33,17 @@ onyx:
   model-server:
     base-url: ${MODEL_SERVER_URL:http://model-server:9000}
     model-name: ${ONYX_EMBEDDING_MODEL_NAME:}
+    embedding-dimension: ${ONYX_EMBEDDING_DIMENSION:768}
     max-context-length: ${ONYX_EMBEDDING_MAX_CONTEXT_LENGTH:512}
     normalize-embeddings: ${ONYX_EMBEDDING_NORMALIZE:true}
     reranker-enabled: ${ONYX_RERANKER_ENABLED:true}
     reranker-model-name: ${ONYX_RERANKER_MODEL_NAME:Alibaba-NLP/gte-multilingual-reranker-base}
     reranker-max-documents: ${ONYX_RERANKER_MAX_DOCUMENTS:100}
+    search-candidates: ${ONYX_SEARCH_CANDIDATES:50}
+    search-rerank-candidates: ${ONYX_SEARCH_RERANK_CANDIDATES:30}
     connect-timeout-ms: ${MODEL_SERVER_CONNECT_TIMEOUT_MS:30000}
     read-timeout-ms: ${MODEL_SERVER_READ_TIMEOUT_MS:600000}
+    reranker-timeout-ms: ${ONYX_RERANKER_TIMEOUT_MS:30000}
     reranker-fallback-on-error: ${ONYX_RERANKER_FALLBACK_ON_ERROR:true}
     embed-max-retries: ${ONYX_EMBED_MAX_RETRIES:2}
     embed-retry-initial-backoff-ms: ${ONYX_EMBED_RETRY_INITIAL_BACKOFF_MS:2000}

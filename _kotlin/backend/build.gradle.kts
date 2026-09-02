@@ -27,6 +27,9 @@ kotlin {
 repositories { mavenCentral() }
 
 dependencies {
+    implementation(platform("io.modelcontextprotocol.sdk:mcp-bom:2.0.1"))
+    implementation("io.modelcontextprotocol.sdk:mcp-core")
+    implementation("io.modelcontextprotocol.sdk:mcp-json-jackson2")
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.springframework.boot:spring-boot-starter-webflux")
     implementation("org.springframework.boot:spring-boot-starter-data-jpa")

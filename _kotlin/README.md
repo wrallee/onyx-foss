@@ -9,6 +9,7 @@ and uses a Python 3.13 model-server for both embedding and reranking.
 - Connector credentials encrypted at rest with AES-GCM
 - PostgreSQL-backed jobs, attempts, checkpoints, and document sets
 - Tika extraction, Python model-server calls, and OpenSearch indexing
+- Hybrid keyword and vector search through a Streamable HTTP MCP endpoint
 - Authentication-free admin UI for local or private networks
 
 All other connector cards and unrelated admin routes remain visible but are
@@ -79,6 +80,34 @@ docker compose up -d
 ```
 
 Open `http://localhost:3000`. Only the Web service is published to the host.
+
+## MCP search
+
+Connect remote MCP clients to `https://onyx-admin.com/mcp`. The Web service
+proxies this path to the Kotlin backend. The backend endpoint is not published
+directly.
+
+```json
+{
+  "mcpServers": {
+    "onyx": {
+      "url": "https://onyx-admin.com/mcp"
+    }
+  }
+}
+```
+
+The `search` tool accepts an optional `document_sets` array. It searches the
+union of those sets. It retrieves 50 keyword and vector candidates by default,
+then reranks at most 30. Set `ONYX_SEARCH_CANDIDATES` and
+`ONYX_SEARCH_RERANK_CANDIDATES` to change these values.
+
+Delete the existing OpenSearch index before this version is deployed. The
+application does not delete it. It rejects an incompatible embedding mapping
+and waits for a clean reindex.
+
+The MCP endpoint has no authentication in this development version. Do not
+expose it beyond the intended private environment until authentication exists.
 
 ## Verification
 

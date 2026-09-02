@@ -30,6 +30,114 @@ class OpenSearchIndexerTest {
     }
 
     @Test
+    fun `candidate search applies document set union to keyword and vector queries`() {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.enqueue(jsonResponse(exactMappingResponse()))
+            server.enqueue(jsonResponse(searchResponse("keyword", 2.0)))
+            server.enqueue(jsonResponse(searchResponse("vector", 1.5)))
+            server.start()
+            val indexer = OpenSearchIndexer(
+                OnyxProperties(
+                    opensearch = OnyxProperties.OpenSearch(
+                        baseUrl = server.url("/").toString().trimEnd('/'),
+                        index = "documents",
+                    ),
+                ),
+                WebClient.builder(),
+                mapper,
+                externalWrites,
+            )
+
+            val results = indexer.searchCandidates(
+                query = "deployment guide",
+                queryEmbedding = List(768) { 0.1 },
+                documentSets = listOf("Engineering", "Operations"),
+                count = 30,
+            )
+
+            server.takeRequest()
+            server.takeRequest()
+            val keyword = mapper.readTree(server.takeRequest().body.readUtf8())
+            val vector = mapper.readTree(server.takeRequest().body.readUtf8())
+            assertThat(keyword.path("size").asInt()).isEqualTo(30)
+            assertThat(keyword.path("query").path("bool").path("filter").path("terms")
+                .path("document_sets").map { it.asText() })
+                .containsExactly("Engineering", "Operations")
+            assertThat(vector.path("query").path("knn").path("embedding").path("filter")
+                .path("terms").path("document_sets").map { it.asText() })
+                .containsExactly("Engineering", "Operations")
+            assertThat(results.keyword.single().id).isEqualTo("keyword")
+            assertThat(results.vector.single().id).isEqualTo("vector")
+        }
+    }
+
+    @Test
+    fun `new index stores embeddings as 768 dimensional knn vectors`() {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(404))
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.start()
+            val indexer = OpenSearchIndexer(
+                OnyxProperties(
+                    modelServer = OnyxProperties.ModelServer(embeddingDimension = 768),
+                    opensearch = OnyxProperties.OpenSearch(
+                        baseUrl = server.url("/").toString().trimEnd('/'),
+                        index = "documents",
+                    ),
+                ),
+                WebClient.builder(),
+                mapper,
+                externalWrites,
+            )
+
+            indexer.upsert(7, "one", 0, "One", "content", null, emptyMap(), listOf(0.1))
+
+            server.takeRequest()
+            val create = server.takeRequest()
+            val body = mapper.readTree(create.body.readUtf8())
+            val embedding = body.path("mappings").path("properties").path("embedding")
+            assertThat(create.path).isEqualTo("/documents")
+            assertThat(body.path("settings").path("index").path("knn").asBoolean()).isTrue()
+            assertThat(embedding.path("type").asText()).isEqualTo("knn_vector")
+            assertThat(embedding.path("dimension").asInt()).isEqualTo(768)
+            assertThat(embedding.path("method").path("engine").asText()).isEqualTo("lucene")
+            assertThat(embedding.path("method").path("space_type").asText()).isEqualTo("cosinesimil")
+        }
+    }
+
+    @Test
+    fun `existing numeric embedding mapping requires an explicit index reset`() {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.enqueue(
+                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
+                    .setBody(exactMappingResponse("float")),
+            )
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.start()
+            val indexer = OpenSearchIndexer(
+                OnyxProperties(
+                    opensearch = OnyxProperties.OpenSearch(
+                        baseUrl = server.url("/").toString().trimEnd('/'),
+                        index = "documents",
+                    ),
+                ),
+                WebClient.builder(),
+                mapper,
+                externalWrites,
+            )
+
+            val error = org.junit.jupiter.api.assertThrows<IllegalStateException> {
+                indexer.upsert(7, "one", 0, "One", "content", null, emptyMap(), listOf(0.1))
+            }
+
+            assertThat(error.message).contains("delete the OpenSearch index")
+        }
+    }
+
+    @Test
     fun `accepts self-signed OpenSearch certificate when verification is disabled`() {
         val certificate = SelfSignedCertificate("localhost")
         val server = HttpServer.create()
@@ -330,6 +438,9 @@ class OpenSearchIndexerTest {
     private fun successfulUpdateResponse(): String =
         """{"timed_out":false,"total":1,"updated":1,"noops":0,"version_conflicts":0,"failures":[]}"""
 
+    private fun searchResponse(id: String, score: Double): String =
+        """{"hits":{"hits":[{"_id":"$id","_score":$score,"_source":{"source_document_id":"doc-$id","chunk_id":0,"title":"Title","content":"Content","link":"https://example.test/$id","metadata":{"type":"guide"}}}]}}"""
+
     private fun migrationDispatcher(aliasAppliedDespiteResponse: Boolean): Dispatcher {
         val logicalMappingReads = AtomicInteger()
         val replacementExists = AtomicBoolean(false)
@@ -370,7 +481,7 @@ class OpenSearchIndexerTest {
     private fun legacyMappingResponse(): String =
         """{"documents":{"mappings":{"properties":{"source_document_id":{"type":"text"}}}}}"""
 
-    private fun exactMappingResponse(): String = mapper.writeValueAsString(
+    private fun exactMappingResponse(embeddingType: String = "knn_vector"): String = mapper.writeValueAsString(
         mapOf(
             "documents-exact-v1" to mapOf(
                 "mappings" to mapOf(
@@ -385,6 +496,11 @@ class OpenSearchIndexerTest {
                         "doc_updated_at" to mapOf("type" to "date"),
                         "primary_owners" to mapOf("type" to "keyword"),
                         "secondary_owners" to mapOf("type" to "keyword"),
+                        "embedding" to if (embeddingType == "knn_vector") {
+                            mapOf("type" to embeddingType, "dimension" to 768)
+                        } else {
+                            mapOf("type" to embeddingType)
+                        },
                     ),
                 ),
             ),
