@@ -9,4 +9,4 @@
 ## Additional Options
 
 - [ ] [Optional] Please cherry-pick this PR to the latest release version.
-- [ ] [Optional] Override Linear Check
+- [x] [Optional] Override Linear Check
