@@ -4,7 +4,7 @@ import org.springframework.boot.context.properties.ConfigurationProperties
 
 @ConfigurationProperties("onyx")
 data class OnyxProperties(
-    val multiTenant: Boolean = false,
+    val multiTenant: Boolean = true,
     val crypto: Crypto = Crypto(),
     val storage: Storage = Storage(),
     val modelServer: ModelServer = ModelServer(),
