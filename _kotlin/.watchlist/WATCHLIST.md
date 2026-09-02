@@ -121,6 +121,20 @@ This file records deferred checks. It does not schedule work.
 - result:
 - next_step_on_fail: 현재 OpenSearch REST 구현을 유지하고 필요한 검색 기능만 최소 구현한다.
 
+### WL-20260903-001 — OpenSearch 검색 응답 버퍼 한도 임시 상향
+- status: open
+- priority: P2
+- owner: both
+- due_at: unscheduled
+- created_at: 2026-09-03T00:00:00+09:00
+- source: backend/src/main/kotlin/com/onyx/foss/kotlin/ingestion/IngestionWorker.kt (OpenSearchIndexer.search)
+- trigger: 넓은 검색 쿼리에서 응답이 WebClient 기본 codec 한도(256KB)를 넘어 DataBufferLimitException이 발생했다. OpenSearchIndexer의 client codec maxInMemorySize를 ModelServerClient와 동일하게 16MB로 올려 응급 조치했다.
+- action: 응답 크기를 늘린 한도로 계속 허용하는 대신, 쿼리 쪽에서 _source 필드 제한과 size 상한을 적용하거나 스트리밍 파싱으로 전환해 근본 원인을 없앤다. WL-20260901-006(OpenSearch 공식 client 전환)과 함께 검토한다.
+- done_when: 대형 검색 결과에서도 메모리 사용량이 예측 가능하게 유지되고, 응답 크기 상한을 넘는 쿼리에 대한 처리(에러 반환 또는 페이지네이션)가 테스트로 검증된다.
+- last_checked_at:
+- result:
+- next_step_on_fail: 16MB 한도도 넘는 사례가 재현되면 쿼리 크기 제한을 우선 적용하고 한도 상향은 되돌린다.
+
 ## Done
 
 ## Archive
