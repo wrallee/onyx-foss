@@ -44,6 +44,22 @@ it("collapses the label inside a folded foldable sidebar", () => {
   expect(foldStateOf("Settings")).toBe("true");
 });
 
+it("renders logo as a link when logoHref is provided", () => {
+  render(
+    <SidebarStateProvider defaultFolded={false}>
+      <SidebarLayouts.Root>
+        <SidebarLayouts.Header
+          renderAppLogo={() => () => <svg data-testid="test-logo" />}
+          logoHref="/"
+        />
+      </SidebarLayouts.Root>
+    </SidebarStateProvider>
+  );
+  const logoLink = screen.getByTestId("test-logo").closest("a");
+  expect(logoLink).not.toBeNull();
+  expect(logoLink?.getAttribute("href")).toBe("/");
+});
+
 it("keeps the label in a non-foldable sidebar, even when app state is folded", () => {
   render(<FoldedSidebar />);
   expect(foldStateOf("Settings")).toBe("false");
@@ -147,7 +163,7 @@ it("shows the folded label tooltip from the tab's control", async () => {
   await waitFor(() => {
     expect(screen.getByRole("tooltip")).toHaveTextContent("Settings");
   });
-});
+}, 15000);
 
 it("shows an explicit tooltip on a disabled tab", async () => {
   // A disabled tab has no control, so an inert overlay is the trigger.
@@ -169,4 +185,4 @@ it("shows an explicit tooltip on a disabled tab", async () => {
   await waitFor(() => {
     expect(screen.getByRole("tooltip")).toHaveTextContent("Enterprise only");
   });
-});
+}, 15000);

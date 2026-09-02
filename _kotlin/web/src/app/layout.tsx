@@ -9,6 +9,7 @@ import SWRConfigProvider from "@/providers/SWRConfigProvider";
 import KotlinAdminProvider from "@/providers/KotlinAdminProvider";
 import { NextIntlClientProvider } from "next-intl";
 import { getLocale, getMessages } from "next-intl/server";
+import { generateFaviconMetadata } from "@/lib/app/svcSS";
 
 const hankenGrotesk = localFont({
   src: "./fonts/hanken-grotesk-latin.woff2",
@@ -34,7 +35,12 @@ const dmMono = localFont({
 });
 
 export const dynamic = "force-dynamic";
-export const metadata: Metadata = { title: "Onyx Admin" };
+export async function generateMetadata(): Promise<Metadata> {
+  return {
+    title: "Onyx Admin",
+    icons: await generateFaviconMetadata(),
+  };
+}
 
 interface LayoutProps {
   children: React.ReactNode;
@@ -73,9 +79,9 @@ export default async function Layout({ children }: LayoutProps) {
               <TooltipProvider>
                 <SWRConfigProvider>
                   <KotlinAdminProvider>
-                      <div id={MODAL_ROOT_ID} className="h-screen w-screen">
-                        {children}
-                      </div>
+                    <div id={MODAL_ROOT_ID} className="h-screen w-screen">
+                      {children}
+                    </div>
                   </KotlinAdminProvider>
                 </SWRConfigProvider>
               </TooltipProvider>

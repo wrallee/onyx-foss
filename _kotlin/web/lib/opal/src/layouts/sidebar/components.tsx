@@ -3,6 +3,7 @@
 import "@opal/layouts/sidebar/styles.css";
 import {
   createContext,
+  createElement,
   useCallback,
   useContext,
   useEffect,
@@ -11,6 +12,7 @@ import {
   useRef,
 } from "react";
 import { usePathname } from "next/navigation";
+import Link from "next/link";
 import { Button, ShadowDiv, Spacer, Text, Tooltip } from "@opal/components";
 import { iconWrapper } from "@opal/components/buttons/icon-wrapper";
 import { Disabled, Hoverable, Interactive } from "@opal/core";
@@ -159,12 +161,17 @@ interface SidebarHeaderProps {
    * when folded.
    */
   showLogoWhenFolded?: boolean;
+  /**
+   * Optional URL to navigate to when the logo is clicked in the unfolded state.
+   */
+  logoHref?: string;
   children?: React.ReactNode;
 }
 
 function SidebarHeader({
   renderAppLogo,
   showLogoWhenFolded = true,
+  logoHref,
   children,
 }: SidebarHeaderProps) {
   const foldable = useContext(SidebarFoldableContext);
@@ -191,8 +198,17 @@ function SidebarHeader({
     [folded, foldLabel, toggleFolded]
   );
 
-  const Logo = renderAppLogo(foldable ? folded : false);
-  const logoEl = <Logo size={SIDEBAR_LOGO_HEIGHT_PX} />;
+  const rawLogo = createElement(
+    renderAppLogo(foldable ? folded : false),
+    { size: SIDEBAR_LOGO_HEIGHT_PX }
+  );
+  const logoEl = logoHref ? (
+    <Link href={logoHref} className="inline-flex items-center">
+      {rawLogo}
+    </Link>
+  ) : (
+    rawLogo
+  );
 
   // Folded: the logo *is* the unfold control. The fold icon swaps in on hover
   // (and on keyboard focus), but the button underneath never changes, so the

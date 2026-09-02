@@ -368,7 +368,10 @@ export default function AddConnector({
               "transform" in matchingConfigValue &&
               matchingConfigValue.transform
             ) {
-              acc[key] = matchingConfigValue.transform(value as string[]);
+              acc[key] = (matchingConfigValue.transform as Function)(
+                value,
+                connector_specific_config
+              );
             } else {
               acc[key] = value;
             }
@@ -641,7 +644,9 @@ export default function AddConnector({
                         onClose={closeCredentialModal}
                       />
                       <Modal.Body alignItems="stretch">
-                        {oauthDetailsLoading ? (
+                        {credentialCreationMethod ===
+                          CredentialCreationMethod.OAuth &&
+                        oauthDetailsLoading ? (
                           <Spinner />
                         ) : credentialCreationMethod ===
                             CredentialCreationMethod.OAuth && oauthDetails ? (

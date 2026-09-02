@@ -313,7 +313,10 @@ export default function CredentialSection({
             />
             <Modal.Body alignItems="stretch">
               {showCreateCredential ? (
-                oauthDetailsLoading ? (
+                oauthDetailsLoading &&
+                (credentialCreationMethod === null ||
+                  credentialCreationMethod ===
+                    CredentialCreationMethod.OAuth) ? (
                   <Spinner />
                 ) : credentialCreationMethod === null ? (
                   <Section alignItems="start" gap={1}>

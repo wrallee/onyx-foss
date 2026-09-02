@@ -42,6 +42,10 @@ export function useOAuthDetails(sourceType: ValidSources) {
     errorHandlingFetcher,
     {
       shouldRetryOnError: false,
+      revalidateOnFocus: false,
+      revalidateOnReconnect: false,
+      revalidateIfStale: false,
+      dedupingInterval: 300_000,
     }
   );
 }

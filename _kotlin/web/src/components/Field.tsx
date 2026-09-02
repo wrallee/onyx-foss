@@ -235,6 +235,9 @@ export function TextFormField({
   vertical,
   className,
   showPasswordToggle = false,
+  rightText,
+  rightElement,
+  leftElement,
 }: {
   name: string;
   removeLabel?: boolean;
@@ -263,6 +266,9 @@ export function TextFormField({
   vertical?: boolean;
   className?: string;
   showPasswordToggle?: boolean;
+  rightText?: string | JSX.Element;
+  rightElement?: React.ReactNode;
+  leftElement?: React.ReactNode;
 }) {
   let heightString = defaultHeight || "";
   if (isTextArea && !heightString) {
@@ -304,7 +310,7 @@ export function TextFormField({
   const effectiveType = isPasswordField && isPasswordVisible ? "text" : type;
 
   return (
-    <div className={`w-full ${maxWidth} ${width}`}>
+    <div className={`w-full ${maxWidth || ""} ${width}`}>
       <FieldLabel
         key={name}
         subtext={subtext}
@@ -317,72 +323,100 @@ export function TextFormField({
         removeLabel={removeLabel}
         vertical={vertical}
       />
-      <div className={`w-full flex ${includeRevert && "gap-x-2"} relative`}>
-        <Field
-          onChange={handleChange}
-          min={min}
-          as={isTextArea ? "textarea" : "input"}
-          type={effectiveType}
-          data-testid={name}
-          name={name}
-          id={name}
-          className={`
-            ${small && sizeClass.input}
-            flex
-            h-10
-            w-full
-            rounded-md
-            border
-            px-3
-            py-2
-            mt-1
-            file:border-0
-            file:bg-transparent
-            file:text-sm
-            file:font-medium
-            file:text-text-05
-            placeholder:text-text-02
-            placeholder:font-description
-            placeholder:${sizeClass.placeholder}
-            caret-accent
-            focus-visible:outline-hidden
-            focus-visible:ring-1
-            focus-visible:ring-lighter-agent
-            focus-visible:ring-offset-1
-            disabled:cursor-not-allowed
-            disabled:opacity-50
-            md:text-sm
-            border-border-03
-            ring-offset-background-neutral-00
-            file:text-text-inverted-05
-            text-text-04
+      <div
+        className={`w-full flex items-center ${
+          includeRevert && "gap-x-2"
+        } relative`}
+      >
+        {leftElement && (
+          <div className="mr-4 mt-1 flex items-center shrink-0">
+            {leftElement}
+          </div>
+        )}
+        <div
+          className={`flex-1 min-w-0 flex items-center ${
+            maxWidth || ""
+          } relative`}
+        >
+          <Field
+            onChange={handleChange}
+            min={min}
+            as={isTextArea ? "textarea" : "input"}
+            type={effectiveType}
+            data-testid={name}
+            name={name}
+            id={name}
+            className={`
+              ${small && sizeClass.input}
+              flex
+              h-10
+              ${
+                rightText
+                  ? "min-w-0 flex-1 rounded-l-md rounded-r-none border-r-0 focus-visible:z-10"
+                  : "w-full rounded-md"
+              }
+              border
+              px-3
+              py-2
+              mt-1
+              file:border-0
+              file:bg-transparent
+              file:text-sm
+              file:font-medium
+              file:text-text-05
+              placeholder:text-text-02
+              placeholder:font-description
+              placeholder:${sizeClass.placeholder}
+              caret-accent
+              focus-visible:outline-hidden
+              focus-visible:ring-1
+              focus-visible:ring-lighter-agent
+              focus-visible:ring-offset-1
+              disabled:cursor-not-allowed
+              disabled:opacity-50
+              md:text-sm
+              border-border-03
+              ring-offset-background-neutral-00
+              file:text-text-inverted-05
+              text-text-04
 
-            ${heightString}
-            ${sizeClass.input}
-            ${disabled ? "bg-background-neutral-02" : ""}
-            ${isCode ? "font-mono" : ""}
-            ${className}
-            bg-background-neutral-00
-            ${isPasswordField && showPasswordToggle ? "pr-10" : ""}
-          `}
-          disabled={disabled}
-          placeholder={placeholder}
-          autoComplete={autoCompleteEnabled ? undefined : "off"}
-        />
-        {!isTextArea && isPasswordField && showPasswordToggle && (
-          <button
-            type="button"
-            aria-label={isPasswordVisible ? "Hide password" : "Show password"}
-            className="absolute right-3 top-1/2 -translate-y-1/2 stroke-text-02 hover:stroke-text-03 mt-0.5"
-            onClick={() => setIsPasswordVisible((v) => !v)}
-            tabIndex={0}
-          >
-            {isPasswordVisible ? (
-              <SvgEye className="h-4 w-4" />
-            ) : (
-              <SvgEyeClosed className="h-4 w-4" />
-            )}
-          </button>
+              ${heightString}
+              ${sizeClass.input}
+              ${disabled ? "bg-background-neutral-02" : ""}
+              ${isCode ? "font-mono" : ""}
+              ${className}
+              bg-background-neutral-00
+              ${isPasswordField && showPasswordToggle ? "pr-10" : ""}
+            `}
+            disabled={disabled}
+            placeholder={placeholder}
+            autoComplete={autoCompleteEnabled ? undefined : "off"}
+          />
+          {rightText && (
+            <span className="mt-1 h-10 inline-flex items-center px-3 text-sm text-text-03 font-mono bg-background-neutral-02 border border-l-0 border-border-03 rounded-r-md select-none shrink-0">
+              {rightText}
+            </span>
+          )}
+          {!isTextArea && isPasswordField && showPasswordToggle && (
+            <button
+              type="button"
+              aria-label={isPasswordVisible ? "Hide password" : "Show password"}
+              className="absolute right-3 top-1/2 -translate-y-1/2 stroke-text-02 hover:stroke-text-03 mt-0.5"
+              onClick={() => setIsPasswordVisible((v) => !v)}
+              tabIndex={0}
+            >
+              {isPasswordVisible ? (
+                <SvgEye className="h-4 w-4" />
+              ) : (
+                <SvgEyeClosed className="h-4 w-4" />
+              )}
+            </button>
+          )}
+        </div>
+        {rightElement && (
+          <div className="ml-4 mt-1 flex items-center shrink-0">
+            {rightElement}
+          </div>
         )}
       </div>
 

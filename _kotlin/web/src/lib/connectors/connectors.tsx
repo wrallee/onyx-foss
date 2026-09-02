@@ -43,7 +43,41 @@ export interface Option {
     currentCredential: Credential<any> | null
   ) => boolean;
   wrapInCollapsible?: boolean;
-  disabled?: boolean | ((currentCredential: Credential<any> | null) => boolean);
+  disabled?:
+    | boolean
+    | ((values: any, currentCredential: Credential<any> | null) => boolean)
+    | ((currentCredential: Credential<any> | null) => boolean);
+  rightText?:
+    | string
+    | React.ReactNode
+    | ((
+        values: any,
+        currentCredential: Credential<any> | null
+      ) => string | React.ReactNode | undefined);
+  leftElement?:
+    | React.ReactNode
+    | ((
+        values: any,
+        currentCredential: Credential<any> | null,
+        setFieldValue: (field: string, value: any) => void
+      ) => React.ReactNode);
+  leftField?: Option;
+  rightElement?:
+    | React.ReactNode
+    | ((
+        values: any,
+        currentCredential: Credential<any> | null,
+        setFieldValue: (field: string, value: any) => void
+      ) => React.ReactNode);
+  rightField?: Option;
+  transform?: (value: any, values?: any) => any;
+  maxWidth?: string;
+  width?: string;
+  onChange?: (
+    value: any,
+    setFieldValue: (field: string, value: any) => void,
+    values?: any
+  ) => void;
 }
 
 export interface SelectOption extends Option {
@@ -81,6 +115,7 @@ export interface TextOption extends Option {
   default?: string;
   initial?: string | ((currentCredential: Credential<any> | null) => string);
   isTextArea?: boolean;
+  placeholder?: string;
 }
 
 export interface NumberOption extends Option {
@@ -281,6 +316,56 @@ export const connectorConfigs: Record<
   github: {
     description: "Configure GitHub connector",
     values: [
+      {
+        type: "checkbox",
+        query: "Is this a public GitHub instance?",
+        label: "Use Github.com",
+        name: "is_public_github",
+        default: false,
+        optional: true,
+        description:
+          "Check for public GitHub (github.com), uncheck for GitHub Enterprise Server",
+        onChange: (
+          checked: boolean,
+          setFieldValue: (field: string, value: any) => void
+        ) => {
+          if (checked) {
+            setFieldValue("github_base_url", "https://api.github.com");
+          } else {
+            setFieldValue("github_base_url", "");
+          }
+        },
+      },
+      {
+        type: "text",
+        query: "Enter the GitHub API base URL:",
+        label: "GitHub API Base URL",
+        name: "github_base_url",
+        optional: false,
+        placeholder: "https://github.your-company.com",
+        description:
+          "Base URL for GitHub Enterprise. /api/v3 is auto-appended.",
+        disabled: (values: any) => Boolean(values?.is_public_github),
+        rightText: (values: any) =>
+          values?.is_public_github ? undefined : "/api/v3",
+        transform: (value: string, values: any) => {
+          if (values?.is_public_github || value === "https://api.github.com") {
+            return "https://api.github.com";
+          }
+          let trimmed = (value || "").trim().replace(/\/+$/, "");
+          if (!trimmed) return "";
+          if (
+            !trimmed.startsWith("http://") &&
+            !trimmed.startsWith("https://")
+          ) {
+            trimmed = `https://${trimmed}`;
+          }
+          if (!trimmed.endsWith("/api/v3")) {
+            trimmed = `${trimmed}/api/v3`;
+          }
+          return trimmed;
+        },
+      },
       {
         type: "text",
         query: "Enter the GitHub username or organization:",
@@ -2138,6 +2223,8 @@ export interface WebConfig {
 }
 
 export interface GithubConfig {
+  is_public_github?: boolean;
+  github_base_url: string;
   repo_owner: string;
   repositories: string; // Comma-separated list of repository names
   include_prs: boolean;
