@@ -82,7 +82,7 @@ class DocumentSetSyncWorker(
     private val documentSets: DocumentSetRepository,
     private val indexer: OpenSearchIndexer,
 ) {
-    @Scheduled(fixedDelayString = "\${onyx.worker.poll-delay-ms:1000}")
+    @Scheduled(fixedDelayString = "\${onyx.worker.poll-delay-ms:5000}")
     fun work() {
         if (properties.worker.enabled) processNext()
     }

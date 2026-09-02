@@ -4,10 +4,12 @@ import org.springframework.boot.context.properties.ConfigurationProperties
 
 @ConfigurationProperties("onyx")
 data class OnyxProperties(
+    val multiTenant: Boolean = true,
     val crypto: Crypto = Crypto(),
     val storage: Storage = Storage(),
     val modelServer: ModelServer = ModelServer(),
     val opensearch: OpenSearch = OpenSearch(),
+    val scheduler: Scheduler = Scheduler(),
     val worker: Worker = Worker(),
 ) {
     data class Crypto(val key: String = "")
@@ -37,9 +39,12 @@ data class OnyxProperties(
         val password: String = "",
         val verifyCerts: Boolean = false,
     )
+    data class Scheduler(
+        val pollDelayMs: Long = 15_000,
+    )
     data class Worker(
         val enabled: Boolean = false,
-        val pollDelayMs: Long = 1000,
+        val pollDelayMs: Long = 5000,
         val heartbeatIntervalMs: Long = 15_000,
     )
 }

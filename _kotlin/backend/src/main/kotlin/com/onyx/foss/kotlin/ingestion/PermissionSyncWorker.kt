@@ -176,7 +176,7 @@ class PermissionSyncScheduledWorker(
     private val properties: OnyxProperties,
     private val worker: PermissionSyncWorker,
 ) {
-    @Scheduled(fixedDelayString = "\${onyx.worker.poll-delay-ms:1000}")
+    @Scheduled(fixedDelayString = "\${onyx.worker.poll-delay-ms:5000}")
     fun work() {
         if (properties.worker.enabled) worker.processNext()
     }

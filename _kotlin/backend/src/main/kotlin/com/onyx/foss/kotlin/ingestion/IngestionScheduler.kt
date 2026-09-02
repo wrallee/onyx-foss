@@ -20,7 +20,7 @@ class IngestionScheduler(
     private val attempts: IngestionAttemptRepository,
     private val admin: AdminService,
 ) {
-    @Scheduled(fixedDelayString = "\${onyx.worker.poll-delay-ms:1000}")
+    @Scheduled(fixedDelayString = "\${onyx.scheduler.poll-delay-ms:15000}")
     @Transactional
     fun schedule() {
         if (properties.worker.enabled) scheduleDue(Instant.now())
@@ -33,19 +33,22 @@ class IngestionScheduler(
             listOf(JobState.QUEUED, JobState.RUNNING),
         ).forEach { pair ->
             // ponytail: batch this projection if scheduler query volume becomes measurable.
+            val pairId = requireNotNull(pair.id)
             val connector = connectors.findById(pair.connectorId).orElseThrow()
-            val lastAttemptAt = attempts.findFirstByCcPairIdAndPruneOnlyFalseOrderByTimeUpdatedDescIdDesc(
-                requireNotNull(pair.id),
-            )?.timeUpdated
+            val lastAttempt = attempts.findFirstByCcPairIdAndPruneOnlyFalseOrderByTimeUpdatedDescIdDesc(pairId)
+            val lastAttemptAt = lastAttempt?.timeUpdated ?: lastAttempt?.timeStarted ?: now
             val pruneDue = connector.pruneFreq?.let { frequency ->
                 pair.lastPrunedAt?.plusSeconds(frequency)?.isAfter(now) != true
             } == true
-            val refreshDue = connector.refreshFreq?.let { frequency ->
-                lastAttemptAt?.plusSeconds(frequency)?.isAfter(now) != true
-            } == true
+            val refreshDue = when {
+                lastAttempt == null -> true
+                connector.refreshFreq == null -> false
+                pair.status == PairStatus.INITIAL_INDEXING && !pair.inRepeatedErrorState -> true
+                else -> !lastAttemptAt.plusSeconds(connector.refreshFreq!!).isAfter(now)
+            }
             when {
-                pruneDue -> admin.enqueuePair(requireNotNull(pair.id), fromBeginning = false, pruneOnly = true)
-                refreshDue -> admin.enqueuePair(requireNotNull(pair.id), fromBeginning = false)
+                pruneDue -> admin.enqueuePair(pairId, fromBeginning = false, pruneOnly = true)
+                refreshDue -> admin.enqueuePair(pairId, fromBeginning = false)
             }
         }
     }

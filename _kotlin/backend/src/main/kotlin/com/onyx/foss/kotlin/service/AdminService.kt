@@ -330,6 +330,9 @@ class AdminService(
     fun setPairStatus(pairId: Long, status: PairStatus): Map<String, Any?> {
         val pair = lockPairForMutation(pairId).pair
         pair.status = status
+        if (status == PairStatus.ACTIVE) {
+            pair.inRepeatedErrorState = false
+        }
         pairs.save(pair)
         return pairDetail(pairId)
     }
@@ -344,7 +347,16 @@ class AdminService(
             all.filter { request.credentialIds.contains(it.credentialId) }
         }
         if (selected.isEmpty()) throw ApiException(HttpStatus.BAD_REQUEST, "Connector has no valid credentials")
-        selected.forEach { enqueuePair(id(it), request.fromBeginning) }
+        selected.forEach { pair ->
+            val pairId = id(pair)
+            val lockedPair = lockPairForMutation(pairId).pair
+            lockedPair.inRepeatedErrorState = false
+            if (lockedPair.status == PairStatus.PAUSED) {
+                lockedPair.status = PairStatus.ACTIVE
+            }
+            pairs.save(lockedPair)
+            enqueuePair(pairId, request.fromBeginning)
+        }
         return StatusResponse(true, "Connector indexing requested", request.connectorId)
     }
 
