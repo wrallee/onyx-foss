@@ -19,6 +19,7 @@ const KOTLIN_ADMIN_SETTINGS: AppSettings = {
   query_history_type: QueryHistoryType.DISABLED,
   vector_db_enabled: true,
   vectorDbEnabled: true,
+  default_pruning_freq: 7 * 24 * 60 * 60,
   ee_features_enabled: false,
   enterprise: null,
   appName: "Onyx",

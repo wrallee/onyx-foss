@@ -662,7 +662,7 @@ export const connectorConfigs: Record<
         label: "Is Cloud",
         name: "is_cloud",
         optional: false,
-        default: true,
+        default: false,
         description:
           "Check if this is a Confluence Cloud instance, uncheck for Confluence Server/Data Center",
         disabled: (currentCredential) => {
@@ -773,7 +773,7 @@ export const connectorConfigs: Record<
         ],
         defaultTab: "space",
       },
-      buildIncludeAttachmentsOption(true),
+      buildIncludeAttachmentsOption(false),
     ],
     advanced_values: [],
   },
@@ -848,7 +848,7 @@ export const connectorConfigs: Record<
             ],
           },
         ],
-        defaultTab: "everything",
+        defaultTab: "project",
       },
       {
         type: "list",
@@ -2088,7 +2088,7 @@ export function createConnectorValidationSchema(
 
   return object;
 }
-export const defaultRefreshFreqMinutes = 30; // 30 minutes
+export const defaultRefreshFreqMinutes = 24 * 60; // 1 day
 
 // CONNECTORS
 export interface ConnectorBase<T> {

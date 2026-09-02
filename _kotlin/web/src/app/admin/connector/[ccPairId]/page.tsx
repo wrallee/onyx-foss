@@ -43,7 +43,6 @@ import {
 } from "./types";
 import { EditableStringFieldDisplay } from "@/components/EditableStringFieldDisplay";
 import EditPropertyModal from "@/sections/modals/EditPropertyModal";
-import { AdvancedOptionsToggle } from "@/components/AdvancedOptionsToggle";
 import { deleteCCPair } from "@/lib/documentDeletion";
 import { ConfirmEntityModal } from "@/sections/modals/ConfirmEntityModal";
 import * as Yup from "yup";
@@ -160,7 +159,6 @@ function Main({ ccPairId }: { ccPairId: number }) {
 
   const [showIsResolvingKickoffLoader, setShowIsResolvingKickoffLoader] =
     useState(false);
-  const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);
   const [showDeleteConnectorConfirmModal, setShowDeleteConnectorConfirmModal] =
     useState(false);
   const isSchedulingConnectorDeletionRef = useRef(false);
@@ -747,67 +745,56 @@ function Main({ ccPairId }: { ccPairId: number }) {
           </>
         )}
 
-      <div className="mt-6">
-        <div className="flex">
-          <AdvancedOptionsToggle
-            showAdvancedOptions={showAdvancedOptions}
-            setShowAdvancedOptions={setShowAdvancedOptions}
-            title={t("sections.advanced.title")}
-          />
-        </div>
-        {showAdvancedOptions && (
-          <div className="pb-16">
-            {(pruneFreq || indexingStart || refreshFreq) && (
-              <>
-                <Title size="md" className="mt-3 mb-2">
-                  {t("sections.advancedConfiguration.title")}
-                </Title>
-                <Card className="px-8 py-4">
-                  <div>
-                    <AdvancedConfigDisplay
-                      pruneFreq={pruneFreq}
-                      indexingStart={indexingStart}
-                      refreshFreq={refreshFreq}
-                      // No handler => no pencil, matching the rest of this page's edits.
-                      onRefreshEdit={
-                        can(ccPair, "edit") ? handleRefreshEdit : undefined
-                      }
-                      onPruningEdit={
-                        can(ccPair, "edit") ? handlePruningEdit : undefined
-                      }
-                    />
-                  </div>
-                </Card>
-              </>
-            )}
-
-            {indexAttempts &&
-              (ccPair.access_type === "sync" ? (
-                <Section height="auto" alignItems="stretch" className="mt-6">
-                  <SyncAttemptsTabs
-                    ccPair={ccPair}
-                    indexAttempts={indexAttempts}
-                    indexCurrentPage={currentPage}
-                    indexTotalPages={totalPages}
-                    onIndexPageChange={goToPage}
-                  />
-                </Section>
-              ) : (
-                <>
-                  <Title size="md" className="mt-6 mb-2">
-                    {t("sections.indexingAttempts.title")}
-                  </Title>
-                  <IndexAttemptsTable
-                    ccPair={ccPair}
-                    indexAttempts={indexAttempts}
-                    currentPage={currentPage}
-                    totalPages={totalPages}
-                    onPageChange={goToPage}
-                  />
-                </>
-              ))}
-          </div>
+      <div className="mt-6 pb-16">
+        {(pruneFreq || indexingStart || refreshFreq) && (
+          <>
+            <Title size="md" className="mt-3 mb-2">
+              {t("sections.advancedConfiguration.title")}
+            </Title>
+            <Card className="px-8 py-4">
+              <div>
+                <AdvancedConfigDisplay
+                  pruneFreq={pruneFreq}
+                  indexingStart={indexingStart}
+                  refreshFreq={refreshFreq}
+                  // No handler => no pencil, matching the rest of this page's edits.
+                  onRefreshEdit={
+                    can(ccPair, "edit") ? handleRefreshEdit : undefined
+                  }
+                  onPruningEdit={
+                    can(ccPair, "edit") ? handlePruningEdit : undefined
+                  }
+                />
+              </div>
+            </Card>
+          </>
         )}
+
+        {indexAttempts &&
+          (ccPair.access_type === "sync" ? (
+            <Section height="auto" alignItems="stretch" className="mt-6">
+              <SyncAttemptsTabs
+                ccPair={ccPair}
+                indexAttempts={indexAttempts}
+                indexCurrentPage={currentPage}
+                indexTotalPages={totalPages}
+                onIndexPageChange={goToPage}
+              />
+            </Section>
+          ) : (
+            <>
+              <Title size="md" className="mt-6 mb-2">
+                {t("sections.indexingAttempts.title")}
+              </Title>
+              <IndexAttemptsTable
+                ccPair={ccPair}
+                indexAttempts={indexAttempts}
+                currentPage={currentPage}
+                totalPages={totalPages}
+                onPageChange={goToPage}
+              />
+            </>
+          ))}
       </div>
     </>
   );

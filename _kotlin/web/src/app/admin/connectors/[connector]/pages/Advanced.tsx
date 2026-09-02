@@ -9,7 +9,7 @@ interface AdvancedFormPageProps {
 }
 
 export default function AdvancedFormPage({
-  defaultPruneFreqHours = 600,
+  defaultPruneFreqHours = 7 * 24,
 }: AdvancedFormPageProps) {
   const t = useTranslations("admin.connectorsList");
 
