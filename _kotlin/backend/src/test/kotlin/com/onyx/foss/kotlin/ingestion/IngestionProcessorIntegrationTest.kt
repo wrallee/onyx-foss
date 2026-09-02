@@ -28,6 +28,8 @@ import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.security.CredentialCipher
 import com.onyx.foss.kotlin.service.AdminService
 import com.onyx.foss.kotlin.api.DeletionAttemptRequest
+import com.onyx.foss.kotlin.api.RunConnectorRequest
+import com.onyx.foss.kotlin.config.OnyxProperties
 import com.onyx.foss.kotlin.support.H2IntegrationTest
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
@@ -46,6 +48,7 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
 import org.springframework.transaction.support.TransactionSynchronizationManager
+import org.springframework.transaction.support.TransactionTemplate
 import java.sql.Timestamp
 import java.time.Instant
 import java.util.concurrent.CountDownLatch
@@ -72,6 +75,7 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
     @Autowired private lateinit var sets: DocumentSetRepository
     @Autowired private lateinit var setPairs: DocumentSetPairRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
+    @Autowired private lateinit var transactionTemplate: TransactionTemplate
     @MockitoBean private lateinit var fileLoader: FileConnectorLoader
     @MockitoBean private lateinit var remoteLoaders: RemoteConnectorLoaders
     @MockitoBean private lateinit var embedder: ModelServerClient
@@ -356,6 +360,52 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
         processor.process(run.jobId)
 
         assertThat(pairs.findById(run.pairId).orElseThrow().inRepeatedErrorState).isFalse()
+    }
+
+    @Test
+    fun repeatedFailureTransitionsToPausedInMultiTenant() {
+        val customClaims = JobClaimService(jobs, pairs, attempts, errors, OnyxProperties(multiTenant = true))
+        val run = createRun()
+        transactionTemplate.execute {
+            val claim = requireNotNull(customClaims.claimJob(run.jobId))
+            customClaims.fail(claim, IllegalStateException("failure"), refreshFreq = null)
+        }
+
+        val pair = pairs.findById(run.pairId).orElseThrow()
+        assertThat(pair.inRepeatedErrorState).isTrue()
+        assertThat(pair.status).isEqualTo(PairStatus.PAUSED)
+    }
+
+    @Test
+    fun repeatedFailurePreservesStatusInSingleTenant() {
+        val customClaims = JobClaimService(jobs, pairs, attempts, errors, OnyxProperties(multiTenant = false))
+        val run = createRun()
+        transactionTemplate.execute {
+            val claim = requireNotNull(customClaims.claimJob(run.jobId))
+            customClaims.fail(claim, IllegalStateException("failure"), refreshFreq = null)
+        }
+
+        val pair = pairs.findById(run.pairId).orElseThrow()
+        assertThat(pair.inRepeatedErrorState).isTrue()
+        assertThat(pair.status).isEqualTo(PairStatus.SCHEDULED)
+    }
+
+    @Test
+    fun adminUnpauseAndRunClearsRepeatedErrorState() {
+        val pairId = createPair(status = PairStatus.PAUSED, inRepeatedErrorState = true)
+
+        admin.setPairStatus(pairId, PairStatus.ACTIVE)
+        assertThat(pairs.findById(pairId).orElseThrow().inRepeatedErrorState).isFalse()
+
+        val pair = pairs.findById(pairId).orElseThrow()
+        pair.status = PairStatus.PAUSED
+        pair.inRepeatedErrorState = true
+        pairs.save(pair)
+
+        admin.enqueue(RunConnectorRequest(connectorId = pair.connectorId, credentialIds = listOf(pair.credentialId)))
+        val updated = pairs.findById(pairId).orElseThrow()
+        assertThat(updated.inRepeatedErrorState).isFalse()
+        assertThat(updated.status).isEqualTo(PairStatus.ACTIVE)
     }
 
     @Test
@@ -843,6 +893,57 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
         scheduler.scheduleDue(Instant.now().plusSeconds(60))
 
         assertThat(attempts.count()).isZero()
+        assertThat(jobs.count()).isZero()
+    }
+
+    @Test
+    fun doesNotQueuePairInRepeatedErrorStateBeforeRefreshFreq() {
+        val now = Instant.parse("2026-09-01T00:00:00Z")
+        val pairId = createPair(refreshFreq = 3600, inRepeatedErrorState = true)
+        val previous = attempts.save(IngestionAttemptEntity(ccPairId = pairId, status = AttemptStatus.FAILED))
+        jdbc.update(
+            "UPDATE ingestion_attempts SET time_updated = ? WHERE id = ?",
+            Timestamp.from(now.minusSeconds(10)),
+            requireNotNull(previous.id),
+        )
+
+        scheduler.scheduleDue(now)
+
+        assertThat(attempts.count()).isEqualTo(1)
+        assertThat(jobs.count()).isZero()
+    }
+
+    @Test
+    fun queuesInitialIndexingWhenNotRepeatedError() {
+        val now = Instant.parse("2026-09-01T00:00:00Z")
+        val pairId = createPair(refreshFreq = 3600, status = PairStatus.INITIAL_INDEXING)
+        val previous = attempts.save(IngestionAttemptEntity(ccPairId = pairId, status = AttemptStatus.FAILED))
+        jdbc.update(
+            "UPDATE ingestion_attempts SET time_updated = ? WHERE id = ?",
+            Timestamp.from(now.minusSeconds(5)),
+            requireNotNull(previous.id),
+        )
+
+        scheduler.scheduleDue(now)
+
+        assertThat(attempts.count()).isEqualTo(2)
+        assertThat(jobs.count()).isEqualTo(1)
+    }
+
+    @Test
+    fun doesNotQueueInitialIndexingWhenInRepeatedErrorStateBeforeRefreshFreq() {
+        val now = Instant.parse("2026-09-01T00:00:00Z")
+        val pairId = createPair(refreshFreq = 3600, status = PairStatus.INITIAL_INDEXING, inRepeatedErrorState = true)
+        val previous = attempts.save(IngestionAttemptEntity(ccPairId = pairId, status = AttemptStatus.FAILED))
+        jdbc.update(
+            "UPDATE ingestion_attempts SET time_updated = ? WHERE id = ?",
+            Timestamp.from(now.minusSeconds(10)),
+            requireNotNull(previous.id),
+        )
+
+        scheduler.scheduleDue(now)
+
+        assertThat(attempts.count()).isEqualTo(1)
         assertThat(jobs.count()).isZero()
     }
 

@@ -26,6 +26,7 @@ server:
   port: ${SERVER_PORT:8080}
 
 onyx:
+  multi-tenant: ${MULTI_TENANT:false}
   crypto:
     key: ${ONYX_CREDENTIAL_ENCRYPTION_KEY:}
   storage:
@@ -53,7 +54,9 @@ onyx:
     username: ${OPENSEARCH_ADMIN_USERNAME:}
     password: ${OPENSEARCH_ADMIN_PASSWORD:}
     verify-certs: ${OPENSEARCH_VERIFY_CERTS:false}
+  scheduler:
+    poll-delay-ms: ${ONYX_SCHEDULER_POLL_DELAY_MS:15000}
   worker:
     enabled: ${ONYX_WORKER_ENABLED:false}
-    poll-delay-ms: ${ONYX_WORKER_POLL_DELAY_MS:1000}
+    poll-delay-ms: ${ONYX_WORKER_POLL_DELAY_MS:5000}
     heartbeat-interval-ms: ${ONYX_WORKER_HEARTBEAT_INTERVAL_MS:15000}

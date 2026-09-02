@@ -51,7 +51,7 @@ class IngestionWorker(
     private val claims: JobClaimService,
     private val processor: IngestionProcessor,
 ) {
-    @Scheduled(fixedDelay = 1000)
+    @Scheduled(fixedDelayString = "\${onyx.worker.poll-delay-ms:5000}")
     fun work() {
         if (!properties.worker.enabled) return
         claims.claimNext()?.let(processor::process)
@@ -64,6 +64,7 @@ class JobClaimService(
     private val pairs: ConnectorCredentialPairRepository,
     private val attempts: IngestionAttemptRepository,
     private val errors: IngestionErrorRepository,
+    private val properties: OnyxProperties,
 ) {
     @Transactional
     fun claimNext(now: Instant = Instant.now()): IngestionClaim? = jobs
@@ -155,12 +156,18 @@ class JobClaimService(
     }
 
     @Transactional
-    fun fail(claim: IngestionClaim, error: Exception, refreshFreq: Long?): Boolean {
+    fun fail(
+        claim: IngestionClaim,
+        error: Exception,
+        refreshFreq: Long?,
+        now: Instant = Instant.now(),
+    ): Boolean {
         val ownership = ownership(claim) ?: return false
         val attempt = attempts.findById(claim.attemptId).orElse(null) ?: return false
         attempt.status = AttemptStatus.FAILED
         attempt.errorMessage = error.message?.take(1000) ?: "Ingestion failed"
         attempt.fullExceptionTrace = error.stackTraceToString().take(16000)
+        attempt.timeUpdated = now
         attempts.saveAndFlush(attempt)
         errors.save(
             IngestionErrorEntity(
@@ -169,10 +176,14 @@ class JobClaimService(
                 errorType = error::class.simpleName,
             ),
         )
-        ownership.pair.inRepeatedErrorState = isRepeatedError(
+        val repeated = isRepeatedError(
             refreshFreq,
             attempts.findAllByCcPairIdOrderByIdDesc(claim.pairId),
         )
+        ownership.pair.inRepeatedErrorState = repeated
+        if (repeated && properties.multiTenant) {
+            ownership.pair.status = PairStatus.PAUSED
+        }
         releasePair(ownership.pair)
         pairs.save(ownership.pair)
         ownership.job.state = JobState.FAILED
