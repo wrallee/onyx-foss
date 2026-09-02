@@ -13,6 +13,7 @@ import {
 } from "react";
 import { usePathname } from "next/navigation";
 import Link from "next/link";
+import type { Route } from "next";
 import { Button, ShadowDiv, Spacer, Text, Tooltip } from "@opal/components";
 import { iconWrapper } from "@opal/components/buttons/icon-wrapper";
 import { Disabled, Hoverable, Interactive } from "@opal/core";
@@ -164,7 +165,7 @@ interface SidebarHeaderProps {
   /**
    * Optional URL to navigate to when the logo is clicked in the unfolded state.
    */
-  logoHref?: string;
+  logoHref?: Route | string;
   children?: React.ReactNode;
 }
 
@@ -198,12 +199,11 @@ function SidebarHeader({
     [folded, foldLabel, toggleFolded]
   );
 
-  const rawLogo = createElement(
-    renderAppLogo(foldable ? folded : false),
-    { size: SIDEBAR_LOGO_HEIGHT_PX }
-  );
+  const rawLogo = createElement(renderAppLogo(foldable ? folded : false), {
+    size: SIDEBAR_LOGO_HEIGHT_PX,
+  });
   const logoEl = logoHref ? (
-    <Link href={logoHref} className="inline-flex items-center">
+    <Link href={logoHref as Route} className="inline-flex items-center">
       {rawLogo}
     </Link>
   ) : (

@@ -45,8 +45,7 @@ export interface Option {
   wrapInCollapsible?: boolean;
   disabled?:
     | boolean
-    | ((values: any, currentCredential: Credential<any> | null) => boolean)
-    | ((currentCredential: Credential<any> | null) => boolean);
+    | ((currentCredential: Credential<any> | null, values?: any) => boolean);
   rightText?:
     | string
     | React.ReactNode
@@ -345,7 +344,8 @@ export const connectorConfigs: Record<
         placeholder: "https://github.your-company.com",
         description:
           "Base URL for GitHub Enterprise. /api/v3 is auto-appended.",
-        disabled: (values: any) => Boolean(values?.is_public_github),
+        disabled: (currentCredential: any, values?: any) =>
+          Boolean((values ?? currentCredential)?.is_public_github),
         rightText: (values: any) =>
           values?.is_public_github ? undefined : "/api/v3",
         transform: (value: string, values: any) => {

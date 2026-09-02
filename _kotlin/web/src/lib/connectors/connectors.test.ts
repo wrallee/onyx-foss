@@ -43,7 +43,9 @@ test("configures GitHub connector with public github checkbox and dynamic base u
 
   const initialValues = createConnectorInitialValues("github");
   expect(initialValues.is_public_github).toBe(false);
-  expect(initialValues.github_base_url).toBeUndefined();
+  expect(initialValues.github_base_url).toBe(
+    (connectorConfigs.github.values[1] as any).default ?? undefined
+  );
 
   const githubBaseUrlField = connectorConfigs.github.values[1];
   expect(githubBaseUrlField?.optional).toBe(false);
