@@ -32,8 +32,11 @@ import org.springframework.stereotype.Component
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
 import org.springframework.web.reactive.function.client.WebClient
+import org.springframework.web.reactive.function.client.WebClientRequestException
+import org.springframework.web.reactive.function.client.WebClientResponseException
 import reactor.core.publisher.Mono
 import reactor.netty.http.client.HttpClient
+import reactor.util.retry.Retry
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Duration
@@ -541,6 +544,17 @@ class ModelServerClient(
             )
             .retrieve()
             .bodyToMono(JsonNode::class.java)
+            // Model server requests can experience transient network blips or brief 5xx errors;
+            // retrying with backoff allows temporary connection failures to recover cleanly.
+            .retryWhen(
+                Retry.backoff(
+                    properties.modelServer.embedMaxRetries.toLong(),
+                    Duration.ofMillis(properties.modelServer.embedRetryInitialBackoffMs),
+                )
+                    .jitter(0.0)
+                    .filter { it is WebClientRequestException || (it is WebClientResponseException && it.statusCode.is5xxServerError) }
+                    .onRetryExhaustedThrow { _, signal -> signal.failure() }
+            )
             .block() ?: error("Model server returned no embedding response")
         return response.path("embeddings").map { vector -> vector.map { it.asDouble() } }
     }

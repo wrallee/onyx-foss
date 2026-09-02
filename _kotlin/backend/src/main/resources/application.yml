@@ -41,6 +41,8 @@ onyx:
     connect-timeout-ms: ${MODEL_SERVER_CONNECT_TIMEOUT_MS:30000}
     read-timeout-ms: ${MODEL_SERVER_READ_TIMEOUT_MS:600000}
     reranker-fallback-on-error: ${ONYX_RERANKER_FALLBACK_ON_ERROR:true}
+    embed-max-retries: ${ONYX_EMBED_MAX_RETRIES:2}
+    embed-retry-initial-backoff-ms: ${ONYX_EMBED_RETRY_INITIAL_BACKOFF_MS:2000}
   opensearch:
     base-url: ${OPENSEARCH_URL:http://opensearch:9200}
     index: ${OPENSEARCH_INDEX:onyx-kotlin-chunks}

@@ -23,6 +23,8 @@ data class OnyxProperties(
         val connectTimeoutMs: Long = 30_000,
         val readTimeoutMs: Long = 600_000,
         val rerankerFallbackOnError: Boolean = true,
+        val embedMaxRetries: Int = 2,
+        val embedRetryInitialBackoffMs: Long = 2_000,
     )
     data class OpenSearch(
         val baseUrl: String = "http://opensearch:9200",
