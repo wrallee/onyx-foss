@@ -54,6 +54,7 @@ interface ConnectorCredentialPairRepository : JpaRepository<ConnectorCredentialP
 interface DocumentSetRepository : JpaRepository<DocumentSetEntity, Long> {
     fun existsByName(name: String): Boolean
     fun existsByNameAndIdNot(name: String, id: Long): Boolean
+    fun findAllByNameIn(names: Collection<String>): List<DocumentSetEntity>
 
     @Query(
         """

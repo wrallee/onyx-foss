@@ -78,12 +78,12 @@ class OpenSearchIndexerIntegrationTest {
             "url content",
             urlId,
             emptyMap(),
-            listOf(0.1),
+            vector(0.1),
             updatedAt = updatedAt,
             primaryOwners = listOf("owner@example.com"),
             secondaryOwners = listOf("reviewer@example.com"),
         )
-        indexer.upsert(7, fileId, 0, "File", "file content", null, emptyMap(), listOf(0.2))
+        indexer.upsert(7, fileId, 0, "File", "file content", null, emptyMap(), vector(0.2))
 
         indexer.updateAccess(7, mapOf(urlId to ExternalAccess(setOf("reader@example.com"), isPublic = false)))
         indexer.updateDocumentSets(7, setOf(urlId, fileId), listOf("Engineering"))
@@ -110,13 +110,33 @@ class OpenSearchIndexerIntegrationTest {
     fun reindexingShorterDocumentRemovesOldTailChunks() {
         val indexer = indexer()
         val documentId = "https://example.test/document/shorter"
-        indexer.upsert(7, documentId, 0, "Old", "old head", documentId, emptyMap(), listOf(0.1))
-        indexer.upsert(7, documentId, 1, "Old", "stale tail", documentId, emptyMap(), listOf(0.2))
+        indexer.upsert(7, documentId, 0, "Old", "old head", documentId, emptyMap(), vector(0.1))
+        indexer.upsert(7, documentId, 1, "Old", "stale tail", documentId, emptyMap(), vector(0.2))
 
-        indexer.upsert(7, documentId, 0, "New", "new content", documentId, emptyMap(), listOf(0.3))
+        indexer.upsert(7, documentId, 0, "New", "new content", documentId, emptyMap(), vector(0.3))
         indexer.deleteStaleChunks(7, documentId, 1)
 
         assertThat(exactDocuments(documentId).map { it.path("content").asText() }).containsExactly("new content")
+    }
+
+    @Test
+    fun candidateSearchUsesTheUnionOfSelectedDocumentSets() {
+        val indexer = indexer()
+        indexer.upsert(7, "engineering", 0, "Guide", "deployment needle", null, emptyMap(), vector(0.1), listOf("Engineering"))
+        indexer.upsert(7, "operations", 0, "Guide", "deployment needle", null, emptyMap(), vector(0.2), listOf("Operations"))
+        indexer.upsert(7, "finance", 0, "Guide", "deployment needle", null, emptyMap(), vector(0.3), listOf("Finance"))
+
+        val results = indexer.searchCandidates(
+            "deployment needle",
+            vector(0.1),
+            listOf("Engineering", "Operations"),
+            10,
+        )
+
+        assertThat(results.keyword.map(SearchCandidate::sourceDocumentId))
+            .containsExactlyInAnyOrder("engineering", "operations")
+        assertThat(results.vector.map(SearchCandidate::sourceDocumentId))
+            .containsExactlyInAnyOrder("engineering", "operations")
     }
 
     @Test
@@ -173,7 +193,7 @@ class OpenSearchIndexerIntegrationTest {
                         "concurrent content",
                         null,
                         emptyMap(),
-                        listOf(0.2),
+                        vector(0.2),
                     )
                 }
                 assertThat(writerStarted.await(10, TimeUnit.SECONDS)).isTrue()
@@ -229,7 +249,7 @@ class OpenSearchIndexerIntegrationTest {
                         "post-swap content",
                         null,
                         emptyMap(),
-                        listOf(0.2),
+                        vector(0.2),
                     )
                 }
                 val migrationsOverlapped = secondReindex.await(3, TimeUnit.SECONDS)
@@ -259,7 +279,7 @@ class OpenSearchIndexerIntegrationTest {
         put("/$replacement", exactIndexDefinition())
         putRawDocument(replacement, "legacy-one", firstId, "first")
 
-        indexer().upsert(7, "after-restart", 0, "Restarted", "new", null, emptyMap(), listOf(0.3))
+        indexer().upsert(7, "after-restart", 0, "Restarted", "new", null, emptyMap(), vector(0.3))
 
         assertThat(get("/_alias/$index").fieldNames().asSequence().toList()).containsExactly(replacement)
         assertThat(exactDocuments(firstId)).hasSize(1)
@@ -324,6 +344,7 @@ class OpenSearchIndexerIntegrationTest {
     }
 
     private fun exactIndexDefinition(): Map<String, Any> = mapOf(
+        "settings" to mapOf("index" to mapOf("knn" to true)),
         "mappings" to mapOf(
             "properties" to mapOf(
                 "cc_pair_id" to mapOf("type" to "long"),
@@ -336,9 +357,20 @@ class OpenSearchIndexerIntegrationTest {
                 "doc_updated_at" to mapOf("type" to "date"),
                 "primary_owners" to mapOf("type" to "keyword"),
                 "secondary_owners" to mapOf("type" to "keyword"),
+                "embedding" to mapOf(
+                    "type" to "knn_vector",
+                    "dimension" to 768,
+                    "method" to mapOf(
+                        "name" to "hnsw",
+                        "space_type" to "cosinesimil",
+                        "engine" to "lucene",
+                    ),
+                ),
             ),
         ),
     )
+
+    private fun vector(value: Double): List<Double> = List(768) { value }
 
     private fun pausingProxy(
         firstReindex: CountDownLatch,

@@ -932,7 +932,8 @@ class PermissionSyncIntegrationTest : H2IntegrationTest() {
                           "document_sets":{"type":"keyword"},
                           "doc_updated_at":{"type":"date"},
                           "primary_owners":{"type":"keyword"},
-                          "secondary_owners":{"type":"keyword"}
+                          "secondary_owners":{"type":"keyword"},
+                          "embedding":{"type":"knn_vector","dimension":768}
                         }}}}
                     """.trimIndent(),
                 ),

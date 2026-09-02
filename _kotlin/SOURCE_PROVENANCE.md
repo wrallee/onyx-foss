@@ -14,6 +14,7 @@ The parent checkout's MIT `LICENSE` is reproduced in this directory.
 | `backend/src/main/kotlin/com/onyx/foss/kotlin/ingestion/GithubConnectorLoader.kt` | `../backend/onyx/connectors/github/connector.py`, `../backend/onyx/connectors/github/models.py`, `../backend/onyx/connectors/github/rate_limit_utils.py`, `../backend/onyx/connectors/github/utils.py` | GitHub discovery, collection, checkpoint, retry, and access behavior |
 | `backend/src/main/kotlin/com/onyx/foss/kotlin/ingestion/IngestionWorker.kt` | `../backend/onyx/background/indexing/run_docfetching.py`, `../backend/onyx/background/celery/tasks/docfetching/tasks.py`, `../backend/onyx/db/index_attempt.py` | Batch, pause, attempt, checkpoint, and pruning behavior |
 | `backend/src/main/kotlin/com/onyx/foss/kotlin/service/AdminService.kt` | `../backend/onyx/server/documents/cc_pair.py`, `../backend/onyx/db/index_attempt.py`, `../backend/onyx/db/document_set.py` | Connector status, last-indexed, and Document Set behavior |
+| `backend/src/main/kotlin/com/onyx/foss/kotlin/service/SearchService.kt` | `../backend/onyx/context/search/`, `../backend/onyx/document_index/` | Query embedding, hybrid candidate retrieval, Document Set filtering, and reranking behavior |
 | `docs/model-server-spike.md` | `../backend/model_server/` and local call sites | Model server feasibility analysis |
 
 `../_kotlinmania/`, external repositories, Enterprise Edition source, and paid

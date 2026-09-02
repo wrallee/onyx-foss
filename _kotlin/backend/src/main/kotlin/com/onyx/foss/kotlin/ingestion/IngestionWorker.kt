@@ -526,7 +526,11 @@ class ModelServerClient(
         codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
     }.buildModelServerClient(properties.modelServer)
 
-    fun embed(texts: List<String>): List<List<Double>> {
+    fun embed(texts: List<String>): List<List<Double>> = embed(texts, "passage")
+
+    fun embedQuery(query: String): List<Double> = embed(listOf(query), "query").single()
+
+    private fun embed(texts: List<String>, textType: String): List<List<Double>> {
         require(properties.modelServer.modelName.isNotBlank()) {
             "ONYX_EMBEDDING_MODEL_NAME must be configured before file ingestion"
         }
@@ -539,7 +543,7 @@ class ModelServerClient(
                     "model_name" to properties.modelServer.modelName,
                     "max_context_length" to properties.modelServer.maxContextLength,
                     "normalize_embeddings" to properties.modelServer.normalizeEmbeddings,
-                    "text_type" to "passage",
+                    "text_type" to textType,
                 ),
             )
             .retrieve()
@@ -585,6 +589,62 @@ class OpenSearchIndexer(
             .build()
     }
     private val indexReady = AtomicBoolean(false)
+
+    fun searchCandidates(
+        query: String,
+        queryEmbedding: List<Double>,
+        documentSets: List<String>,
+        count: Int,
+    ): SearchCandidateResults {
+        require(query.isNotBlank()) { "query must not be blank" }
+        require(queryEmbedding.size == properties.modelServer.embeddingDimension) {
+            "query embedding dimension must be ${properties.modelServer.embeddingDimension}"
+        }
+        require(count > 0) { "count must be positive" }
+        ensureIndex()
+        val filter = documentSets.distinct().takeIf(List<String>::isNotEmpty)?.let {
+            mapOf("terms" to mapOf("document_sets" to it))
+        }
+        val keywordQuery = linkedMapOf<String, Any>(
+            "must" to mapOf(
+                "multi_match" to mapOf(
+                    "query" to query,
+                    "fields" to listOf("title^2", "content"),
+                ),
+            ),
+        ).apply { filter?.let { put("filter", it) } }
+        val vectorQuery = linkedMapOf<String, Any>(
+            "vector" to queryEmbedding,
+            "k" to count,
+        ).apply { filter?.let { put("filter", it) } }
+        return SearchCandidateResults(
+            keyword = search(mapOf("size" to count, "query" to mapOf("bool" to keywordQuery))),
+            vector = search(mapOf("size" to count, "query" to mapOf("knn" to mapOf(EMBEDDING_FIELD to vectorQuery)))),
+        )
+    }
+
+    private fun search(body: Map<String, Any>): List<SearchCandidate> {
+        val response = client.post()
+            .uri(properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index + "/_search")
+            .contentType(MediaType.APPLICATION_JSON)
+            .bodyValue(mapper.valueToTree<JsonNode>(body))
+            .retrieve()
+            .bodyToMono(JsonNode::class.java)
+            .block(OPENSEARCH_TIMEOUT) ?: error("OpenSearch returned no search response")
+        return response.path("hits").path("hits").map { hit ->
+            val source = hit.path("_source")
+            SearchCandidate(
+                id = hit.path("_id").asText(),
+                sourceDocumentId = source.path("source_document_id").asText(),
+                chunkId = source.path("chunk_id").asInt(),
+                title = source.path("title").asText(),
+                content = source.path("content").asText(),
+                link = source.path("link").takeUnless(JsonNode::isNull)?.asText(),
+                metadata = source.path("metadata"),
+                retrievalScore = hit.path("_score").asDouble(),
+            )
+        }
+    }
 
     fun deletePair(pairId: Long) {
         deleteByQuery(mapOf("term" to mapOf("cc_pair_id" to pairId)), "pair deletion")
@@ -808,11 +868,20 @@ class OpenSearchIndexer(
                 val indexUrl = properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index
                 val exists = indexExists(indexUrl, "index check")
                 if (!exists) {
-                    putJson(indexUrl, INDEX_DEFINITION, "index creation")
+                    putJson(indexUrl, indexDefinition(), "index creation")
                 } else {
                     val mapping = mapping(indexUrl, "mapping check")
                     val missingFields = linkedMapOf<String, Any>()
                     var incompatibleMapping = false
+                    val embedding = mapping.properties.path(EMBEDDING_FIELD)
+                    val embeddingType = embedding.path("type").asText()
+                    check(
+                        embeddingType.isBlank() ||
+                            embeddingType == "knn_vector" &&
+                            embedding.path("dimension").asInt() == properties.modelServer.embeddingDimension,
+                    ) {
+                        "Existing embedding mapping is incompatible; delete the OpenSearch index and reindex documents"
+                    }
                     EXACT_FIELDS.forEach { (field, definition) ->
                         val expectedType = (definition as Map<*, *>)["type"].toString()
                         val actualType = mapping.properties.path(field).path("type").asText()
@@ -821,6 +890,9 @@ class OpenSearchIndexer(
                         } else if (actualType != expectedType) {
                             incompatibleMapping = true
                         }
+                    }
+                    if (embeddingType.isBlank()) {
+                        missingFields[EMBEDDING_FIELD] = vectorFieldDefinition()
                     }
                     if (incompatibleMapping) {
                         reindexWithExactMappings(mapping.concreteIndex)
@@ -913,7 +985,7 @@ class OpenSearchIndexer(
     private fun ensureReplacementIndex(replacementUrl: String) {
         if (!indexExists(replacementUrl, "replacement index check")) {
             try {
-                putJson(replacementUrl, INDEX_DEFINITION, "replacement index creation")
+                putJson(replacementUrl, indexDefinition(), "replacement index creation")
             } catch (error: Exception) {
                 if (!indexExists(replacementUrl, "replacement index race check")) throw error
             }
@@ -1002,6 +1074,7 @@ class OpenSearchIndexer(
 
     private companion object {
         const val EXACT_DOCUMENT_ID_FIELD = "source_document_id"
+        const val EMBEDDING_FIELD = "embedding"
         val EXACT_FIELDS: Map<String, Any> = mapOf(
             "cc_pair_id" to mapOf("type" to "long"),
             EXACT_DOCUMENT_ID_FIELD to mapOf("type" to "keyword"),
@@ -1014,9 +1087,41 @@ class OpenSearchIndexer(
             "primary_owners" to mapOf("type" to "keyword"),
             "secondary_owners" to mapOf("type" to "keyword"),
         )
-        val INDEX_DEFINITION: Map<String, Any> = mapOf("mappings" to mapOf("properties" to EXACT_FIELDS))
     }
+
+    private fun vectorFieldDefinition(): Map<String, Any> = mapOf(
+        "type" to "knn_vector",
+        "dimension" to properties.modelServer.embeddingDimension,
+        "method" to mapOf(
+            "name" to "hnsw",
+            "space_type" to "cosinesimil",
+            "engine" to "lucene",
+        ),
+    )
+
+    private fun indexDefinition(): Map<String, Any> = mapOf(
+        "settings" to mapOf("index" to mapOf("knn" to true)),
+        "mappings" to mapOf(
+            "properties" to EXACT_FIELDS + (EMBEDDING_FIELD to vectorFieldDefinition()),
+        ),
+    )
 }
+
+data class SearchCandidate(
+    val id: String,
+    val sourceDocumentId: String,
+    val chunkId: Int,
+    val title: String,
+    val content: String,
+    val link: String?,
+    val metadata: JsonNode,
+    val retrievalScore: Double,
+)
+
+data class SearchCandidateResults(
+    val keyword: List<SearchCandidate>,
+    val vector: List<SearchCandidate>,
+)
 
 private class OpenSearchWriteBlockedException(message: String) : RuntimeException(message)
 
