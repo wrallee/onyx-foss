@@ -10,6 +10,7 @@ import org.springframework.http.HttpHeaders
 import org.springframework.stereotype.Service
 import org.springframework.web.reactive.function.client.WebClientResponseException
 import org.springframework.web.util.UriUtils
+import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.time.OffsetDateTime
@@ -508,11 +509,29 @@ class JiraConnectorLoader(
     }
 
     private fun connection(config: JsonNode?, credentials: JsonNode): JiraConnection {
-        val jiraBase = required(config, "jira_base_url", "base_url").trimEnd('/')
-        val headers = auth(credentials)
-        val cloud = credentials.firstText("jira_user_email", "jira_email", "email") != null ||
-            config?.path("scoped_token")?.asBoolean(false) == true || config?.path("is_cloud")?.asBoolean(false) == true
-        val apiBase = if (config?.path("scoped_token")?.asBoolean(false) == true) {
+        val rawBase = config?.firstText("jira_base_url", "base_url")?.trimEnd('/')
+        val isScopedToken = config?.path("scoped_token")?.asBoolean(false) == true
+        val isAtlassianDomain = rawBase?.let { url ->
+            runCatching { URI.create(url).host?.endsWith(".atlassian.net", ignoreCase = true) == true }.getOrDefault(false)
+        } ?: false
+
+        val cloud = when {
+            isScopedToken -> true
+            rawBase.isNullOrBlank() -> true
+            isAtlassianDomain -> true
+            isLocalHost(rawBase) -> credentials.firstText("jira_user_email", "jira_email", "email") != null
+            else -> false
+        }
+
+        val jiraBase = if (rawBase.isNullOrBlank()) {
+            if (isScopedToken) "https://api.atlassian.com"
+            else throw IllegalArgumentException("Connector configuration is missing jira_base_url")
+        } else {
+            rawBase
+        }
+
+        val headers = auth(credentials, cloud)
+        val apiBase = if (isScopedToken) {
             val cloudId = http.get(jiraBase, "/_edge/tenant_info", headers).path("cloudId").asText()
             require(cloudId.isNotBlank()) { "Jira scoped token discovery did not return a cloudId" }
             "https://api.atlassian.com/ex/jira/" + segment(cloudId)
@@ -522,17 +541,22 @@ class JiraConnectorLoader(
         return JiraConnection(jiraBase, apiBase, if (cloud) 3 else 2, headers)
     }
 
-    private fun auth(credentials: JsonNode): Map<String, String> {
+    private fun auth(credentials: JsonNode, cloud: Boolean): Map<String, String> {
         val token = credentials.firstText("jira_api_token", "api_token", "access_token", "token")
             ?: throw IllegalArgumentException("Connector credential does not contain a Jira API token")
         val email = credentials.firstText("jira_user_email", "jira_email", "email")
-        val value = if (email == null) {
-            "Bearer $token"
-        } else {
+        val value = if (cloud && !email.isNullOrBlank()) {
             "Basic " + Base64.getEncoder().encodeToString("$email:$token".toByteArray(StandardCharsets.UTF_8))
+        } else {
+            "Bearer $token"
         }
         return mapOf(HttpHeaders.AUTHORIZATION to value)
     }
+
+    private fun isLocalHost(url: String): Boolean = runCatching {
+        val host = URI.create(url).host?.lowercase() ?: return false
+        host == "localhost" || host == "127.0.0.1" || host == "::1"
+    }.getOrDefault(false)
 
     private val Context.labelsToSkip: Set<String> get() = config.stringSet("labels_to_skip")
 

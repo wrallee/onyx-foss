@@ -584,6 +584,51 @@ class JiraConnectorLoaderTest {
             assertTrue(error.message.orEmpty().contains(expected))
         }
 
+    @Test
+    fun onPremiseJiraBaseUrlUsesBearerAuthAndV2EvenWhenEmailIsPresent() = MockWebServer().use { server ->
+        val client = RemoteJsonClient(
+            WebClient.builder().filter { request, next ->
+                val rewritten = ClientRequest.from(request)
+                    .url(URI.create("${server.startAndBase()}${request.url().rawPath}"))
+                    .build()
+                next.exchange(rewritten)
+            }
+        )
+        server.json("""{"key":"ENG"}""")
+
+        val onPremiseConfig = mapper.readTree(
+            """{"jira_base_url":"https://jira.gmarket.com","project_key":"ENG"}"""
+        )
+        JiraConnectorLoader(client, mapper).validate(onPremiseConfig, cloudCredentials())
+
+        val request = server.takeRequest()
+        assertEquals("Bearer token", request.getHeader("Authorization"))
+        assertEquals("/rest/api/2/project/ENG", request.path)
+    }
+
+    @Test
+    fun atlassianDomainJiraBaseUrlUsesCloudMode() = MockWebServer().use { server ->
+        val client = RemoteJsonClient(
+            WebClient.builder().filter { request, next ->
+                val rewritten = ClientRequest.from(request)
+                    .url(URI.create("${server.startAndBase()}${request.url().rawPath}"))
+                    .build()
+                next.exchange(rewritten)
+            }
+        )
+        server.json("""{"key":"ENG"}""")
+
+        val cloudConfig = mapper.readTree(
+            """{"jira_base_url":"https://mycompany.atlassian.net","project_key":"ENG"}"""
+        )
+        JiraConnectorLoader(client, mapper).validate(cloudConfig, cloudCredentials())
+
+        val request = server.takeRequest()
+        assertTrue(request.getHeader("Authorization").orEmpty().startsWith("Basic "))
+        assertEquals("/rest/api/3/project/ENG", request.path)
+    }
+
+
     private fun assertValidationError(status: Int, expected: String) = MockWebServer().use { server ->
         server.start()
         server.enqueue(
