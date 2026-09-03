@@ -143,8 +143,64 @@ export const RenderField: FC<RenderFieldProps> = ({
       : field.description;
   const disabled =
     typeof field.disabled === "function"
-      ? field.disabled(currentCredential)
+      ? field.disabled(values, currentCredential)
       : (field.disabled ?? false);
+  const rightText =
+    typeof field.rightText === "function"
+      ? field.rightText(values, currentCredential)
+      : field.rightText;
+  const leftField = field.leftField;
+  const leftElement = leftField ? (
+    <CheckboxField
+      name={leftField.name}
+      label={
+        typeof leftField.label === "function"
+          ? leftField.label(currentCredential)
+          : leftField.label
+      }
+      disabled={
+        typeof leftField.disabled === "function"
+          ? leftField.disabled(values, currentCredential)
+          : (leftField.disabled ?? false)
+      }
+      onChange={(checked) => {
+        setFieldValue(leftField.name, checked);
+        if (leftField.onChange) {
+          leftField.onChange(checked, setFieldValue, values);
+        }
+      }}
+    />
+  ) : typeof field.leftElement === "function" ? (
+    field.leftElement(values, currentCredential, setFieldValue)
+  ) : (
+    field.leftElement
+  );
+  const rightField = field.rightField;
+  const rightElement = rightField ? (
+    <CheckboxField
+      name={rightField.name}
+      label={
+        typeof rightField.label === "function"
+          ? rightField.label(currentCredential)
+          : rightField.label
+      }
+      disabled={
+        typeof rightField.disabled === "function"
+          ? rightField.disabled(values, currentCredential)
+          : (rightField.disabled ?? false)
+      }
+      onChange={(checked) => {
+        setFieldValue(rightField.name, checked);
+        if (rightField.onChange) {
+          rightField.onChange(checked, setFieldValue, values);
+        }
+      }}
+    />
+  ) : typeof field.rightElement === "function" ? (
+    field.rightElement(values, currentCredential, setFieldValue)
+  ) : (
+    field.rightElement
+  );
   const initialValue =
     typeof field.initial === "function"
       ? field.initial(currentCredential)
@@ -234,7 +290,12 @@ export const RenderField: FC<RenderFieldProps> = ({
             label={label}
             sublabel={description}
             disabled={disabled}
-            onChange={(checked) => setFieldValue(field.name, checked)}
+            onChange={(checked) => {
+              setFieldValue(field.name, checked);
+              if (field.onChange) {
+                field.onChange(checked, setFieldValue, values);
+              }
+            }}
           />
         </GeneralLayouts.Section>
       ) : field.type === "text" ? (
@@ -263,6 +324,12 @@ export const RenderField: FC<RenderFieldProps> = ({
             name={field.name}
             isTextArea={false}
             disabled={disabled}
+            placeholder={field.placeholder}
+            rightText={rightText}
+            rightElement={rightElement}
+            leftElement={leftElement}
+            maxWidth={field.maxWidth}
+            width={field.width}
             onChange={(e) => setFieldValue(field.name, e.target.value)}
           />
         )

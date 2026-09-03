@@ -582,7 +582,9 @@ class OpenSearchIndexer(
     private val mapper: ObjectMapper,
     private val externalWrites: PairExternalWriteFence,
 ) {
-    private val configuredClientBuilder = clientBuilder.clone().also { builder ->
+    private val configuredClientBuilder = clientBuilder.clone().codecs { codecs ->
+        codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
+    }.also { builder ->
         if (properties.opensearch.username.isNotBlank() && properties.opensearch.password.isNotBlank()) {
             builder.defaultHeaders { headers ->
                 headers.setBasicAuth(properties.opensearch.username, properties.opensearch.password)
@@ -1084,6 +1086,7 @@ class OpenSearchIndexer(
     )
 
     private companion object {
+        const val MAX_RESPONSE_BYTES = 16 * 1024 * 1024
         const val EXACT_DOCUMENT_ID_FIELD = "source_document_id"
         const val EMBEDDING_FIELD = "embedding"
         val EXACT_FIELDS: Map<String, Any> = mapOf(
