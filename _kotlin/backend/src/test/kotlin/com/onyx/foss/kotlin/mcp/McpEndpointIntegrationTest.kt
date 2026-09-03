@@ -41,7 +41,7 @@ class McpEndpointIntegrationTest {
     @Test
     fun `remote client discovers and calls search`() {
         `when`(search.search("deployment guide", listOf("Engineering"), 5))
-            .thenReturn(SearchResponse(reranked = true, results = emptyList()))
+            .thenReturn(SearchResponse(results = emptyList()))
         val transport = HttpClientStreamableHttpTransport.builder("http://localhost:$port")
             .endpoint("/mcp")
             .jsonMapper(JacksonMcpJsonMapper(mapper))
@@ -50,13 +50,17 @@ class McpEndpointIntegrationTest {
         McpClient.sync(transport).requestTimeout(Duration.ofSeconds(10)).build().use { client ->
             val initialized = client.initialize()
             assertThat(initialized.serverInfo().name()).isEqualTo("onyx-search")
-            assertThat(client.listTools().tools().map(McpSchema.Tool::name)).containsExactly("search")
+            assertThat(client.listTools().tools().map(McpSchema.Tool::name)).containsExactlyInAnyOrder(
+                "search",
+                "search_indexed_documents",
+                "weighted_reciprocal_rank_fusion",
+            )
             val result = client.callTool(
-                McpSchema.CallToolRequest.builder("search")
+                McpSchema.CallToolRequest.builder("search_indexed_documents")
                     .arguments(
                         mapOf(
                             "query" to "deployment guide",
-                            "document_sets" to listOf("Engineering"),
+                            "document_set_names" to listOf("Engineering"),
                             "limit" to 5,
                         ),
                     )
@@ -65,13 +69,13 @@ class McpEndpointIntegrationTest {
             assertThat(result.isError() == true).isFalse()
         }
 
-        verify(search).search("deployment guide", listOf("Engineering"), 5)
+        verify(search).search("deployment guide", listOf("Engineering"), 5, com.onyx.foss.kotlin.service.SearchType.HYBRID)
     }
 
     @Test
     fun `remote client uses header document sets when none provided in arguments`() {
         `when`(search.search("guide", listOf("Engineering", "Operations"), 5))
-            .thenReturn(SearchResponse(reranked = true, results = emptyList()))
+            .thenReturn(SearchResponse(results = emptyList()))
         val transport = HttpClientStreamableHttpTransport.builder("http://localhost:$port")
             .endpoint("/mcp")
             .jsonMapper(JacksonMcpJsonMapper(mapper))
@@ -94,7 +98,7 @@ class McpEndpointIntegrationTest {
     @Test
     fun `remote client uses query parameter document sets as fallback`() {
         `when`(search.search("guide", listOf("FallbackSet"), 5))
-            .thenReturn(SearchResponse(reranked = true, results = emptyList()))
+            .thenReturn(SearchResponse(results = emptyList()))
         val transport = HttpClientStreamableHttpTransport.builder("http://localhost:$port")
             .endpoint("/mcp?document_sets=FallbackSet")
             .jsonMapper(JacksonMcpJsonMapper(mapper))
@@ -116,7 +120,7 @@ class McpEndpointIntegrationTest {
     @Test
     fun `remote client prefers header over query parameter when both are present`() {
         `when`(search.search("guide", listOf("HeaderSet"), 5))
-            .thenReturn(SearchResponse(reranked = true, results = emptyList()))
+            .thenReturn(SearchResponse(results = emptyList()))
         val transport = HttpClientStreamableHttpTransport.builder("http://localhost:$port")
             .endpoint("/mcp?document_sets=FallbackSet")
             .jsonMapper(JacksonMcpJsonMapper(mapper))

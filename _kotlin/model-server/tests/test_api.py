@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app, embedding_runtime, reranker_runtime
+from app.main import app, embedding_runtime
 from app.runtime import RuntimeStatus
 
 
@@ -17,16 +17,7 @@ def client(monkeypatch) -> TestClient:
             embedding_runtime.settings.embedding_model_name,
         )
 
-    def load_reranker() -> None:
-        reranker_runtime.status = RuntimeStatus(
-            True,
-            "READY",
-            "test reranker ready",
-            reranker_runtime.settings.reranker_model_name,
-        )
-
     monkeypatch.setattr(embedding_runtime, "load", load_embedding)
-    monkeypatch.setattr(reranker_runtime, "load", load_reranker)
     with TestClient(app) as test_client:
         yield test_client
 
@@ -55,16 +46,3 @@ def test_embed_contract_with_fake_runtime(monkeypatch, client: TestClient) -> No
     assert response.status_code == 200
     assert response.json() == {"embeddings": [[1.0, 0.0], [1.0, 0.0]]}
 
-
-def test_rerank_contract_with_fake_runtime(monkeypatch, client: TestClient) -> None:
-    monkeypatch.setattr(reranker_runtime, "score", lambda request: [0.1, 0.9])
-    response = client.post(
-        "/encoder/cross-encoder-scores",
-        json={
-            "query": "query",
-            "documents": ["first", "second"],
-            "model_name": reranker_runtime.settings.reranker_model_name,
-        },
-    )
-    assert response.status_code == 200
-    assert response.json() == {"scores": [0.1, 0.9]}

@@ -8,11 +8,7 @@ x-backend-environment: &backend-environment
   ONYX_FILE_STORAGE_ROOT: /var/lib/onyx/files
   MODEL_SERVER_URL: http://model-server:9000
   ONYX_EMBEDDING_MODEL_NAME: ${ONYX_EMBEDDING_MODEL_NAME:-ibm-granite/granite-embedding-311m-multilingual-r2}
-  ONYX_RERANKER_ENABLED: ${ONYX_RERANKER_ENABLED:-true}
-  ONYX_RERANKER_MODEL_NAME: ${RERANKER_MODEL:-Alibaba-NLP/gte-multilingual-reranker-base}
-  ONYX_RERANKER_MAX_DOCUMENTS: ${RERANKER_MAX_DOCUMENTS:-100}
   ONYX_SEARCH_CANDIDATES: ${ONYX_SEARCH_CANDIDATES:-50}
-  ONYX_SEARCH_RERANK_CANDIDATES: ${ONYX_SEARCH_RERANK_CANDIDATES:-30}
   OPENSEARCH_URL: https://opensearch:9200
   OPENSEARCH_INDEX: ${OPENSEARCH_INDEX:-onyx-kotlin-chunks}
   OPENSEARCH_ADMIN_USERNAME: admin
@@ -87,11 +83,6 @@ services:
     environment:
       EMBEDDING_MODEL_PATH: /models/granite-embedding-311m-multilingual-r2-int8-openvino
       EMBEDDING_MODEL_NAME: ${ONYX_EMBEDDING_MODEL_NAME:-ibm-granite/granite-embedding-311m-multilingual-r2}
-      RERANKER_MODEL_PATH: ${RERANKER_MODEL_PATH:-/models/gte-multilingual-reranker-base}
-      RERANKER_MODEL: ${RERANKER_MODEL:-Alibaba-NLP/gte-multilingual-reranker-base}
-      RERANKER_REQUIRED: "true"
-      RERANKER_MAX_DOCUMENTS: ${RERANKER_MAX_DOCUMENTS:-100}
-      RERANKER_MAX_LENGTH: ${RERANKER_MAX_LENGTH:-512}
       MODEL_INFERENCE_CONCURRENCY: ${MODEL_INFERENCE_CONCURRENCY:-1}
       TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-1}
     shm_size: 512m
