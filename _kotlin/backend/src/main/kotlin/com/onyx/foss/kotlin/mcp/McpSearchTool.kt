@@ -11,11 +11,7 @@ class McpSearchTool(
     private val mapper: ObjectMapper,
 ) {
     fun definition(): McpSchema.Tool = McpSchema.Tool.builder("search", INPUT_SCHEMA)
-        .description(
-            "Search indexed Onyx documents. document_sets uses union semantics. Start with one focused query. " +
-                "Run another search only when results are insufficient or ambiguous. Do not exceed 3 search calls " +
-                "for one user request.",
-        )
+        .description("Search indexed Onyx documents. document_sets uses union semantics.")
         .build()
 
     private companion object {
@@ -35,11 +31,12 @@ class McpSearchTool(
             )
     }
 
-    fun call(arguments: Map<String, Any>): McpSchema.CallToolResult = try {
+    fun call(arguments: Map<String, Any>, defaultDocumentSets: List<String> = emptyList()): McpSchema.CallToolResult = try {
         val query = arguments["query"] as? String ?: throw IllegalArgumentException("query must be a string")
-        val documentSets = (arguments["document_sets"] as? List<*>)?.map {
+        val requestedSets = (arguments["document_sets"] as? List<*>)?.map {
             it as? String ?: throw IllegalArgumentException("document_sets must contain strings")
-        }.orEmpty()
+        }
+        val documentSets = if (!requestedSets.isNullOrEmpty()) requestedSets else defaultDocumentSets
         val limit = (arguments["limit"] as? Number)?.toInt() ?: 10
         val response = search.search(query, documentSets, limit)
         McpSchema.CallToolResult.builder()

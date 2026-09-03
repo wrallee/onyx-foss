@@ -135,6 +135,20 @@ This file records deferred checks. It does not schedule work.
 - result:
 - next_step_on_fail: 16MB 한도도 넘는 사례가 재현되면 쿼리 크기 제한을 우선 적용하고 한도 상향은 되돌린다.
 
+### WL-20260903-002 — Jira 크레덴셜 등록 단계의 Base URL 입력 및 검증 분리
+- status: open
+- priority: P2
+- owner: both
+- due_at: unscheduled
+- created_at: 2026-09-03T17:42:00+09:00
+- source: web/src/lib/connectors/credentials.ts; web/src/lib/connectors/connectors.tsx; backend/src/main/kotlin/com/onyx/foss/kotlin/ingestion/JiraConnectorLoader.kt
+- trigger: 현재 Jira 커넥터는 Credential 생성 단계에 Base URL 입력 필드가 없어 커넥터 설정 단계에서 jira_base_url을 받고 있다. 이로 인해 Credential 생성 시점에 Cloud/Server 여부를 알 수 없고 사전 검증도 불가능한 UI/모델 설계 문제가 있다.
+- action: Jira Credential 등록 단계에 Base URL 필드를 추가하여 크레덴셜 생성 시점에 사전 검증과 Cloud/Server 분기를 수행하도록 개선하고, 커넥터 설정 단계에서는 크레덴셜의 Base URL을 연동하도록 재설계한다.
+- done_when: Jira 크레덴셜 생성 UI에서 Base URL을 입력받아 사전 검증할 수 있고, 커넥터 설정과 분리된 온프레미스/클라우드 자격 증명 관리가 테스트로 검증된다.
+- last_checked_at:
+- result:
+- next_step_on_fail: 커넥터 설정 단계의 jira_base_url 기반 판별 로직을 유지하면서 점진적 UI 개편을 진행한다.
+
 ## Done
 
 ## Archive

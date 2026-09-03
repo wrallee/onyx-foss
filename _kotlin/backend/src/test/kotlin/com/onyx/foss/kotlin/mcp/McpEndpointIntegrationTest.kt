@@ -49,7 +49,7 @@ class McpEndpointIntegrationTest {
 
         McpClient.sync(transport).requestTimeout(Duration.ofSeconds(10)).build().use { client ->
             val initialized = client.initialize()
-            assertThat(initialized.instructions()).contains("at most 3 search calls")
+            assertThat(initialized.serverInfo().name()).isEqualTo("onyx-search")
             assertThat(client.listTools().tools().map(McpSchema.Tool::name)).containsExactly("search")
             val result = client.callTool(
                 McpSchema.CallToolRequest.builder("search")
@@ -66,5 +66,73 @@ class McpEndpointIntegrationTest {
         }
 
         verify(search).search("deployment guide", listOf("Engineering"), 5)
+    }
+
+    @Test
+    fun `remote client uses header document sets when none provided in arguments`() {
+        `when`(search.search("guide", listOf("Engineering", "Operations"), 5))
+            .thenReturn(SearchResponse(reranked = true, results = emptyList()))
+        val transport = HttpClientStreamableHttpTransport.builder("http://localhost:$port")
+            .endpoint("/mcp")
+            .jsonMapper(JacksonMcpJsonMapper(mapper))
+            .httpRequestCustomizer { builder, _, _, _, _ -> builder.header("X-Onyx-Document-Sets", "Engineering,Operations") }
+            .build()
+
+        McpClient.sync(transport).requestTimeout(Duration.ofSeconds(10)).build().use { client ->
+            client.initialize()
+            val result = client.callTool(
+                McpSchema.CallToolRequest.builder("search")
+                    .arguments(mapOf("query" to "guide", "limit" to 5))
+                    .build(),
+            )
+            assertThat(result.isError() == true).isFalse()
+        }
+
+        verify(search).search("guide", listOf("Engineering", "Operations"), 5)
+    }
+
+    @Test
+    fun `remote client uses query parameter document sets as fallback`() {
+        `when`(search.search("guide", listOf("FallbackSet"), 5))
+            .thenReturn(SearchResponse(reranked = true, results = emptyList()))
+        val transport = HttpClientStreamableHttpTransport.builder("http://localhost:$port")
+            .endpoint("/mcp?document_sets=FallbackSet")
+            .jsonMapper(JacksonMcpJsonMapper(mapper))
+            .build()
+
+        McpClient.sync(transport).requestTimeout(Duration.ofSeconds(10)).build().use { client ->
+            client.initialize()
+            val result = client.callTool(
+                McpSchema.CallToolRequest.builder("search")
+                    .arguments(mapOf("query" to "guide", "limit" to 5))
+                    .build(),
+            )
+            assertThat(result.isError() == true).isFalse()
+        }
+
+        verify(search).search("guide", listOf("FallbackSet"), 5)
+    }
+
+    @Test
+    fun `remote client prefers header over query parameter when both are present`() {
+        `when`(search.search("guide", listOf("HeaderSet"), 5))
+            .thenReturn(SearchResponse(reranked = true, results = emptyList()))
+        val transport = HttpClientStreamableHttpTransport.builder("http://localhost:$port")
+            .endpoint("/mcp?document_sets=FallbackSet")
+            .jsonMapper(JacksonMcpJsonMapper(mapper))
+            .httpRequestCustomizer { builder, _, _, _, _ -> builder.header("X-Onyx-Document-Sets", "HeaderSet") }
+            .build()
+
+        McpClient.sync(transport).requestTimeout(Duration.ofSeconds(10)).build().use { client ->
+            client.initialize()
+            val result = client.callTool(
+                McpSchema.CallToolRequest.builder("search")
+                    .arguments(mapOf("query" to "guide", "limit" to 5))
+                    .build(),
+            )
+            assertThat(result.isError() == true).isFalse()
+        }
+
+        verify(search).search("guide", listOf("HeaderSet"), 5)
     }
 }
