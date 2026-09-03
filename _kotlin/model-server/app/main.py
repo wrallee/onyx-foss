@@ -12,8 +12,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 
 from app.config import Settings
-from app.contracts import ApiError, EmbedRequest, EmbedResponse, RerankRequest, RerankResponse
-from app.runtime import EmbeddingRuntime, RerankerRuntime
+from app.contracts import ApiError, EmbedRequest, EmbedResponse
+from app.runtime import EmbeddingRuntime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("onyx-python-model-server")
@@ -36,24 +36,19 @@ READY = Gauge(
 
 settings = Settings.from_environment()
 embedding_runtime = EmbeddingRuntime(settings)
-reranker_runtime = RerankerRuntime(settings)
 startup_errors: dict[str, str] = {}
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    for name, runtime in (
-        ("embedding", embedding_runtime),
-        ("reranker", reranker_runtime),
-    ):
-        try:
-            await run_in_threadpool(runtime.load)
-            READY.labels(name).set(1)
-            logger.info("%s runtime ready: %s", name, runtime.status.model_name)
-        except Exception as error:
-            startup_errors[name] = str(error)
-            READY.labels(name).set(0)
-            logger.exception("Failed to load %s runtime", name)
+    try:
+        await run_in_threadpool(embedding_runtime.load)
+        READY.labels("embedding").set(1)
+        logger.info("embedding runtime ready: %s", embedding_runtime.status.model_name)
+    except Exception as error:
+        startup_errors["embedding"] = str(error)
+        READY.labels("embedding").set(0)
+        logger.exception("Failed to load embedding runtime")
     yield
 
 
@@ -90,23 +85,19 @@ def gpu_status() -> dict[str, Any]:
 def model_status() -> dict[str, Any]:
     return {
         "embedding": embedding_runtime.status.__dict__,
-        "reranker": reranker_runtime.status.__dict__,
         "startup_errors": startup_errors,
     }
 
 
 @app.get("/actuator/health/readiness")
 def readiness() -> JSONResponse:
-    embedding_ready = embedding_runtime.status.ready
-    reranker_ready = reranker_runtime.status.ready or not settings.reranker_required
-    ready = embedding_ready and reranker_ready
+    ready = embedding_runtime.status.ready
     return JSONResponse(
         status_code=200 if ready else 503,
         content={
             "status": "UP" if ready else "DOWN",
             "components": {
                 "embedding": embedding_runtime.status.__dict__,
-                "reranker": reranker_runtime.status.__dict__,
             },
         },
     )
@@ -129,17 +120,3 @@ async def embed(request: EmbedRequest) -> EmbedResponse:
         raise
     finally:
         LATENCY.labels("embed").observe(time.perf_counter() - started)
-
-
-@app.post("/encoder/cross-encoder-scores", response_model=RerankResponse)
-async def rerank(request: RerankRequest) -> RerankResponse:
-    started = time.perf_counter()
-    try:
-        scores = await run_in_threadpool(reranker_runtime.score, request)
-        REQUESTS.labels("rerank", "success").inc()
-        return RerankResponse(scores=scores)
-    except Exception:
-        REQUESTS.labels("rerank", "error").inc()
-        raise
-    finally:
-        LATENCY.labels("rerank").observe(time.perf_counter() - started)

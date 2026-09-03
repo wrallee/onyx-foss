@@ -32,21 +32,7 @@ class EmbedResponse(BaseModel):
     embeddings: list[list[float]]
 
 
-class RerankRequest(BaseModel):
-    model_config = ConfigDict(protected_namespaces=())
-
-    query: str
-    documents: list[str]
-    model_name: str
-    provider_type: str | None = None
-    api_key: str | None = None
-    api_url: str | None = None
-
-
-class RerankResponse(BaseModel):
-    scores: list[float]
-
-
 class ApiError(BaseModel):
     code: str
     message: str
+

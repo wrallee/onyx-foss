@@ -46,11 +46,20 @@ class McpConfiguration {
         .jsonMapper(jsonMapper)
         .serverInfo("onyx-search", "0.1.0")
         .capabilities(McpSchema.ServerCapabilities.builder().tools(false).build())
-        .toolCall(searchTool.definition()) { exchange, request ->
+        .toolCall(searchTool.searchDefinition(McpSearchTool.TOOL_SEARCH_INDEXED_DOCUMENTS)) { exchange, request ->
             val defaultSets = (exchange.transportContext()?.get(DEFAULT_DOCUMENT_SETS_KEY) as? List<*>)
                 ?.mapNotNull { it as? String }
                 .orEmpty()
-            searchTool.call(request.arguments(), defaultSets)
+            searchTool.callSearch(request.arguments(), defaultSets)
+        }
+        .toolCall(searchTool.searchDefinition(McpSearchTool.TOOL_SEARCH_LEGACY)) { exchange, request ->
+            val defaultSets = (exchange.transportContext()?.get(DEFAULT_DOCUMENT_SETS_KEY) as? List<*>)
+                ?.mapNotNull { it as? String }
+                .orEmpty()
+            searchTool.callSearch(request.arguments(), defaultSets)
+        }
+        .toolCall(searchTool.fusionDefinition()) { _, request ->
+            searchTool.callFusion(request.arguments())
         }
         .build()
 
