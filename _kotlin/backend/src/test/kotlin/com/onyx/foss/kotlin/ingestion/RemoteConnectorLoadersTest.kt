@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer

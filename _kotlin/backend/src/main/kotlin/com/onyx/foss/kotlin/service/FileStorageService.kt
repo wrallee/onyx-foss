@@ -1,8 +1,8 @@
 package com.onyx.foss.kotlin.service
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.databind.node.ArrayNode
-import com.fasterxml.jackson.databind.node.ObjectNode
+import tools.jackson.databind.ObjectMapper
+import tools.jackson.databind.node.ArrayNode
+import tools.jackson.databind.node.ObjectNode
 import com.onyx.foss.kotlin.api.ApiException
 import com.onyx.foss.kotlin.config.OnyxProperties
 import com.onyx.foss.kotlin.domain.ConnectorSource
@@ -74,7 +74,7 @@ class FileStorageService(
         if (connector.source != ConnectorSource.FILE) {
             throw ApiException(HttpStatus.BAD_REQUEST, "This endpoint only works with file connectors")
         }
-        val config = ((connector.connectorSpecificConfig ?: mapper.createObjectNode()).deepCopy<ObjectNode>())
+        val config = ((connector.connectorSpecificConfig ?: mapper.createObjectNode()).deepCopy() as ObjectNode)
         val currentNames = config.withArray("file_names")
         val currentFiles = config.withArray("file_locations").mapIndexed { index, location ->
             location.asText() to (currentNames.get(index)?.asText() ?: location.asText())
@@ -87,8 +87,8 @@ class FileStorageService(
             uploaded.metadataId,
             currentFiles.map { it.second }.toSet(),
         )
-        config.set<ArrayNode>("file_locations", mapper.valueToTree(currentFiles.map { it.first }))
-        config.set<ArrayNode>("file_names", mapper.valueToTree(currentFiles.map { it.second }))
+        config.set("file_locations", mapper.valueToTree(currentFiles.map { it.first }))
+        config.set("file_names", mapper.valueToTree(currentFiles.map { it.second }))
         config.put("zip_metadata_file_id", metadataId)
         connector.connectorSpecificConfig = config
         admin.updateConnector(
@@ -232,7 +232,7 @@ class FileStorageService(
         val node = Files.newInputStream(filePath(assetId)).use(mapper::readTree)
         return when {
             node.isArray -> node.mapNotNull { entry -> entry.path("filename").asText().takeIf(String::isNotBlank)?.let { it to entry } }.toMap()
-            node.isObject -> node.fields().asSequence().associate { it.key to it.value }
+            node.isObject -> node.properties().asSequence().associate { it.key to it.value }
             else -> emptyMap()
         }
     }

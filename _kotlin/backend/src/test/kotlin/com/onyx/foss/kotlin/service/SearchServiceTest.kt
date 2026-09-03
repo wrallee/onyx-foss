@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.service
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
 import com.onyx.foss.kotlin.domain.DocumentSetEntity
 import com.onyx.foss.kotlin.domain.DocumentSetRepository

@@ -1,7 +1,7 @@
 package com.onyx.foss.kotlin.api
 
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.domain.ConnectorCredentialPairRepository
 import com.onyx.foss.kotlin.domain.ConnectorRepository
 import com.onyx.foss.kotlin.domain.CredentialRepository
@@ -27,7 +27,7 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc
+import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc
 import org.springframework.http.MediaType
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.mock.web.MockMultipartFile
@@ -297,7 +297,7 @@ class AdminApiIntegrationTest : H2IntegrationTest() {
         )
 
         assertThat(documentSetSyncOutbox.findAll()).hasSize(3)
-        assertThat(documentSetSyncOutbox.findAll().map { row -> row.ccPairIds?.map { it.asLong() } })
+        assertThat(documentSetSyncOutbox.findAll().map { row -> row.ccPairIds?.toList()?.map { it.asLong() } })
             .containsOnly(listOf(pairId))
     }
 
@@ -316,7 +316,7 @@ class AdminApiIntegrationTest : H2IntegrationTest() {
         request(delete("/manage/admin/document-set/$setId"))
 
         assertThat(documentSetSyncOutbox.findAll()).hasSize(3)
-        assertThat(documentSetSyncOutbox.findAll().map { row -> row.ccPairIds?.map { it.asLong() } })
+        assertThat(documentSetSyncOutbox.findAll().map { row -> row.ccPairIds?.toList()?.map { it.asLong() } })
             .containsOnly(listOf(pairId))
     }
 
@@ -582,9 +582,9 @@ class AdminApiIntegrationTest : H2IntegrationTest() {
         assertThat(uploaded.status).isEqualTo(200)
         assertThat(configured.status).isEqualTo(200)
         assertThat(response.status).isEqualTo(200)
-        assertThat(response.body.path("file_names").map(JsonNode::asText)).containsExactly("c.txt")
-        assertThat(config.path("file_locations").map(JsonNode::asText)).containsExactly(bId, response.body.path("file_paths").first().asText())
-        assertThat(config.path("file_names").map(JsonNode::asText)).containsExactly("b.txt", "c.txt")
+        assertThat(response.body.path("file_names").toList().map(JsonNode::asText)).containsExactly("c.txt")
+        assertThat(config.path("file_locations").toList().map(JsonNode::asText)).containsExactly(bId, response.body.path("file_paths").first().asText())
+        assertThat(config.path("file_names").toList().map(JsonNode::asText)).containsExactly("b.txt", "c.txt")
         assertThat(connectors.count()).isEqualTo(1)
         assertThat(queuedJobs()).isEqualTo(1)
     }
@@ -597,8 +597,8 @@ class AdminApiIntegrationTest : H2IntegrationTest() {
         )
 
         assertThat(response.status).isEqualTo(200)
-        assertThat(response.body.path("file_paths").map(JsonNode::asText)).hasSize(1)
-        assertThat(response.body.path("file_names").map(JsonNode::asText)).containsExactly("one.txt")
+        assertThat(response.body.path("file_paths").toList().map(JsonNode::asText)).hasSize(1)
+        assertThat(response.body.path("file_names").toList().map(JsonNode::asText)).containsExactly("one.txt")
         val metadataId = response.body.path("zip_metadata_file_id").asText()
         assertThat(metadataId).isNotBlank()
         assertThat(Files.readString(storedFiles.filePath(metadataId))).contains("one.txt")
@@ -618,8 +618,8 @@ class AdminApiIntegrationTest : H2IntegrationTest() {
             connector(
                 "file",
                 mapOf(
-                    "file_locations" to initial.body.path("file_paths").map(JsonNode::asText),
-                    "file_names" to initial.body.path("file_names").map(JsonNode::asText),
+                    "file_locations" to initial.body.path("file_paths").toList().map(JsonNode::asText),
+                    "file_names" to initial.body.path("file_names").toList().map(JsonNode::asText),
                     "zip_metadata_file_id" to initial.body.path("zip_metadata_file_id").asText(),
                 ),
             ),
@@ -633,7 +633,7 @@ class AdminApiIntegrationTest : H2IntegrationTest() {
         val metadata = Files.readString(storedFiles.filePath(config.path("zip_metadata_file_id").asText()))
 
         assertThat(response.status).isEqualTo(200)
-        assertThat(config.path("file_names").map(JsonNode::asText)).containsExactly("one.txt", "two.txt")
+        assertThat(config.path("file_names").toList().map(JsonNode::asText)).containsExactly("one.txt", "two.txt")
         assertThat(metadata).contains("one.txt", "two.txt")
     }
 
@@ -768,7 +768,7 @@ class AdminApiIntegrationTest : H2IntegrationTest() {
         patch(url).contentType(MediaType.APPLICATION_JSON).content(mapper.writeValueAsString(body)),
     )
 
-    private fun request(request: org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder): Response {
+    private fun request(request: org.springframework.test.web.servlet.RequestBuilder): Response {
         val result = mvc.perform(request).andReturn().response
         return Response(result.status, mapper.readTree(result.contentAsString), result.contentAsString)
     }

@@ -1,8 +1,8 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.SerializationFeature
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.SerializationFeature
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
 import io.netty.handler.ssl.SslContextBuilder
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory
@@ -44,8 +44,7 @@ import okio.Buffer
 @Testcontainers
 @Tag("opensearch-integration")
 class OpenSearchIndexerIntegrationTest {
-    private val mapper = jacksonObjectMapper().findAndRegisterModules()
-        .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+    private val mapper = jacksonObjectMapper()
     private val client = insecureClient()
     private val index = "indexer-test-${UUID.randomUUID()}"
     private val baseUrl get() = "https://${openSearch.host}:${openSearch.getMappedPort(9200)}"
@@ -97,12 +96,12 @@ class OpenSearchIndexerIntegrationTest {
         assertThat(mapping.path(index).path("mappings").path("properties").path("primary_owners").path("type").asText())
             .isEqualTo("keyword")
         val urlDocument = exactDocuments(urlId).single()
-        assertThat(urlDocument.path("external_user_emails").map(JsonNode::asText)).containsExactly("reader@example.com")
+        assertThat(urlDocument.path("external_user_emails").toList().map(JsonNode::asText)).containsExactly("reader@example.com")
         assertThat(urlDocument.path("is_public").asBoolean()).isFalse()
-        assertThat(urlDocument.path("document_sets").map(JsonNode::asText)).containsExactly("Engineering")
+        assertThat(urlDocument.path("document_sets").toList().map(JsonNode::asText)).containsExactly("Engineering")
         assertThat(urlDocument.path("doc_updated_at").asText()).isEqualTo(updatedAt.toString())
-        assertThat(urlDocument.path("primary_owners").map(JsonNode::asText)).containsExactly("owner@example.com")
-        assertThat(urlDocument.path("secondary_owners").map(JsonNode::asText)).containsExactly("reviewer@example.com")
+        assertThat(urlDocument.path("primary_owners").toList().map(JsonNode::asText)).containsExactly("owner@example.com")
+        assertThat(urlDocument.path("secondary_owners").toList().map(JsonNode::asText)).containsExactly("reviewer@example.com")
         assertThat(exactDocuments(fileId)).isEmpty()
     }
 
@@ -155,8 +154,8 @@ class OpenSearchIndexerIntegrationTest {
         assertThat(mappingProperties().path("source_document_id").path("type").asText()).isEqualTo("keyword")
         val urlDocument = exactDocuments(urlId).single()
         assertThat(urlDocument.path("content").asText()).isEqualTo("url content")
-        assertThat(urlDocument.path("external_user_emails").map(JsonNode::asText)).containsExactly("reader@example.com")
-        assertThat(urlDocument.path("document_sets").map(JsonNode::asText)).containsExactly("Engineering")
+        assertThat(urlDocument.path("external_user_emails").toList().map(JsonNode::asText)).containsExactly("reader@example.com")
+        assertThat(urlDocument.path("document_sets").toList().map(JsonNode::asText)).containsExactly("Engineering")
         assertThat(exactDocuments(fileId)).isEmpty()
     }
 
@@ -208,7 +207,7 @@ class OpenSearchIndexerIntegrationTest {
             }
         }
 
-        assertThat(exactDocuments(legacyId).single().path("external_user_emails").map(JsonNode::asText))
+        assertThat(exactDocuments(legacyId).single().path("external_user_emails").toList().map(JsonNode::asText))
             .containsExactly("reader@example.com")
         assertThat(exactDocuments(concurrentId).single().path("content").asText()).isEqualTo("concurrent content")
     }
@@ -281,7 +280,7 @@ class OpenSearchIndexerIntegrationTest {
 
         indexer().upsert(7, "after-restart", 0, "Restarted", "new", null, emptyMap(), vector(0.3))
 
-        assertThat(get("/_alias/$index").fieldNames().asSequence().toList()).containsExactly(replacement)
+        assertThat((get("/_alias/$index") as tools.jackson.databind.node.ObjectNode).properties().map { it.key }).containsExactly(replacement)
         assertThat(exactDocuments(firstId)).hasSize(1)
         assertThat(exactDocuments(secondId)).hasSize(1)
         assertThat(exactDocuments("after-restart")).hasSize(1)
@@ -309,7 +308,7 @@ class OpenSearchIndexerIntegrationTest {
         .retrieve()
         .bodyToMono(JsonNode::class.java)
         .block(Duration.ofSeconds(30))
-        ?.path("hits")?.path("hits")?.map { it.path("_source") }
+        ?.path("hits")?.path("hits")?.toList()?.map { it.path("_source") }
         .orEmpty()
 
     private fun putRawDocument(documentId: String, sourceDocumentId: String, content: String) {
@@ -420,7 +419,7 @@ class OpenSearchIndexerIntegrationTest {
             .build()
     }
 
-    private fun mappingProperties(): JsonNode = get("/$index/_mapping").fields().next().value
+    private fun mappingProperties(): JsonNode = get("/$index/_mapping").properties().first().value
         .path("mappings").path("properties")
 
     private fun get(path: String): JsonNode = requireNotNull(

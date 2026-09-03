@@ -1,9 +1,9 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
-import com.fasterxml.jackson.module.kotlin.readValue
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.ObjectMapper
+import tools.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.module.kotlin.readValue
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
@@ -292,7 +292,7 @@ class JiraConnectorLoaderTest {
                 if (request.requestUrl!!.encodedPath.endsWith("/search/jql")) {
                     return jsonResponse(mapper.writeValueAsString(mapOf("issues" to ids.map { mapOf("id" to it) })))
                 }
-                val requested = mapper.readTree(request.body.readUtf8()).path("issueIdsOrKeys").map(JsonNode::asText)
+                val requested = mapper.readTree(request.body.readUtf8()).path("issueIdsOrKeys").toList().map(JsonNode::asText)
                 requestSizes += requested.size
                 return jsonResponse(bulkPage(*requested.map { issue("ENG-$it", id = it) }.toTypedArray()))
             }
@@ -693,7 +693,7 @@ class JiraConnectorLoaderTest {
             if (request.requestUrl!!.encodedPath.endsWith("/search/jql")) {
                 return jsonResponse(mapper.writeValueAsString(mapOf("issues" to ids.map { mapOf("id" to it) })))
             }
-            val requested = mapper.readTree(request.body.readUtf8()).path("issueIdsOrKeys").map(JsonNode::asText)
+            val requested = mapper.readTree(request.body.readUtf8()).path("issueIdsOrKeys").toList().map(JsonNode::asText)
             if ("BAD" in requested) return jsonResponse("{")
             return jsonResponse(bulkPage(*requested.map { issue("ENG-$it", id = it) }.toTypedArray()))
         }

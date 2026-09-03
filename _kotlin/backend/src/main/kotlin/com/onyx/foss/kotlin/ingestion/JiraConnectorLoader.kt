@@ -1,9 +1,9 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.core.JsonProcessingException
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.databind.node.ObjectNode
+import tools.jackson.core.JacksonException
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.ObjectMapper
+import tools.jackson.databind.node.ObjectNode
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import org.springframework.core.codec.DecodingException
 import org.springframework.http.HttpHeaders
@@ -110,7 +110,7 @@ class JiraConnectorLoader(
         end: Instant? = null,
         includePermissions: Boolean = false,
     ): Sequence<ConnectorBatch> {
-        val effectiveConfig = (config?.deepCopy<ObjectNode>() ?: mapper.createObjectNode())
+        val effectiveConfig = ((config?.deepCopy() as? ObjectNode) ?: mapper.createObjectNode())
             .put("include_permissions", includePermissions)
         return loadInternal(
             effectiveConfig,
@@ -162,7 +162,7 @@ class JiraConnectorLoader(
                     "/rest/api/3/search/jql?jql=${query(context.jql)}&maxResults=$CLOUD_ID_PAGE_SIZE" +
                         "&fields=id$cursorQuery",
                 )
-                response.path("issues").mapNotNull { issue -> issue.path("id").asText().takeIf(String::isNotBlank) }
+                response.path("issues").toList().mapNotNull{ issue -> issue.path("id").asText().takeIf(String::isNotBlank) }
                     .chunked(context.pageSize)
                     .forEach(pendingIds::add)
                 cursor = response.path("nextPageToken").asText().takeIf(String::isNotBlank)
@@ -247,7 +247,7 @@ class JiraConnectorLoader(
     }
 
     private fun issueErrorMessage(error: JsonNode?, issueId: String): String {
-        val details = error?.path("errorMessages")?.map(JsonNode::asText).orEmpty() +
+        val details = (error?.path("errorMessages")?.toList()?.map(JsonNode::asText)).orEmpty() +
             listOfNotNull(error?.path("errorMessage")?.asText()?.takeIf(String::isNotBlank))
         return details.filter(String::isNotBlank).joinToString("; ")
             .ifBlank { "Jira bulk fetch did not return requested issue $issueId" }
@@ -351,11 +351,11 @@ class JiraConnectorLoader(
         require(key.isNotBlank()) { "Jira issue key is missing" }
         val fields = issue.path("fields")
         require(fields.isObject) { "Jira issue $key has no fields" }
-        val labels = fields.path("labels").map(JsonNode::asText)
+        val labels = fields.path("labels").toList().map(JsonNode::asText)
         if (labels.any(context.labelsToSkip::contains)) return null
 
         val description = adfText(fields.path("description"))
-        val comments = fields.path("comment").path("comments").mapNotNull { comment ->
+        val comments = fields.path("comment").path("comments").toList().mapNotNull{ comment ->
             val authorEmail = comment.path("author").path("emailAddress").asText()
             if (authorEmail in context.commentEmailBlacklist) null else adfText(comment.path("body")).takeIf(String::isNotBlank)
         }
@@ -583,7 +583,7 @@ class JiraConnectorLoader(
 
     private fun adfText(node: JsonNode): String = when {
         node.isTextual -> node.asText()
-        node.isArray -> node.map(::adfText).filter(String::isNotBlank).joinToString(" ")
+        node.isArray -> node.toList().map(::adfText).filter(String::isNotBlank).joinToString(" ")
         node.isObject && node.path("type").asText() == "text" -> node.path("text").asText()
         node.isObject -> adfText(node.path("content"))
         else -> ""
@@ -607,7 +607,7 @@ class JiraConnectorLoader(
     }.getOrNull()
 
     private fun RuntimeException.isJsonDecodeFailure(): Boolean = generateSequence<Throwable>(this) { it.cause }
-        .any { it is DecodingException || it is JsonProcessingException }
+        .any { it is DecodingException || it is tools.jackson.core.JacksonException }
 
     private data class Context(
         val config: JsonNode?,

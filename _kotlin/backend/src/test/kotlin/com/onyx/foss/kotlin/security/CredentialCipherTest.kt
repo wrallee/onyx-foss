@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.security
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
 import org.junit.jupiter.api.Test
 import org.springframework.mock.env.MockEnvironment

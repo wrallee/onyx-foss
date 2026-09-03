@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.api
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.service.AdminService
 import com.onyx.foss.kotlin.service.FileStorageService
 import com.onyx.foss.kotlin.service.IngestionQueryService

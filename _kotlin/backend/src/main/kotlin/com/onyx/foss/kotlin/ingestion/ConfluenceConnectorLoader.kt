@@ -1,9 +1,9 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.databind.node.ArrayNode
-import com.fasterxml.jackson.databind.node.ObjectNode
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.ObjectMapper
+import tools.jackson.databind.node.ArrayNode
+import tools.jackson.databind.node.ObjectNode
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import org.apache.tika.metadata.Metadata
 import org.apache.tika.metadata.TikaCoreProperties
@@ -233,7 +233,7 @@ class ConfluenceConnectorLoader(
     ): List<JsonNode> {
         val context = context(config, credentials)
         return paginate(context, buildCqlPath(cql, expand), limit).map { item ->
-            item.deepCopy<JsonNode>().also { expandNested(context, it, limit) }
+            item.deepCopy().also { expandNested(context, it, limit) }
         }
     }
 
@@ -398,7 +398,7 @@ class ConfluenceConnectorLoader(
                 val next = node.path("_links").path("next").asText().takeIf(String::isNotBlank)
                 val results = node.path("results") as? ArrayNode
                 if (next != null && results != null) paginate(context, next, limit).forEach(results::add)
-                node.fields().forEachRemaining { (_, value) -> expandNested(context, value, limit) }
+                node.properties().forEach { (_, value) -> expandNested(context, value, limit) }
             }
             is ArrayNode -> node.forEach { expandNested(context, it, limit) }
         }
@@ -424,8 +424,7 @@ class ConfluenceConnectorLoader(
             val html = page.path("body").path("storage").path("value").asText()
                 .ifBlank { page.path("body").path("view").path("value").asText() }
             val comments = if (context.config.boolean("include_comments", true)) comments(context, pageId) else ""
-            val labels = page.path("metadata").path("labels").path("results")
-                .mapNotNull { it.path("name").asText().takeIf(String::isNotBlank) }
+            val labels = page.path("metadata").path("labels").path("results").toList().mapNotNull{ it.path("name").asText().takeIf(String::isNotBlank) }
             val spaceKey = page.path("space").path("key").asText()
             val metadata = linkedMapOf<String, Any?>(
                 "source" to "confluence",
@@ -579,8 +578,7 @@ class ConfluenceConnectorLoader(
             if (!isImage && content.length > context.config.int("attachment_char_count_threshold", DEFAULT_ATTACHMENT_CHAR_LIMIT)) {
                 return AttachmentResult()
             }
-            val labels = attachment.path("metadata").path("labels").path("results")
-                .mapNotNull { it.path("name").asText().takeIf(String::isNotBlank) }
+            val labels = attachment.path("metadata").path("labels").path("results").toList().mapNotNull{ it.path("name").asText().takeIf(String::isNotBlank) }
             AttachmentResult(
                 document = SourceDocument(
                     id = documentId,
@@ -653,7 +651,7 @@ class ConfluenceConnectorLoader(
             val documents = mutableListOf<SourceDocument>()
             val failures = mutableListOf<ConnectorFailure>()
             result.results.forEach { rawPage ->
-                val page = rawPage.deepCopy<JsonNode>().also { expandNested(context, it, limit) }
+                val page = rawPage.deepCopy().also { expandNested(context, it, limit) }
                 val pageId = page.path("id").asText()
                 val pageUrl = buildContentUrl(context, page.path("_links").path("webui").asText())
                 val spaceKey = page.path("space").path("key").asText()
@@ -782,13 +780,13 @@ class ConfluenceConnectorLoader(
 
     private fun cqlPaginateAllExpansions(context: Context, cql: String, expand: String, limit: Int): List<JsonNode> =
         paginate(context, buildCqlPath(cql, expand), limit).map { item ->
-            item.deepCopy<JsonNode>().also { expandNested(context, it, limit) }
+            item.deepCopy().also { expandNested(context, it, limit) }
         }
 
     internal fun retrieveUsers(config: JsonNode?, credentials: JsonNode): List<ConfluenceUser> {
         val overrides = config?.path("confluence_user_profiles_override")?.takeIf(JsonNode::isArray)
         if (overrides != null && !overrides.isEmpty) {
-            return overrides.map { user ->
+            return overrides.toList().map { user ->
                 ConfluenceUser(
                     user.path("user_id").asText(),
                     user.path("username").asText().takeIf(String::isNotBlank),

@@ -13,6 +13,8 @@ spring:
       ddl-auto: validate
     properties:
       hibernate:
+        type:
+          json_format_mapper: org.hibernate.type.format.jackson.Jackson3JsonFormatMapper
         jdbc:
           time_zone: UTC
   flyway:

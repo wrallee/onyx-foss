@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import com.onyx.foss.kotlin.service.FileStorageService
 import org.junit.jupiter.api.Test

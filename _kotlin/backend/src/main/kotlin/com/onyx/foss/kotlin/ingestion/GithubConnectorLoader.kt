@@ -1,7 +1,7 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import org.springframework.http.HttpHeaders
 import org.springframework.beans.factory.annotation.Autowired
@@ -340,7 +340,7 @@ class GithubConnectorLoader(
             ).body
         }
         require(page.isArray) { "GitHub repository listing was not an array" }
-        val parsed = page.map { parseRepository(it, context) }
+        val parsed = page.toList().map { parseRepository(it, context) }
         if (checkpoint.repositories.size + parsed.size > MAX_REPOSITORIES) {
             checkpointLimit("repository count exceeds $MAX_REPOSITORIES")
         }
@@ -548,7 +548,7 @@ class GithubConnectorLoader(
                     nextCursor(response.headers, context.base),
                     cursorMode = true,
                 )
-            } catch (error: WebClientResponseException.UnprocessableEntity) {
+            } catch (error: WebClientResponseException.UnprocessableContent) {
                 if (!error.responseBodyAsString.contains("cursor", ignoreCase = true)) throw error
                 val restartPage = (retrieved / PAGE_SIZE) + 1
                 val response = get(context, "$endpoint?$query&page=$restartPage")
@@ -570,7 +570,7 @@ class GithubConnectorLoader(
                 nextCursor(response.headers, context.base),
                 cursorMode = false,
             )
-        } catch (error: WebClientResponseException.UnprocessableEntity) {
+        } catch (error: WebClientResponseException.UnprocessableContent) {
             if (!error.responseBodyAsString.contains("cursor", ignoreCase = true)) throw error
             val response = get(context, "$endpoint?$query")
             CollectionPage(
@@ -700,8 +700,8 @@ class GithubConnectorLoader(
         val link = item.text("html_url") ?: error("GitHub ${type.label} URL is missing")
         val title = item.path("title").asText()
         val author = item.path("user").path("login").asText().takeIf(String::isNotBlank)
-        val assignees = item.path("assignees").mapNotNull { it.path("login").asText().takeIf(String::isNotBlank) }
-        val labels = item.path("labels").mapNotNull { it.path("name").asText().takeIf(String::isNotBlank) }
+        val assignees = item.path("assignees").toList().mapNotNull{ it.path("login").asText().takeIf(String::isNotBlank) }
+        val labels = item.path("labels").toList().mapNotNull{ it.path("name").asText().takeIf(String::isNotBlank) }
         val metadata = linkedMapOf<String, Any?>(
             "source" to "github",
             "repository" to repository.fullName,
@@ -710,7 +710,7 @@ class GithubConnectorLoader(
             "id" to number,
             "state" to item.path("state").asText(),
             "user" to userInfo(item.path("user")),
-            "assignees" to item.path("assignees").map(::userInfo),
+            "assignees" to item.path("assignees").toList().map(::userInfo),
             "labels" to labels,
             "created_at" to item.text("created_at"),
             "updated_at" to item.text("updated_at"),

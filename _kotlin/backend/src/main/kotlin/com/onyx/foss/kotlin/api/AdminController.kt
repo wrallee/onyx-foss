@@ -1,7 +1,7 @@
 package com.onyx.foss.kotlin.api
 
-import com.fasterxml.jackson.core.type.TypeReference
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.core.type.TypeReference
+import tools.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import com.onyx.foss.kotlin.domain.PairStatus
 import com.onyx.foss.kotlin.service.AdminService
