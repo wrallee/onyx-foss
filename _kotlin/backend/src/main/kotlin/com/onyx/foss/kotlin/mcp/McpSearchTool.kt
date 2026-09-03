@@ -24,9 +24,6 @@ class McpSearchTool(
             .description("Merge multiple ranked result lists using weighted Reciprocal Rank Fusion (RRF). Intelligently combines rankings from decomposed queries.")
             .build()
 
-    // Backward compatibility for existing single definition accessor
-    fun definition(): McpSchema.Tool = searchDefinition(TOOL_SEARCH_INDEXED_DOCUMENTS)
-
     fun callSearch(
         arguments: Map<String, Any>,
         defaultDocumentSets: List<String> = emptyList(),
@@ -51,12 +48,6 @@ class McpSearchTool(
             .isError(true)
             .build()
     }
-
-    // Default call routes to search
-    fun call(
-        arguments: Map<String, Any>,
-        defaultDocumentSets: List<String> = emptyList(),
-    ): McpSchema.CallToolResult = callSearch(arguments, defaultDocumentSets)
 
     fun callFusion(arguments: Map<String, Any>): McpSchema.CallToolResult = try {
         val rankedResultsRaw = arguments["ranked_results"] as? List<*>
