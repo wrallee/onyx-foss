@@ -33,8 +33,10 @@ dependencies {
     implementation(platform("io.modelcontextprotocol.sdk:mcp-bom:2.0.1"))
     implementation("io.modelcontextprotocol.sdk:mcp-core")
     implementation("io.modelcontextprotocol.sdk:mcp-json-jackson3")
+    implementation(platform("org.springframework.ai:spring-ai-bom:2.0.1"))
+    implementation("org.springframework.ai:spring-ai-starter-vector-store-opensearch")
+    implementation("org.springframework.ai:spring-ai-rag")
     implementation("org.springframework.boot:spring-boot-starter-web")
-    implementation("org.springframework.boot:spring-boot-starter-webflux")
     implementation("org.springframework.boot:spring-boot-starter-data-jpa")
     implementation("org.springframework.boot:spring-boot-starter-validation")
     implementation("org.springframework.boot:spring-boot-starter-flyway")
@@ -50,6 +52,7 @@ dependencies {
     testImplementation("org.testcontainers:junit-jupiter:1.20.6")
     testImplementation(kotlin("test"))
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("com.squareup.okhttp3:okhttp-tls:4.12.0")
 }
 
 tasks.withType<Test> {

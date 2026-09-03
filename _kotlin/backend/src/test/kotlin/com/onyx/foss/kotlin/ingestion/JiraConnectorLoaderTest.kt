@@ -10,10 +10,10 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.jupiter.api.Test
-import org.springframework.web.reactive.function.client.ClientRequest
-import org.springframework.web.reactive.function.client.ExchangeFilterFunction
-import org.springframework.web.reactive.function.client.WebClient
-import org.springframework.web.reactive.function.client.WebClientResponseException
+import org.springframework.http.client.ClientHttpRequestInterceptor
+import org.springframework.http.client.support.HttpRequestWrapper
+import org.springframework.web.client.HttpServerErrorException
+import org.springframework.web.client.RestClient
 import java.net.URI
 import java.time.Instant
 import kotlin.test.assertEquals
@@ -185,7 +185,7 @@ class JiraConnectorLoaderTest {
         server.json("""{"issues":[{"id":"10001"}]}""")
         server.json(bulkPage(issue("ENG-1", id = "10001")))
         val client = RemoteJsonClient(
-            WebClient.builder().filter(rewriteAtlassianRequestsTo(server)),
+            RestClient.builder().requestInterceptor(rewriteAtlassianRequestsTo(server)),
         )
 
         val document = JiraConnectorLoader(client, mapper).load(
@@ -322,7 +322,7 @@ class JiraConnectorLoaderTest {
         server.json("""{"issues":[{"id":"1"}]}""")
         server.enqueue(MockResponse().setResponseCode(500).setBody("upstream failed"))
 
-        assertFailsWith<WebClientResponseException.InternalServerError> {
+        assertFailsWith<HttpServerErrorException.InternalServerError> {
             loader().load(config(server, "\"project_key\":\"ENG\""), cloudCredentials(), null).toList()
         }
     }
@@ -465,7 +465,7 @@ class JiraConnectorLoaderTest {
     fun scopedValidationUsesCloudIdAndAtlassianApiBase() = MockWebServer().use { server ->
         server.json("""{"cloudId":"cloud-123"}""")
         server.json("""{"key":"ENG"}""")
-        val client = RemoteJsonClient(WebClient.builder().filter(rewriteAtlassianRequestsTo(server)))
+        val client = RemoteJsonClient(RestClient.builder().requestInterceptor(rewriteAtlassianRequestsTo(server)))
 
         JiraConnectorLoader(client, mapper).validate(
             config(server, "\"project_key\":\"ENG\",\"scoped_token\":true"),
@@ -587,12 +587,13 @@ class JiraConnectorLoaderTest {
     @Test
     fun onPremiseJiraBaseUrlUsesBearerAuthAndV2EvenWhenEmailIsPresent() = MockWebServer().use { server ->
         val client = RemoteJsonClient(
-            WebClient.builder().filter { request, next ->
-                val rewritten = ClientRequest.from(request)
-                    .url(URI.create("${server.startAndBase()}${request.url().rawPath}"))
-                    .build()
-                next.exchange(rewritten)
-            }
+            RestClient.builder().requestInterceptor { request, body, execution ->
+                val target = URI.create("${server.startAndBase()}${request.uri.rawPath}")
+                val wrapper = object : HttpRequestWrapper(request) {
+                    override fun getURI(): URI = target
+                }
+                execution.execute(wrapper, body)
+            },
         )
         server.json("""{"key":"ENG"}""")
 
@@ -609,12 +610,13 @@ class JiraConnectorLoaderTest {
     @Test
     fun atlassianDomainJiraBaseUrlUsesCloudMode() = MockWebServer().use { server ->
         val client = RemoteJsonClient(
-            WebClient.builder().filter { request, next ->
-                val rewritten = ClientRequest.from(request)
-                    .url(URI.create("${server.startAndBase()}${request.url().rawPath}"))
-                    .build()
-                next.exchange(rewritten)
-            }
+            RestClient.builder().requestInterceptor { request, body, execution ->
+                val target = URI.create("${server.startAndBase()}${request.uri.rawPath}")
+                val wrapper = object : HttpRequestWrapper(request) {
+                    override fun getURI(): URI = target
+                }
+                execution.execute(wrapper, body)
+            },
         )
         server.json("""{"key":"ENG"}""")
 
@@ -643,7 +645,7 @@ class JiraConnectorLoaderTest {
         assertTrue(error.message.orEmpty().contains(expected))
     }
 
-    private fun loader(): JiraConnectorLoader = JiraConnectorLoader(RemoteJsonClient(WebClient.builder()), mapper)
+    private fun loader(): JiraConnectorLoader = JiraConnectorLoader(RemoteJsonClient(RestClient.builder()), mapper)
 
     private fun config(server: MockWebServer, extra: String) = mapper.readTree(
         """{"jira_base_url":"${server.startAndBase()}",$extra}""",
@@ -712,12 +714,16 @@ class JiraConnectorLoaderTest {
         return url("/").toString().trimEnd('/')
     }
 
-    private fun rewriteAtlassianRequestsTo(server: MockWebServer): ExchangeFilterFunction = ExchangeFilterFunction.ofRequestProcessor { request ->
-        if (request.url().host != "api.atlassian.com") {
-            reactor.core.publisher.Mono.just(request)
-        } else {
-            val local = server.url(request.url().rawPath + (request.url().rawQuery?.let { "?$it" } ?: ""))
-            reactor.core.publisher.Mono.just(ClientRequest.from(request).url(URI.create(local.toString())).build())
+    private fun rewriteAtlassianRequestsTo(server: MockWebServer): ClientHttpRequestInterceptor =
+        ClientHttpRequestInterceptor { request, body, execution ->
+            if (request.uri.host != "api.atlassian.com") {
+                execution.execute(request, body)
+            } else {
+                val local = server.url((request.uri.rawPath ?: "") + (request.uri.rawQuery?.let { "?$it" } ?: ""))
+                val wrapper = object : HttpRequestWrapper(request) {
+                    override fun getURI(): URI = URI.create(local.toString())
+                }
+                execution.execute(wrapper, body)
+            }
         }
-    }
 }

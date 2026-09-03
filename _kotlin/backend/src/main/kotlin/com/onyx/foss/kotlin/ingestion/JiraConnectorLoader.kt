@@ -8,7 +8,7 @@ import com.onyx.foss.kotlin.domain.ConnectorSource
 import org.springframework.core.codec.DecodingException
 import org.springframework.http.HttpHeaders
 import org.springframework.stereotype.Service
-import org.springframework.web.reactive.function.client.WebClientResponseException
+import org.springframework.web.client.RestClientResponseException
 import org.springframework.web.util.UriUtils
 import java.net.URI
 import java.nio.charset.StandardCharsets
@@ -98,7 +98,7 @@ class JiraConnectorLoader(
         }
         try {
             http.get(connection.apiBase, path, connection.headers)
-        } catch (error: WebClientResponseException) {
+        } catch (error: RestClientResponseException) {
             throw validationError(error)
         }
     }
@@ -236,7 +236,7 @@ class JiraConnectorLoader(
             )
         }
         BulkFetchResult(issues, failures)
-    } catch (error: WebClientResponseException) {
+    } catch (error: RestClientResponseException) {
         throw searchError(error, context.jql)
     } catch (error: RuntimeException) {
         if (issueIds.size <= 1 || !error.isJsonDecodeFailure()) throw error
@@ -464,11 +464,11 @@ class JiraConnectorLoader(
 
     private fun getSearch(context: Context, path: String): JsonNode = try {
         http.get(context.apiBase, path, context.headers)
-    } catch (error: WebClientResponseException) {
+    } catch (error: RestClientResponseException) {
         throw searchError(error, context.jql)
     }
 
-    private fun searchError(error: WebClientResponseException, jql: String): RuntimeException {
+    private fun searchError(error: RestClientResponseException, jql: String): RuntimeException {
         val detail = error.responseBodyAsString
         return when (error.statusCode.value()) {
             400 -> if (detail.contains("does not exist for the field 'project'")) {
@@ -483,7 +483,7 @@ class JiraConnectorLoader(
         }
     }
 
-    private fun validationError(error: WebClientResponseException): IllegalArgumentException = when (error.statusCode.value()) {
+    private fun validationError(error: RestClientResponseException): IllegalArgumentException = when (error.statusCode.value()) {
         401 -> IllegalArgumentException("Jira credential appears to be expired or invalid (HTTP 401).")
         403 -> IllegalArgumentException("Your Jira token does not have sufficient permissions for this configuration (HTTP 403).")
         429 -> IllegalArgumentException("Validation failed due to Jira rate-limits being exceeded. Please try again later.")

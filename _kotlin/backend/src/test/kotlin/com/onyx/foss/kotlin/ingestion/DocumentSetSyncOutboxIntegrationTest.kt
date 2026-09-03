@@ -428,8 +428,8 @@ class DocumentSetSyncOutboxIntegrationTest : H2IntegrationTest() {
         @JvmStatic
         @DynamicPropertySource
         fun opensearch(registry: DynamicPropertyRegistry) {
-            registry.add("onyx.opensearch.base-url") { server.url("/").toString().trimEnd('/') }
-            registry.add("onyx.opensearch.index") { "documents" }
+            registry.add("spring.ai.vectorstore.opensearch.uris") { listOf(server.url("/").toString().trimEnd('/')) }
+            registry.add("spring.ai.vectorstore.opensearch.index-name") { "documents" }
         }
 
         @JvmStatic

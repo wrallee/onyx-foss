@@ -6,6 +6,10 @@ import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.ingestion.ModelServerClient
 import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
 import com.onyx.foss.kotlin.ingestion.SearchCandidate
+import com.onyx.foss.kotlin.rag.RrfDocumentJoiner
+import com.onyx.foss.kotlin.rag.ScoreNormalizedFusionJoiner
+import org.springframework.ai.document.Document
+import org.springframework.ai.rag.Query
 import org.springframework.stereotype.Service
 
 @Service
@@ -15,6 +19,8 @@ class SearchService(
     private val indexer: OpenSearchIndexer,
     private val documentSetRepository: DocumentSetRepository,
 ) {
+    private val fusionJoiner = ScoreNormalizedFusionJoiner(listOf(KEYWORD_WEIGHT, VECTOR_WEIGHT))
+
     @JvmOverloads
     fun search(
         query: String,
@@ -75,48 +81,35 @@ class SearchService(
         idExtractor: (T) -> String,
         k: Int = DEFAULT_RRF_K,
     ): List<T> {
-        require(rankedResults.size == weights.size) {
-            "Number of ranked results (${rankedResults.size}) must match number of weights (${weights.size})"
-        }
-        val rrfScores = mutableMapOf<String, Double>()
-        val idToItem = mutableMapOf<String, T>()
-        val idToSourceIndex = mutableMapOf<String, Int>()
-        val idToSourceRank = mutableMapOf<String, Int>()
-
-        rankedResults.forEachIndexed { sourceIdx, resultList ->
-            val weight = weights[sourceIdx]
-            resultList.forEachIndexed { index, item ->
-                val rank = index + 1
-                val itemId = idExtractor(item)
-                rrfScores[itemId] = (rrfScores[itemId] ?: 0.0) + (weight / (k + rank))
-                if (itemId !in idToItem) {
-                    idToItem[itemId] = item
-                    idToSourceIndex[itemId] = sourceIdx
-                    idToSourceRank[itemId] = rank
-                }
+        val itemById = mutableMapOf<String, T>()
+        val docLists = rankedResults.map { list ->
+            list.map { item ->
+                val id = idExtractor(item)
+                itemById.putIfAbsent(id, item)
+                Document.builder().id(id).text(id).build()
             }
         }
-
-        return rrfScores.keys.sortedWith(
-            compareByDescending<String> { rrfScores[it] ?: 0.0 }
-                .thenBy { idToSourceRank[it] ?: Int.MAX_VALUE }
-                .thenBy { idToSourceIndex[it] ?: Int.MAX_VALUE },
-        ).map { idToItem.getValue(it) }
+        val joiner = RrfDocumentJoiner(weights, k)
+        val joined = joiner.join(mapOf(Query("rrf") to docLists))
+        return joined.map { itemById.getValue(it.id) }
     }
 
     private fun fuse(keyword: List<SearchCandidate>, vector: List<SearchCandidate>): List<SearchCandidate> {
-        val normKeyword = normalize(keyword)
-        val normVector = normalize(vector)
-        val sources = linkedMapOf<String, SearchCandidate>()
-        (keyword + vector).forEach { candidate ->
-            sources.putIfAbsent(candidate.id, candidate)
+        val keywordDocs = keyword.map { toDocument(it) }
+        val vectorDocs = vector.map { toDocument(it) }
+        val joined = fusionJoiner.join(mapOf(Query("hybrid") to listOf(keywordDocs, vectorDocs)))
+        val candidatesById = (keyword + vector).associateBy { it.id }
+        return joined.mapNotNull { doc ->
+            candidatesById[doc.id]?.copy(retrievalScore = doc.score ?: 0.0)
         }
-        return sources.values.map { candidate ->
-            val kScore = normKeyword[candidate.id] ?: 0.0
-            val vScore = normVector[candidate.id] ?: 0.0
-            candidate.copy(retrievalScore = KEYWORD_WEIGHT * kScore + VECTOR_WEIGHT * vScore)
-        }.sortedWith(compareByDescending<SearchCandidate> { it.retrievalScore ?: 0.0 }.thenBy { it.id })
     }
+
+    private fun toDocument(candidate: SearchCandidate): Document =
+        Document.builder()
+            .id(candidate.id)
+            .text(candidate.content)
+            .score(candidate.retrievalScore)
+            .build()
 
     private fun normalize(candidates: List<SearchCandidate>): Map<String, Double> {
         if (candidates.isEmpty()) return emptyMap()
@@ -163,7 +156,6 @@ data class SearchResult(
     val title: String,
     val content: String,
     val link: String?,
-    val metadata: JsonNode,
+    val metadata: JsonNode?,
     val retrievalScore: Double?,
 )
-

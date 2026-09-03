@@ -15,7 +15,8 @@ import org.apache.tika.parser.html.JSoupParser
 import org.apache.tika.sax.BodyContentHandler
 import org.springframework.http.HttpHeaders
 import org.springframework.stereotype.Service
-import org.springframework.web.reactive.function.client.WebClientResponseException
+import org.springframework.web.client.HttpClientErrorException
+import org.springframework.web.client.RestClientResponseException
 import org.springframework.web.util.UriUtils
 import org.xml.sax.Attributes
 import org.xml.sax.helpers.DefaultHandler
@@ -84,14 +85,14 @@ class ConfluenceConnectorLoader(
         val first = try {
             val response = try {
                 get(context, path)
-            } catch (error: WebClientResponseException.NotFound) {
+            } catch (error: HttpClientErrorException.NotFound) {
                 if (!cloudV2) throw error
                 path = updateQuery("/rest/api/space", "limit", "1")
                 path = updateQuery(path, "start", "0")
                 get(context, path)
             }
             response.path("results").firstOrNull()
-        } catch (error: WebClientResponseException) {
+        } catch (error: RestClientResponseException) {
             throw when (error.statusCode.value()) {
                 401 -> IllegalArgumentException("Invalid or expired Confluence credentials (HTTP 401).", error)
                 403 -> IllegalArgumentException("Insufficient permissions to access Confluence resources (HTTP 403).", error)
@@ -105,7 +106,7 @@ class ConfluenceConnectorLoader(
         val space = config.text("space") ?: return
         try {
             get(context, "/rest/api/space/${segment(space)}")
-        } catch (error: WebClientResponseException) {
+        } catch (error: RestClientResponseException) {
             throw IllegalArgumentException("Invalid Confluence space key '$space'.", error)
         }
     }
@@ -325,7 +326,7 @@ class ConfluenceConnectorLoader(
         while (true) {
             val response = try {
                 get(context, path)
-            } catch (error: WebClientResponseException) {
+            } catch (error: RestClientResponseException) {
                 val status = error.statusCode.value()
                 if (status == 429 || error.responseBodyAsString.contains(RATE_LIMIT_MESSAGE, ignoreCase = true)) {
                     rateLimitAttempts += 1
@@ -370,7 +371,7 @@ class ConfluenceConnectorLoader(
         context: Context,
         path: String,
         limit: Int,
-        original: WebClientResponseException,
+        original: RestClientResponseException,
         allowAllFailedRecovery: Boolean,
     ): PageFetch {
         val initialStart = queryInt(path, "start")
@@ -525,7 +526,7 @@ class ConfluenceConnectorLoader(
                 }
                 path = result.nextPath
             }
-        } catch (error: WebClientResponseException) {
+        } catch (error: RestClientResponseException) {
             val status = error.statusCode.value()
             if (status == 400 && isDateError(error)) throw error
             if (status !in setOf(400, 401, 403)) throw error
@@ -771,7 +772,7 @@ class ConfluenceConnectorLoader(
         repeat(SLIM_ATTACHMENT_ATTEMPTS) { attempt ->
             try {
                 return paginate(context, path, SLIM_PAGE_SIZE, allowAllFailedRecovery = false)
-            } catch (error: WebClientResponseException) {
+            } catch (error: RestClientResponseException) {
                 if (error.statusCode.value() != 400 || isDateError(error) || attempt == SLIM_ATTACHMENT_ATTEMPTS - 1) throw error
             }
         }
@@ -869,7 +870,7 @@ class ConfluenceConnectorLoader(
 
     private fun fetchContentReadRestrictions(context: Context, contentId: String): JsonNode? = try {
         get(context, "/rest/api/content/${segment(contentId)}/restriction/byOperation")
-    } catch (error: WebClientResponseException) {
+    } catch (error: RestClientResponseException) {
         if (error.statusCode.value() in setOf(403, 404)) null else throw error
     }
 
@@ -956,7 +957,7 @@ class ConfluenceConnectorLoader(
         val initial = if (cloudV2) "/wiki/api/v2/spaces" else "/rest/api/space"
         return try {
             paginateSpaces(context, initial, limit, cloudV2)
-        } catch (error: WebClientResponseException.NotFound) {
+        } catch (error: HttpClientErrorException.NotFound) {
             if (cloudV2) paginateSpaces(context, "/rest/api/space", limit, false) else throw error
         }
     }
@@ -1008,7 +1009,7 @@ class ConfluenceConnectorLoader(
     private fun getAllSpacePermissionsServerRest(context: Context, spaceKey: String): List<JsonNode> = try {
         val response = get(context, "/rest/api/space/${segment(spaceKey)}/permissions")
         if (response.isArray) response.toList() else emptyList()
-    } catch (error: WebClientResponseException) {
+    } catch (error: RestClientResponseException) {
         when (error.statusCode.value()) {
             404 -> throw ConfluenceRestSpacePermissionsNotAvailableException(
                 "REST space-permissions endpoint is unavailable for '$spaceKey'; Confluence Data Center 9.1+ is required.",
@@ -1242,8 +1243,8 @@ class ConfluenceConnectorLoader(
         failures.all { it.target is FailureTarget.Document },
     )
 
-    private fun retryAfterMillis(error: WebClientResponseException, attempt: Int): Long {
-        val raw = error.headers.getFirst("Retry-After")
+    private fun retryAfterMillis(error: RestClientResponseException, attempt: Int): Long {
+        val raw = error.responseHeaders?.getFirst("Retry-After")
         val parsedSeconds = raw?.trim()?.toDoubleOrNull()?.takeIf(Double::isFinite)?.coerceAtLeast(0.0)
             ?: raw?.let { value ->
                 runCatching {
@@ -1256,7 +1257,7 @@ class ConfluenceConnectorLoader(
         return (delaySeconds * 1_000).toLong()
     }
 
-    private fun isDateError(error: WebClientResponseException): Boolean =
+    private fun isDateError(error: RestClientResponseException): Boolean =
         error.responseBodyAsString.contains("updated", ignoreCase = true) &&
             error.responseBodyAsString.contains("invalid", ignoreCase = true)
 

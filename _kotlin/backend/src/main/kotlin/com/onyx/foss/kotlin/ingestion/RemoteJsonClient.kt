@@ -1,10 +1,12 @@
 package com.onyx.foss.kotlin.ingestion
 
 import tools.jackson.databind.JsonNode
+import org.apache.hc.client5.http.impl.classic.HttpClients
 import org.springframework.http.HttpHeaders
 import org.springframework.http.MediaType
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory
 import org.springframework.stereotype.Service
-import org.springframework.web.reactive.function.client.WebClient
+import org.springframework.web.client.RestClient
 import java.net.URI
 import java.time.Duration
 
@@ -21,72 +23,63 @@ data class RemoteJsonResponse(
 
 @Service
 class RemoteJsonClient(
-    private val clientBuilder: WebClient.Builder,
+    clientBuilder: RestClient.Builder = RestClient.builder(),
 ) {
-    private companion object {
-        const val MAX_RESPONSE_BYTES = 16 * 1024 * 1024
-    }
+    private val client = clientBuilder.clone()
+        .requestFactory(HttpComponentsClientHttpRequestFactory(HttpClients.custom().disableAutomaticRetries().build()))
+        .build()
 
     fun get(base: String, path: String, headers: Map<String, String>): JsonNode =
         getResponse(base, path, headers).body
 
-    fun getResponse(base: String, path: String, headers: Map<String, String>): RemoteJsonResponse =
-        configuredClient().get()
+    fun getResponse(base: String, path: String, headers: Map<String, String>): RemoteJsonResponse {
+        val entity = client.get()
             .uri(URI.create(base.trimEnd('/') + path))
             .accept(MediaType.APPLICATION_JSON)
             .headers { httpHeaders -> headers.forEach { (name, value) -> httpHeaders.set(name, value) } }
             .retrieve()
             .toEntity(JsonNode::class.java)
-            .map { response ->
-                RemoteJsonResponse(
-                    response.body ?: error("Remote connector returned an empty response"),
-                    response.headers,
-                )
-            }
-            .block(REMOTE_CONNECTOR_TIMEOUT) ?: error("Remote connector returned an empty response")
+
+        return RemoteJsonResponse(
+            entity.body ?: error("Remote connector returned an empty response"),
+            entity.headers,
+        )
+    }
 
     fun post(base: String, path: String, headers: Map<String, String>, body: Any): JsonNode =
-        clientBuilder.clone().codecs { codecs ->
-            codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
-        }.build().post()
+        client.post()
             .uri(URI.create(base.trimEnd('/') + path))
             .accept(MediaType.APPLICATION_JSON)
             .contentType(MediaType.APPLICATION_JSON)
             .headers { httpHeaders -> headers.forEach { (name, value) -> httpHeaders.set(name, value) } }
-            .bodyValue(body)
+            .body(body)
             .retrieve()
-            .bodyToMono(JsonNode::class.java)
-            .block(REMOTE_CONNECTOR_TIMEOUT) ?: error("Remote connector returned an empty response")
+            .body(JsonNode::class.java)
+            ?: error("Remote connector returned an empty response")
 
     fun getBytes(base: String, path: String, headers: Map<String, String>): ByteArray =
-        configuredClient().get()
+        client.get()
             .uri(URI.create(base.trimEnd('/') + path))
             .headers { httpHeaders -> headers.forEach { (name, value) -> httpHeaders.set(name, value) } }
             .retrieve()
-            .bodyToMono(ByteArray::class.java)
-            .block(REMOTE_CONNECTOR_TIMEOUT) ?: error("Remote connector returned an empty response")
+            .body(ByteArray::class.java)
+            ?: error("Remote connector returned an empty response")
 
-    fun postText(base: String, path: String, headers: Map<String, String>, body: Any): RemoteTextResponse =
-        configuredClient().post()
+    fun postText(base: String, path: String, headers: Map<String, String>, body: Any): RemoteTextResponse {
+        val response = client.post()
             .uri(URI.create(base.trimEnd('/') + path))
             .accept(MediaType.ALL)
             .contentType(MediaType.APPLICATION_JSON)
             .headers { httpHeaders -> headers.forEach { (name, value) -> httpHeaders.set(name, value) } }
-            .bodyValue(body)
-            .exchangeToMono { response ->
-                response.bodyToMono(String::class.java).defaultIfEmpty("").map { responseBody ->
-                    RemoteTextResponse(
-                        response.statusCode().value(),
-                        response.headers().contentType().map(MediaType::toString).orElse(null),
-                        responseBody,
-                    )
-                }
+            .body(body)
+            .exchange { _, clientResponse ->
+                val statusCode = clientResponse.statusCode.value()
+                val contentType = clientResponse.headers.contentType?.toString()
+                val responseBody = clientResponse.body.bufferedReader().use { it.readText() }
+                RemoteTextResponse(statusCode, contentType, responseBody)
             }
-            .block(REMOTE_CONNECTOR_TIMEOUT) ?: error("Remote connector returned an empty response")
-
-    private fun configuredClient() = clientBuilder.clone().codecs { codecs ->
-        codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
-    }.build()
+        return response ?: error("Remote connector returned an empty response")
+    }
 }
 
 internal val REMOTE_CONNECTOR_TIMEOUT: Duration = Duration.ofSeconds(30)

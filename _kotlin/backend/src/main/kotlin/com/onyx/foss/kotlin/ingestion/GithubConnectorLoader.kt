@@ -6,7 +6,8 @@ import com.onyx.foss.kotlin.domain.ConnectorSource
 import org.springframework.http.HttpHeaders
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import org.springframework.web.reactive.function.client.WebClientResponseException
+import org.springframework.web.client.HttpClientErrorException
+import org.springframework.web.client.RestClientResponseException
 import org.springframework.web.util.UriUtils
 import java.net.URI
 import java.nio.ByteBuffer
@@ -162,7 +163,7 @@ class GithubConnectorLoader(
         }
         val names = context.repositoryNames
         if (names.isNotEmpty()) {
-            var lastError: WebClientResponseException? = null
+            var lastError: RestClientResponseException? = null
             names.forEach { name ->
                 try {
                     context.heartbeat()
@@ -176,7 +177,7 @@ class GithubConnectorLoader(
                         )
                     }
                     return
-                } catch (error: WebClientResponseException) {
+                } catch (error: RestClientResponseException) {
                     lastError = error
                 }
             }
@@ -190,7 +191,7 @@ class GithubConnectorLoader(
                 "/orgs/${segment(context.owner)}/repos?per_page=1&page=1",
                 context.headers,
             )
-        } catch (error: WebClientResponseException.NotFound) {
+        } catch (error: HttpClientErrorException.NotFound) {
             try {
                 context.heartbeat()
                 http.get(
@@ -198,10 +199,10 @@ class GithubConnectorLoader(
                     "/users/${segment(context.owner)}/repos?per_page=1&page=1",
                     context.headers,
                 )
-            } catch (userError: WebClientResponseException) {
+            } catch (userError: RestClientResponseException) {
                 throw validationError(userError, context)
             }
-        } catch (error: WebClientResponseException) {
+        } catch (error: RestClientResponseException) {
             throw validationError(error, context)
         }
         if (!repositories.isArray || repositories.isEmpty) {
@@ -295,7 +296,7 @@ class GithubConnectorLoader(
             val repositoryName = context.repositoryNames[checkpoint.repositoryIndex]
             val repository = try {
                 parseRepository(get(context, repositoryPath(context.owner, repositoryName)).body, context)
-            } catch (_: WebClientResponseException.NotFound) {
+            } catch (_: HttpClientErrorException.NotFound) {
                 return ProcessResult(
                     failures = listOf(
                         ConnectorFailure(
@@ -331,7 +332,7 @@ class GithubConnectorLoader(
                 context,
                 "/$ownerKind/${segment(context.owner)}/repos?per_page=$PAGE_SIZE&page=${checkpoint.repositoryPage}",
             ).body
-        } catch (error: WebClientResponseException.NotFound) {
+        } catch (error: HttpClientErrorException.NotFound) {
             if (ownerKind != "orgs") throw validationError(error, context)
             resolvedOwnerKind = "users"
             get(
@@ -402,7 +403,7 @@ class GithubConnectorLoader(
                     ?: return ProcessResult(checkpoint = checkpoint.copy(permissionStage = GithubPermissionStage.TEAMS))
                 val email = try {
                     get(context, "/users/${segment(login)}").body.text("email")
-                } catch (_: WebClientResponseException.NotFound) {
+                } catch (_: HttpClientErrorException.NotFound) {
                     null
                 }
                 val offset = checkpoint.permissionUserOffset + 1
@@ -460,7 +461,7 @@ class GithubConnectorLoader(
         }
         val page = try {
             fetchCollectionPage(context, repository, type, pageNumber, cursor, retrieved)
-        } catch (error: WebClientResponseException.NotFound) {
+        } catch (error: HttpClientErrorException.NotFound) {
             CollectionPage(emptyList(), rawSize = 0, nextCursor = null, cursorMode = cursor != null)
         }
         val access = checkpointAccess(context, checkpoint, repository)
@@ -548,8 +549,8 @@ class GithubConnectorLoader(
                     nextCursor(response.headers, context.base),
                     cursorMode = true,
                 )
-            } catch (error: WebClientResponseException.UnprocessableContent) {
-                if (!error.responseBodyAsString.contains("cursor", ignoreCase = true)) throw error
+            } catch (error: RestClientResponseException) {
+                if (error.statusCode.value() != 422 || !error.responseBodyAsString.contains("cursor", ignoreCase = true)) throw error
                 val restartPage = (retrieved / PAGE_SIZE) + 1
                 val response = get(context, "$endpoint?$query&page=$restartPage")
                 val skip = retrieved % PAGE_SIZE
@@ -570,8 +571,8 @@ class GithubConnectorLoader(
                 nextCursor(response.headers, context.base),
                 cursorMode = false,
             )
-        } catch (error: WebClientResponseException.UnprocessableContent) {
-            if (!error.responseBodyAsString.contains("cursor", ignoreCase = true)) throw error
+        } catch (error: RestClientResponseException) {
+            if (error.statusCode.value() != 422 || !error.responseBodyAsString.contains("cursor", ignoreCase = true)) throw error
             val response = get(context, "$endpoint?$query")
             CollectionPage(
                 response.body.toList(),
@@ -603,7 +604,7 @@ class GithubConnectorLoader(
                         context,
                         "${repositoryPath(context.owner, repository.name)}/git/trees/${segment(branch)}?recursive=1",
                     ).body
-                } catch (error: WebClientResponseException) {
+                } catch (error: RestClientResponseException) {
                     if (error.statusCode.value() == 409 && error.responseBodyAsString.contains("empty", ignoreCase = true)) {
                         mapper.createObjectNode().putArray("tree")
                     } else if (error.statusCode.value() == 404 && context.configuredBranch != null) {
@@ -1005,9 +1006,9 @@ class GithubConnectorLoader(
         try {
             context.heartbeat()
             return http.getResponse(context.base, path, context.headers)
-        } catch (error: WebClientResponseException) {
+        } catch (error: RestClientResponseException) {
             if (!isRateLimited(error)) throw error
-            val reset = error.headers.getFirst("X-RateLimit-Reset")?.toLongOrNull()
+            val reset = error.responseHeaders?.getFirst("X-RateLimit-Reset")?.toLongOrNull()
                 ?: throw GithubRateLimitValidationException("GitHub rate limit response did not include a reset time.", error)
             val waitSeconds = try {
                 Math.subtractExact(reset, nowSource().epochSecond)
@@ -1032,14 +1033,14 @@ class GithubConnectorLoader(
         }
     }
 
-    private fun isRateLimited(error: WebClientResponseException): Boolean =
+    private fun isRateLimited(error: RestClientResponseException): Boolean =
         error.statusCode.value() in setOf(403, 429) && (
-            error.headers.getFirst("X-RateLimit-Remaining") == "0" ||
+            error.responseHeaders?.getFirst("X-RateLimit-Remaining") == "0" ||
                 error.responseBodyAsString.contains("rate limit", ignoreCase = true)
             )
 
     private fun validationError(
-        error: WebClientResponseException,
+        error: RestClientResponseException,
         context: Context,
         repository: String? = null,
     ): GithubConnectorValidationException = when (error.statusCode.value()) {

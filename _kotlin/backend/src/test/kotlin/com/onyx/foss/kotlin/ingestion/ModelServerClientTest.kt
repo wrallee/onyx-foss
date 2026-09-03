@@ -8,9 +8,9 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
-import org.springframework.web.reactive.function.client.WebClient
-import org.springframework.web.reactive.function.client.WebClientRequestException
-import org.springframework.web.reactive.function.client.WebClientResponseException
+import org.springframework.web.client.ResourceAccessException
+import org.springframework.web.client.RestClient
+import org.springframework.web.client.RestClientResponseException
 import java.util.concurrent.TimeUnit
 
 class ModelServerClientTest {
@@ -29,7 +29,7 @@ class ModelServerClientTest {
                         modelName = "embedding-model",
                     ),
                 ),
-                WebClient.builder(),
+                RestClient.builder(),
             )
 
             assertThat(client.embedQuery("search terms")).containsExactly(0.1, 0.2)
@@ -41,6 +41,7 @@ class ModelServerClientTest {
             assertThat(body.path("text_type").asText()).isEqualTo("query")
         }
     }
+
     @Test
     fun readTimeoutAppliesToEmbeddingResponse() = MockWebServer().use { server ->
         server.enqueue(
@@ -56,7 +57,7 @@ class ModelServerClientTest {
             readTimeoutMs = 50,
         )
 
-        assertThrows(WebClientRequestException::class.java) { client.embed(listOf("text")) }
+        assertThrows(ResourceAccessException::class.java) { client.embed(listOf("text")) }
     }
 
     @Test
@@ -81,7 +82,7 @@ class ModelServerClientTest {
         repeat(3) { server.enqueue(MockResponse().setResponseCode(502)) }
         server.start()
 
-        assertThrows(WebClientResponseException::class.java) {
+        assertThrows(RestClientResponseException::class.java) {
             client(server, embedMaxRetries = 2, embedRetryInitialBackoffMs = 5).embed(listOf("hello"))
         }
         assertEquals(3, server.requestCount)
@@ -104,6 +105,6 @@ class ModelServerClientTest {
                 embedRetryInitialBackoffMs = embedRetryInitialBackoffMs,
             ),
         ),
-        clientBuilder = WebClient.builder(),
+        clientBuilder = RestClient.builder(),
     )
 }

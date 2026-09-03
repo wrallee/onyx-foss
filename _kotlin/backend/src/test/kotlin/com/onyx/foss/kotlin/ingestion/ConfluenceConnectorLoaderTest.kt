@@ -8,10 +8,11 @@ import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.jupiter.api.Test
-import org.springframework.web.reactive.function.client.ClientRequest
-import org.springframework.web.reactive.function.client.ExchangeFilterFunction
-import org.springframework.web.reactive.function.client.WebClient
-import org.springframework.web.reactive.function.client.WebClientResponseException
+import org.springframework.http.client.ClientHttpRequestInterceptor
+import org.springframework.http.client.support.HttpRequestWrapper
+import org.springframework.web.client.HttpClientErrorException
+import org.springframework.web.client.RestClient
+import org.springframework.web.client.RestClientResponseException
 import java.net.URI
 import java.time.Instant
 import java.time.ZoneOffset
@@ -101,7 +102,7 @@ class ConfluenceConnectorLoaderTest {
         server.enqueue(json("""{"cloudId":"cloud-1"}"""))
         server.enqueue(json(pageResponse()))
         server.enqueue(json("""{"results":[]}"""))
-        val http = RemoteJsonClient(WebClient.builder().filter(rewriteAtlassianRequestsTo(server)))
+        val http = RemoteJsonClient(RestClient.builder().requestInterceptor(rewriteAtlassianRequestsTo(server)))
 
         val document = ConfluenceConnectorLoader(http, mapper).load(
             config(server, "\"scoped_token\":true,\"is_cloud\":true,\"include_comments\":false"),
@@ -446,7 +447,7 @@ class ConfluenceConnectorLoaderTest {
                 if (request.path!!.contains("type%3Dattachment")) MockResponse().setResponseCode(500) else json(pageResponse())
         }
 
-        assertFailsWith<WebClientResponseException> {
+        assertFailsWith<RestClientResponseException> {
             loader().load(config(server, "\"include_comments\":false"), credentials(), null).toList()
         }
     }
@@ -458,7 +459,7 @@ class ConfluenceConnectorLoaderTest {
             server.enqueue(MockResponse().setResponseCode(400).setBody("The field 'updated' is invalid"))
         }
 
-        assertFailsWith<WebClientResponseException> {
+        assertFailsWith<RestClientResponseException> {
             loader().load(config(server, "\"include_comments\":false"), credentials(), null).toList()
         }
     }
@@ -490,7 +491,7 @@ class ConfluenceConnectorLoaderTest {
     fun slimAttachmentPersistent400Raises(): Unit = MockWebServer().use { server ->
         server.dispatcher = slimAttachmentDispatcher(server) { 400 }
 
-        assertFailsWith<WebClientResponseException> {
+        assertFailsWith<RestClientResponseException> {
             loader().retrieveAllSlimDocuments(config(server), credentials()).toList()
         }
     }
@@ -509,7 +510,7 @@ class ConfluenceConnectorLoaderTest {
                             json(pageResponse())
                         }
                 }
-                assertFailsWith<WebClientResponseException> {
+                assertFailsWith<RestClientResponseException> {
                     loader().retrieveAllSlimDocuments(config(server), credentials()).toList()
                 }
                 assertEquals(1, calls)
@@ -519,7 +520,7 @@ class ConfluenceConnectorLoaderTest {
         MockWebServer().use { server ->
             var calls = 0
             server.dispatcher = slimAttachmentDispatcher(server) { if (calls++ < 20) 500 else 200 }
-            assertFailsWith<WebClientResponseException> {
+            assertFailsWith<RestClientResponseException> {
                 loader().retrieveAllSlimDocuments(config(server), credentials()).toList()
             }
         }
@@ -627,7 +628,7 @@ class ConfluenceConnectorLoaderTest {
     fun paginateUrlPropagatesUnrelated404(): Unit = MockWebServer().use { server ->
         server.enqueue(MockResponse().setResponseCode(404).setBody("not found"))
 
-        assertFailsWith<WebClientResponseException.NotFound> {
+        assertFailsWith<HttpClientErrorException.NotFound> {
             loader().paginate(
                 config(server, "\"is_cloud\":true"),
                 credentials(),
@@ -641,7 +642,7 @@ class ConfluenceConnectorLoaderTest {
     fun paginateUrlDoesNotRaise77618WithoutAncestorExpand(): Unit = MockWebServer().use { server ->
         server.enqueue(MockResponse().setResponseCode(404).setBody(CONFCLOUD_77618_BODY))
 
-        assertFailsWith<WebClientResponseException.NotFound> {
+        assertFailsWith<HttpClientErrorException.NotFound> {
             loader().paginate(config(server, "\"is_cloud\":true"), credentials(), "/rest/api/content/search", 50).toList()
         }
     }
@@ -665,7 +666,7 @@ class ConfluenceConnectorLoaderTest {
     @Test
     fun fetchContentReadRestrictionsRaisesOn500(): Unit = MockWebServer().use { server ->
         server.enqueue(MockResponse().setResponseCode(500).setBody("boom"))
-        assertFailsWith<WebClientResponseException> {
+        assertFailsWith<RestClientResponseException> {
             loader().fetchContentReadRestrictions(config(server), credentials(), "999")
         }
     }
@@ -1423,7 +1424,7 @@ class ConfluenceConnectorLoaderTest {
             }
         }
 
-        assertFailsWith<WebClientResponseException> {
+        assertFailsWith<RestClientResponseException> {
             loader().paginate(config(server, "\"is_cloud\":true"), credentials(), "/rest/api/content/search?cql=type%3Dpage", 10)
         }
         assertEquals(3, server.requestCount)
@@ -1545,7 +1546,7 @@ class ConfluenceConnectorLoaderTest {
             ),
         )
 
-        assertFailsWith<WebClientResponseException> {
+        assertFailsWith<RestClientResponseException> {
             loader().load(config(server), credentials(), checkpoint).toList()
         }
         assertEquals(1, server.requestCount)
@@ -1601,7 +1602,7 @@ class ConfluenceConnectorLoaderTest {
     }
 
     private fun loader(): ConfluenceConnectorLoader =
-        ConfluenceConnectorLoader(RemoteJsonClient(WebClient.builder()), mapper).also { it.sleepMillis = {} }
+        ConfluenceConnectorLoader(RemoteJsonClient(RestClient.builder()), mapper).also { it.sleepMillis = {} }
 
     private fun config(server: MockWebServer, extra: String = "") = config(
         server.startAndBase(),
@@ -1864,13 +1865,16 @@ class ConfluenceConnectorLoaderTest {
     private fun MockWebServer.takeRequests(count: Int): List<RecordedRequest> =
         (1..count).map { takeRequest() }
 
-    private fun rewriteAtlassianRequestsTo(server: MockWebServer): ExchangeFilterFunction =
-        ExchangeFilterFunction.ofRequestProcessor { request ->
-            if (request.url().host != "api.atlassian.com") {
-                reactor.core.publisher.Mono.just(request)
+    private fun rewriteAtlassianRequestsTo(server: MockWebServer): ClientHttpRequestInterceptor =
+        ClientHttpRequestInterceptor { request, body, execution ->
+            if (request.uri.host != "api.atlassian.com") {
+                execution.execute(request, body)
             } else {
-                val local = server.url(request.url().rawPath + (request.url().rawQuery?.let { "?$it" } ?: ""))
-                reactor.core.publisher.Mono.just(ClientRequest.from(request).url(URI.create(local.toString())).build())
+                val local = server.url((request.uri.rawPath ?: "") + (request.uri.rawQuery?.let { "?$it" } ?: ""))
+                val wrapper = object : HttpRequestWrapper(request) {
+                    override fun getURI(): URI = URI.create(local.toString())
+                }
+                execution.execute(wrapper, body)
             }
         }
 

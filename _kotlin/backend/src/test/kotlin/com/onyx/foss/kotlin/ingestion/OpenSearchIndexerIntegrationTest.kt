@@ -4,12 +4,17 @@ import tools.jackson.databind.JsonNode
 import tools.jackson.databind.SerializationFeature
 import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
-import io.netty.handler.ssl.SslContextBuilder
-import io.netty.handler.ssl.util.InsecureTrustManagerFactory
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.RecordedRequest
+import okio.Buffer
+import org.apache.hc.client5.http.impl.classic.HttpClients
+import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder
+import org.apache.hc.client5.http.ssl.ClientTlsStrategyBuilder
+import org.apache.hc.client5.http.ssl.NoopHostnameVerifier
+import org.apache.hc.client5.http.ssl.TrustAllStrategy
+import org.apache.hc.core5.ssl.SSLContextBuilder
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Tag
@@ -20,14 +25,13 @@ import org.mockito.Mockito.doAnswer
 import org.mockito.Mockito.mock
 import org.springframework.http.HttpMethod
 import org.springframework.http.MediaType
-import org.springframework.http.client.reactive.ReactorClientHttpConnector
-import org.springframework.web.reactive.function.client.WebClient
+import org.springframework.http.client.HttpComponentsClientHttpRequestFactory
+import org.springframework.web.client.RestClient
 import org.testcontainers.containers.GenericContainer
 import org.testcontainers.junit.jupiter.Container
 import org.testcontainers.junit.jupiter.Testcontainers
 import org.testcontainers.utility.DockerImageName
 import org.testcontainers.containers.wait.strategy.Wait
-import reactor.netty.http.client.HttpClient
 import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.time.Instant
@@ -39,7 +43,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
-import okio.Buffer
 
 @Testcontainers
 @Tag("opensearch-integration")
@@ -59,7 +62,7 @@ class OpenSearchIndexerIntegrationTest {
     fun deleteIndex() {
         get("/_cat/indices/$index*?format=json").forEach { row ->
             client.delete().uri("$baseUrl/${row.path("index").asText()}")
-                .retrieve().toBodilessEntity().block(Duration.ofSeconds(30))
+                .retrieve().toBodilessEntity()
         }
     }
 
@@ -286,28 +289,28 @@ class OpenSearchIndexerIntegrationTest {
         assertThat(exactDocuments("after-restart")).hasSize(1)
     }
 
-    private fun indexer(url: String = baseUrl): OpenSearchIndexer = OpenSearchIndexer(
-        OnyxProperties(
-            opensearch = OnyxProperties.OpenSearch(
-                baseUrl = url,
-                index = index,
-                username = ADMIN_USERNAME,
-                password = ADMIN_PASSWORD,
-                verifyCerts = false,
-            ),
-        ),
-        WebClient.builder(),
-        mapper,
-        externalWrites,
-    )
+    private fun indexer(url: String = baseUrl): OpenSearchIndexer {
+        val props = org.springframework.ai.vectorstore.opensearch.autoconfigure.OpenSearchVectorStoreProperties().apply {
+            uris = listOf(url)
+            indexName = index
+            username = ADMIN_USERNAME
+            password = ADMIN_PASSWORD
+        }
+        return OpenSearchIndexer(
+            OnyxProperties(),
+            props,
+            OpenSearchIndexer.createOpenSearchClient(props, verifyCerts = false),
+            mapper,
+            externalWrites,
+        )
+    }
 
     private fun exactDocuments(sourceDocumentId: String): List<JsonNode> = client.post()
         .uri("$baseUrl/$index/_search")
         .contentType(MediaType.APPLICATION_JSON)
-        .bodyValue(mapOf("query" to mapOf("term" to mapOf("source_document_id" to sourceDocumentId))))
+        .body(mapOf("query" to mapOf("term" to mapOf("source_document_id" to sourceDocumentId))))
         .retrieve()
-        .bodyToMono(JsonNode::class.java)
-        .block(Duration.ofSeconds(30))
+        .body(JsonNode::class.java)
         ?.path("hits")?.path("hits")?.toList()?.map { it.path("_source") }
         .orEmpty()
 
@@ -323,7 +326,7 @@ class OpenSearchIndexerIntegrationTest {
     ) {
         client.put().uri("$baseUrl/$targetIndex/_doc/$documentId?refresh=true")
             .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue(
+            .body(
                 mapOf(
                     "cc_pair_id" to 7,
                     "source_document_id" to sourceDocumentId,
@@ -331,15 +334,15 @@ class OpenSearchIndexerIntegrationTest {
                     "content" to content,
                 ),
             )
-            .retrieve().toBodilessEntity().block(Duration.ofSeconds(30))
+            .retrieve().toBodilessEntity()
     }
 
     private fun put(path: String, body: Any? = null) {
         val request = client.put().uri(baseUrl + path)
-        val response = if (body == null) request.retrieve() else {
-            request.contentType(MediaType.APPLICATION_JSON).bodyValue(body).retrieve()
+        if (body != null) {
+            request.contentType(MediaType.APPLICATION_JSON).body(body)
         }
-        response.toBodilessEntity().block(Duration.ofSeconds(30))
+        request.retrieve().toBodilessEntity()
     }
 
     private fun exactIndexDefinition(): Map<String, Any> = mapOf(
@@ -393,14 +396,16 @@ class OpenSearchIndexerIntegrationTest {
                 val contentType = request.getHeader("Content-Type")
                 if (contentType != null) upstream.header("Content-Type", contentType)
                 val response = (if (method in setOf("POST", "PUT", "PATCH")) {
-                    upstream.bodyValue(request.body.clone().readByteArray())
+                    upstream.body(request.body.clone().readByteArray())
                 } else {
                     upstream
-                }).exchangeToMono { result ->
-                    result.bodyToMono(ByteArray::class.java).defaultIfEmpty(ByteArray(0)).map { body ->
-                        Triple(result.statusCode().value(), result.headers().asHttpHeaders().contentType, body)
-                    }
-                }.block(Duration.ofSeconds(30)) ?: error("OpenSearch proxy returned no response")
+                }).exchange { _, clientResponse ->
+                    Triple(
+                        clientResponse.statusCode.value(),
+                        clientResponse.headers.contentType,
+                        clientResponse.body.readAllBytes(),
+                    )
+                } ?: error("OpenSearch proxy returned no response")
                 return MockResponse().setResponseCode(response.first).apply {
                     response.second?.let { setHeader("Content-Type", it.toString()) }
                     setBody(Buffer().write(response.third))
@@ -409,13 +414,23 @@ class OpenSearchIndexerIntegrationTest {
         }
     }
 
-    private fun insecureClient(): WebClient {
-        val sslContext = SslContextBuilder.forClient()
-            .trustManager(InsecureTrustManagerFactory.INSTANCE)
+    private fun insecureClient(): RestClient {
+        val sslContext = SSLContextBuilder.create()
+            .loadTrustMaterial(TrustAllStrategy.INSTANCE)
             .build()
-        return WebClient.builder()
+        val tlsStrategy = org.apache.hc.client5.http.ssl.DefaultClientTlsStrategy(
+            sslContext,
+            NoopHostnameVerifier.INSTANCE,
+        )
+        val connManager = PoolingHttpClientConnectionManagerBuilder.create()
+            .setTlsSocketStrategy(tlsStrategy)
+            .build()
+        val httpClient = HttpClients.custom()
+            .setConnectionManager(connManager)
+            .build()
+        return RestClient.builder()
+            .requestFactory(HttpComponentsClientHttpRequestFactory(httpClient))
             .defaultHeaders { it.setBasicAuth(ADMIN_USERNAME, ADMIN_PASSWORD) }
-            .clientConnector(ReactorClientHttpConnector(HttpClient.create().secure { it.sslContext(sslContext) }))
             .build()
     }
 
@@ -423,7 +438,7 @@ class OpenSearchIndexerIntegrationTest {
         .path("mappings").path("properties")
 
     private fun get(path: String): JsonNode = requireNotNull(
-        client.get().uri(baseUrl + path).retrieve().bodyToMono(JsonNode::class.java).block(Duration.ofSeconds(30)),
+        client.get().uri(baseUrl + path).retrieve().body(JsonNode::class.java),
     )
 
     companion object {

@@ -7,7 +7,7 @@ import okhttp3.mockwebserver.MockWebServer
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.RecordedRequest
 import org.junit.jupiter.api.Test
-import org.springframework.web.reactive.function.client.WebClient
+import org.springframework.web.client.RestClient
 import java.util.Base64
 import java.time.Instant
 import kotlin.test.assertEquals
@@ -203,7 +203,7 @@ class RemoteConnectorLoadersTest {
     }
 
     private fun loaders(): RemoteConnectorLoaders =
-        RemoteJsonClient(WebClient.builder()).let { http ->
+        RemoteJsonClient(RestClient.builder()).let { http ->
             RemoteConnectorLoaders(
                 JiraConnectorLoader(http, mapper),
                 ConfluenceConnectorLoader(http, mapper).also { it.sleepMillis = {} },

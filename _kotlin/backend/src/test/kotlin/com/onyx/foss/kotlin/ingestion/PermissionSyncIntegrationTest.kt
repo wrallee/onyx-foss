@@ -43,7 +43,6 @@ import org.springframework.test.context.bean.override.mockito.MockitoBean
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean
 import org.springframework.test.web.servlet.MockMvc
 import org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get
-import org.springframework.web.reactive.function.client.WebClient
 import java.time.Instant
 import java.time.Clock
 import java.sql.Connection
@@ -890,26 +889,28 @@ class PermissionSyncIntegrationTest : H2IntegrationTest() {
         }
     }
 
-    private fun realWorker(server: MockWebServer): PermissionSyncWorker = PermissionSyncWorker(
-        admin,
-        pairs,
-        claims,
-        documents,
-        staging,
-        remoteLoaders,
-        OpenSearchIndexer(
-            OnyxProperties(
-                opensearch = OnyxProperties.OpenSearch(
-                    baseUrl = server.url("/").toString().trimEnd('/'),
-                    index = "documents",
-                ),
+    private fun realWorker(server: MockWebServer): PermissionSyncWorker {
+        val openSearchProps = org.springframework.ai.vectorstore.opensearch.autoconfigure.OpenSearchVectorStoreProperties().apply {
+            uris = listOf(server.url("/").toString().trimEnd('/'))
+            indexName = "documents"
+        }
+        return PermissionSyncWorker(
+            admin,
+            pairs,
+            claims,
+            documents,
+            staging,
+            remoteLoaders,
+            OpenSearchIndexer(
+                OnyxProperties(),
+                openSearchProps,
+                OpenSearchIndexer.createOpenSearchClient(openSearchProps, verifyCerts = false),
+                mapper,
+                externalWrites,
             ),
-            WebClient.builder(),
             mapper,
-            externalWrites,
-        ),
-        mapper,
-    )
+        )
+    }
 
     private fun successfulOpenSearchUpdate(): MockResponse = MockResponse()
         .setResponseCode(200)

@@ -8,7 +8,6 @@ data class OnyxProperties(
     val crypto: Crypto = Crypto(),
     val storage: Storage = Storage(),
     val modelServer: ModelServer = ModelServer(),
-    val opensearch: OpenSearch = OpenSearch(),
     val scheduler: Scheduler = Scheduler(),
     val worker: Worker = Worker(),
 ) {
@@ -25,13 +24,6 @@ data class OnyxProperties(
         val readTimeoutMs: Long = 600_000,
         val embedMaxRetries: Int = 2,
         val embedRetryInitialBackoffMs: Long = 2_000,
-    )
-    data class OpenSearch(
-        val baseUrl: String = "http://opensearch:9200",
-        val index: String = "onyx-kotlin-chunks",
-        val username: String = "",
-        val password: String = "",
-        val verifyCerts: Boolean = false,
     )
     data class Scheduler(
         val pollDelayMs: Long = 15_000,

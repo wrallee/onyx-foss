@@ -3,6 +3,18 @@ spring:
     name: onyx-foss-kotlin-backend
   jackson:
     property-naming-strategy: SNAKE_CASE
+  ai:
+    vectorstore:
+      opensearch:
+        uris:
+          - ${OPENSEARCH_URL:http://opensearch:9200}
+        index-name: ${OPENSEARCH_INDEX:onyx-kotlin-chunks}
+        username: ${OPENSEARCH_ADMIN_USERNAME:}
+        password: ${OPENSEARCH_ADMIN_PASSWORD:}
+        connection-timeout: ${OPENSEARCH_CONNECT_TIMEOUT:30s}
+        read-timeout: ${OPENSEARCH_READ_TIMEOUT:60s}
+        aws:
+          enabled: false
   datasource:
     url: ${POSTGRES_URL:jdbc:postgresql://postgres:5432/onyx}
     username: ${POSTGRES_USER:onyx}
@@ -44,12 +56,6 @@ onyx:
     read-timeout-ms: ${MODEL_SERVER_READ_TIMEOUT_MS:600000}
     embed-max-retries: ${ONYX_EMBED_MAX_RETRIES:2}
     embed-retry-initial-backoff-ms: ${ONYX_EMBED_RETRY_INITIAL_BACKOFF_MS:2000}
-  opensearch:
-    base-url: ${OPENSEARCH_URL:http://opensearch:9200}
-    index: ${OPENSEARCH_INDEX:onyx-kotlin-chunks}
-    username: ${OPENSEARCH_ADMIN_USERNAME:}
-    password: ${OPENSEARCH_ADMIN_PASSWORD:}
-    verify-certs: ${OPENSEARCH_VERIFY_CERTS:false}
   scheduler:
     poll-delay-ms: ${ONYX_SCHEDULER_POLL_DELAY_MS:15000}
   worker:

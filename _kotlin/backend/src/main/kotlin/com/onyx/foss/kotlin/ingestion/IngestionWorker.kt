@@ -22,21 +22,18 @@ import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.domain.JobState
 import com.onyx.foss.kotlin.domain.PairStatus
 import com.onyx.foss.kotlin.service.AdminService
-import io.netty.handler.ssl.SslContextBuilder
-import io.netty.handler.ssl.util.InsecureTrustManagerFactory
+import org.opensearch.client.opensearch.OpenSearchClient
+import org.opensearch.client.opensearch.generic.Requests
+import org.springframework.ai.vectorstore.opensearch.autoconfigure.OpenSearchVectorStoreProperties
 import org.springframework.data.domain.PageRequest
 import org.springframework.http.MediaType
-import org.springframework.http.client.reactive.ReactorClientHttpConnector
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Component
 import org.springframework.stereotype.Service
 import org.springframework.transaction.annotation.Transactional
-import org.springframework.web.reactive.function.client.WebClient
-import org.springframework.web.reactive.function.client.WebClientRequestException
-import org.springframework.web.reactive.function.client.WebClientResponseException
-import reactor.core.publisher.Mono
-import reactor.netty.http.client.HttpClient
-import reactor.util.retry.Retry
+import org.springframework.web.client.RestClient
+import org.springframework.web.client.RestClientResponseException
+import org.springframework.web.client.ResourceAccessException
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.time.Duration
@@ -527,15 +524,9 @@ private fun ConnectorFailure.toEntity(attemptId: Long): IngestionErrorEntity = w
 @Service
 class ModelServerClient(
     private val properties: OnyxProperties,
-    clientBuilder: WebClient.Builder,
+    clientBuilder: RestClient.Builder = RestClient.builder(),
 ) {
-    private companion object {
-        const val MAX_RESPONSE_BYTES = 16 * 1024 * 1024
-    }
-
-    private val client = clientBuilder.clone().codecs { codecs ->
-        codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
-    }.buildModelServerClient(properties.modelServer)
+    private val client = clientBuilder.buildModelServerClient(properties.modelServer)
 
     fun embed(texts: List<String>): List<List<Double>> = embed(texts, "passage")
 
@@ -545,63 +536,93 @@ class ModelServerClient(
         require(properties.modelServer.modelName.isNotBlank()) {
             "ONYX_EMBEDDING_MODEL_NAME must be configured before file ingestion"
         }
-        val response = client.post()
-            .uri(properties.modelServer.baseUrl.trimEnd('/') + "/encoder/bi-encoder-embed")
-            .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue(
-                mapOf(
-                    "texts" to texts,
-                    "model_name" to properties.modelServer.modelName,
-                    "max_context_length" to properties.modelServer.maxContextLength,
-                    "normalize_embeddings" to properties.modelServer.normalizeEmbeddings,
-                    "text_type" to textType,
-                ),
-            )
-            .retrieve()
-            .bodyToMono(JsonNode::class.java)
-            // Model server requests can experience transient network blips or brief 5xx errors;
-            // retrying with backoff allows temporary connection failures to recover cleanly.
-            .retryWhen(
-                Retry.backoff(
-                    properties.modelServer.embedMaxRetries.toLong(),
-                    Duration.ofMillis(properties.modelServer.embedRetryInitialBackoffMs),
-                )
-                    .jitter(0.0)
-                    .filter { it is WebClientRequestException || (it is WebClientResponseException && it.statusCode.is5xxServerError) }
-                    .onRetryExhaustedThrow { _, signal -> signal.failure() }
-            )
-            .block() ?: error("Model server returned no embedding response")
-        return response.path("embeddings").toList().map { vector -> vector.toList().map { it.asDouble() } }
+        val payload = mapOf(
+            "texts" to texts,
+            "model_name" to properties.modelServer.modelName,
+            "max_context_length" to properties.modelServer.maxContextLength,
+            "normalize_embeddings" to properties.modelServer.normalizeEmbeddings,
+            "text_type" to textType,
+        )
+        val maxRetries = properties.modelServer.embedMaxRetries
+        val initialBackoff = properties.modelServer.embedRetryInitialBackoffMs
+        var attempt = 0
+        while (true) {
+            try {
+                val response = client.post()
+                    .uri("/encoder/bi-encoder-embed")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(payload)
+                    .retrieve()
+                    .body(JsonNode::class.java)
+                    ?: error("Model server returned no embedding response")
+                return response.path("embeddings").toList().map { vector -> vector.toList().map { it.asDouble() } }
+            } catch (ex: Exception) {
+                val isRetryable = when (ex) {
+                    is RestClientResponseException -> ex.statusCode.is5xxServerError
+                    is ResourceAccessException -> true
+                    else -> false
+                }
+                if (!isRetryable || attempt >= maxRetries) {
+                    throw ex
+                }
+                attempt++
+                val backoffMs = initialBackoff * (1L shl (attempt - 1))
+                if (backoffMs > 0) {
+                    Thread.sleep(backoffMs)
+                }
+            }
+        }
     }
 }
 
 @Service
 class OpenSearchIndexer(
     private val properties: OnyxProperties,
-    clientBuilder: WebClient.Builder,
+    private val openSearchProperties: OpenSearchVectorStoreProperties,
+    private val openSearchClient: OpenSearchClient,
     private val mapper: ObjectMapper,
     private val externalWrites: PairExternalWriteFence,
 ) {
-    private val configuredClientBuilder = clientBuilder.clone().codecs { codecs ->
-        codecs.defaultCodecs().maxInMemorySize(MAX_RESPONSE_BYTES)
-    }.also { builder ->
-        if (properties.opensearch.username.isNotBlank() && properties.opensearch.password.isNotBlank()) {
-            builder.defaultHeaders { headers ->
-                headers.setBasicAuth(properties.opensearch.username, properties.opensearch.password)
-            }
+    private val indexReady = AtomicBoolean(false)
+
+    private val baseUrl: String
+        get() {
+            val raw = openSearchProperties.uris?.firstOrNull()
+            require(!raw.isNullOrBlank()) { "spring.ai.vectorstore.opensearch.uris must not be empty or blank" }
+            return raw.trim()
+        }
+
+    private val index: String
+        get() = openSearchProperties.indexName?.takeIf { it.isNotBlank() } ?: "onyx-kotlin-chunks"
+
+    private fun toEndpoint(uriOrPath: String): String {
+        val base = baseUrl.trimEnd('/')
+        return if (uriOrPath.startsWith(base)) {
+            val path = uriOrPath.substring(base.length)
+            if (path.startsWith("/")) path else "/$path"
+        } else if (uriOrPath.startsWith("http://") || uriOrPath.startsWith("https://")) {
+            val uri = java.net.URI.create(uriOrPath)
+            val path = uri.rawPath ?: ""
+            val query = uri.rawQuery?.let { "?$it" } ?: ""
+            "$path$query"
+        } else {
+            if (uriOrPath.startsWith("/")) uriOrPath else "/$uriOrPath"
         }
     }
-    private val client = if (properties.opensearch.verifyCerts) {
-        configuredClientBuilder.build()
-    } else {
-        val sslContext = SslContextBuilder.forClient()
-            .trustManager(InsecureTrustManagerFactory.INSTANCE)
-            .build()
-        configuredClientBuilder
-            .clientConnector(ReactorClientHttpConnector(HttpClient.create().secure { it.sslContext(sslContext) }))
-            .build()
+
+    private fun executeGeneric(
+        method: String,
+        endpoint: String,
+        jsonBody: String? = null,
+    ): org.opensearch.client.opensearch.generic.Response {
+        val reqBuilder = Requests.builder()
+            .method(method)
+            .endpoint(toEndpoint(endpoint))
+        if (jsonBody != null) {
+            reqBuilder.json(jsonBody)
+        }
+        return openSearchClient.generic().execute(reqBuilder.build())
     }
-    private val indexReady = AtomicBoolean(false)
 
     fun searchCandidates(
         query: String,
@@ -637,14 +658,11 @@ class OpenSearchIndexer(
     }
 
     private fun search(body: Map<String, Any>): List<SearchCandidate> {
-        val response = client.post()
-            .uri(properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index + "/_search")
-            .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue(mapper.valueToTree<JsonNode>(body))
-            .retrieve()
-            .bodyToMono(JsonNode::class.java)
-            .block(OPENSEARCH_TIMEOUT) ?: error("OpenSearch returned no search response")
-        return response.path("hits").path("hits").toList().map{ hit ->
+        val response = executeGeneric("POST", "/${index}/_search", mapper.writeValueAsString(body))
+        check(response.status in 200..299) { "OpenSearch search failed: ${response.status}" }
+        val responseJson = response.body.map { mapper.readTree(it.bodyAsString()) }.orElse(null)
+            ?: error("OpenSearch returned no search response")
+        return responseJson.path("hits").path("hits").toList().map { hit ->
             val source = hit.path("_source")
             SearchCandidate(
                 id = hit.path("_id").asText(),
@@ -744,23 +762,17 @@ class OpenSearchIndexer(
 
     private fun updateByQuery(body: Map<String, Any>, operation: String, minimumTotal: Int) {
         val response = withMigrationRetry {
-            client
-                .post()
-                .uri(
-                    properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index +
-                        "/_update_by_query?refresh=true&conflicts=proceed",
-                )
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(mapper.valueToTree<JsonNode>(body))
-                .exchangeToMono { result ->
-                    if (result.statusCode().is2xxSuccessful) {
-                        result.bodyToMono(JsonNode::class.java).defaultIfEmpty(mapper.createObjectNode())
-                    } else {
-                        result.bodyToMono(String::class.java).flatMap {
-                            Mono.error(openSearchWriteError(operation, result.statusCode().value(), it))
-                        }
-                    }
-                }.block(DOCUMENT_SET_UPDATE_TIMEOUT)
+            val res = executeGeneric(
+                "POST",
+                "/${index}/_update_by_query?refresh=true&conflicts=proceed",
+                mapper.writeValueAsString(body),
+            )
+            if (res.status in 200..299) {
+                res.body.map { mapper.readTree(it.bodyAsString()) }.orElseGet { mapper.createObjectNode() }
+            } else {
+                val errBody = res.body.map { it.bodyAsString() }.orElse("")
+                throw openSearchWriteError(operation, res.status, errBody)
+            }
         }
         val total = response?.path("total")?.asInt(-1) ?: -1
         val updated = response?.path("updated")?.asInt(-1) ?: -1
@@ -775,21 +787,17 @@ class OpenSearchIndexer(
 
     private fun deleteByQuery(query: Map<String, Any>, operation: String) {
         val response = withMigrationRetry {
-            client
-                .post()
-                .uri(
-                    properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index +
-                        "/_delete_by_query?refresh=true",
-                )
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(mapOf("query" to query))
-                .exchangeToMono { result ->
-                    if (result.statusCode().is2xxSuccessful) {
-                        result.bodyToMono(JsonNode::class.java).defaultIfEmpty(mapper.createObjectNode())
-                    } else result.bodyToMono(String::class.java).flatMap {
-                        Mono.error(openSearchWriteError(operation, result.statusCode().value(), it))
-                    }
-                }.block(OPENSEARCH_TIMEOUT)
+            val res = executeGeneric(
+                "POST",
+                "/${index}/_delete_by_query?refresh=true",
+                mapper.writeValueAsString(mapOf("query" to query)),
+            )
+            if (res.status in 200..299) {
+                res.body.map { mapper.readTree(it.bodyAsString()) }.orElseGet { mapper.createObjectNode() }
+            } else {
+                val errBody = res.body.map { it.bodyAsString() }.orElse("")
+                throw openSearchWriteError(operation, res.status, errBody)
+            }
         }
         val total = response?.path("total")?.asInt(-1) ?: -1
         val deleted = response?.path("deleted")?.asInt(-1) ?: -1
@@ -835,17 +843,16 @@ class OpenSearchIndexer(
             "is_public" to false,
         )
         val response = withMigrationRetry {
-            client
-                .put()
-                .uri(properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index + "/_doc/" + documentId + "?refresh=true")
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(mapper.valueToTree<JsonNode>(body))
-                .exchangeToMono { result ->
-                    if (result.statusCode().is2xxSuccessful) result.releaseBody().thenReturn(true)
-                    else result.bodyToMono(String::class.java).flatMap {
-                        Mono.error(openSearchWriteError("index write", result.statusCode().value(), it))
-                    }
-                }.block(OPENSEARCH_TIMEOUT)
+            val res = executeGeneric(
+                "PUT",
+                "/${index}/_doc/$documentId?refresh=true",
+                mapper.writeValueAsString(body),
+            )
+            if (res.status in 200..299) true
+            else {
+                val errBody = res.body.map { it.bodyAsString() }.orElse("")
+                throw openSearchWriteError("index write", res.status, errBody)
+            }
         }
         check(response == true) { "OpenSearch did not confirm the index write" }
     }
@@ -877,8 +884,8 @@ class OpenSearchIndexer(
         if (indexReady.get()) return
         synchronized(indexReady) {
             if (indexReady.get()) return
-            externalWrites.withOpenSearchIndex(properties.opensearch.index) {
-                val indexUrl = properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index
+            externalWrites.withOpenSearchIndex(index) {
+                val indexUrl = baseUrl.trimEnd('/') + "/" + index
                 val exists = indexExists(indexUrl, "index check")
                 if (!exists) {
                     putJson(indexUrl, indexDefinition(), "index creation")
@@ -919,12 +926,12 @@ class OpenSearchIndexer(
     }
 
     private fun reindexWithExactMappings(sourceIndex: String) {
-        val logicalIndex = properties.opensearch.index
+        val logicalIndex = index
         val replacementIndex = "$logicalIndex-exact-v1"
         check(sourceIndex != replacementIndex) { "OpenSearch exact mapping replacement cannot replace itself" }
-        val baseUrl = properties.opensearch.baseUrl.trimEnd('/')
-        val indexUrl = "$baseUrl/$logicalIndex"
-        val replacementUrl = "$baseUrl/$replacementIndex"
+        val base = baseUrl.trimEnd('/')
+        val indexUrl = "$base/$logicalIndex"
+        val replacementUrl = "$base/$replacementIndex"
         try {
             addWriteBlock(sourceIndex)
         } catch (error: Exception) {
@@ -977,7 +984,7 @@ class OpenSearchIndexer(
 
     private fun addWriteBlock(sourceIndex: String) {
         val result = putWithoutBodyJson(
-            properties.opensearch.baseUrl.trimEnd('/') + "/$sourceIndex/_block/write",
+            baseUrl.trimEnd('/') + "/$sourceIndex/_block/write",
             "migration write block",
         )
         check(
@@ -988,7 +995,7 @@ class OpenSearchIndexer(
 
     private fun isWriteBlocked(sourceIndex: String): Boolean = runCatching {
         val settings = getJson(
-            properties.opensearch.baseUrl.trimEnd('/') + "/$sourceIndex/_settings/index.blocks.write?flat_settings=true",
+            baseUrl.trimEnd('/') + "/$sourceIndex/_settings/index.blocks.write?flat_settings=true",
             "migration write block check",
         ).path(sourceIndex).path("settings")
         settings.path("index.blocks.write").asText().equals("true", ignoreCase = true) ||
@@ -1010,7 +1017,7 @@ class OpenSearchIndexer(
 
     private fun exactLogicalMapping(): IndexMapping? = runCatching {
         mapping(
-            properties.opensearch.baseUrl.trimEnd('/') + "/" + properties.opensearch.index,
+            baseUrl.trimEnd('/') + "/" + index,
             "migration recovery mapping check",
         )
     }.getOrNull()?.takeIf { hasExactMappings(it.properties) }
@@ -1026,66 +1033,65 @@ class OpenSearchIndexer(
         return IndexMapping(entry.key, entry.value.path("mappings").path("properties"))
     }
 
-    private fun indexExists(uri: String, operation: String): Boolean =
-        client.head().uri(uri).exchangeToMono { response ->
-            when {
-                response.statusCode().is2xxSuccessful -> response.releaseBody().thenReturn(true)
-                response.statusCode().value() == 404 -> response.releaseBody().thenReturn(false)
-                else -> response.bodyToMono(String::class.java).flatMap {
-                    Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
-                }
+    private fun indexExists(uri: String, operation: String): Boolean {
+        val res = executeGeneric("HEAD", uri)
+        return when {
+            res.status in 200..299 -> true
+            res.status == 404 -> false
+            else -> {
+                val err = res.body.map { it.bodyAsString() }.orElse("")
+                throw IllegalStateException("OpenSearch $operation failed: $err")
             }
-        }.block(OPENSEARCH_TIMEOUT) == true
-
-    private fun getJson(uri: String, operation: String): JsonNode = requireNotNull(
-        client.get().uri(uri).exchangeToMono { response ->
-            if (response.statusCode().is2xxSuccessful) response.bodyToMono(JsonNode::class.java)
-            else response.bodyToMono(String::class.java).flatMap {
-                Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
-            }
-        }.block(OPENSEARCH_TIMEOUT),
-    )
-
-    private fun putJson(uri: String, body: Map<String, Any>, operation: String) {
-        val confirmed = client.put().uri(uri)
-            .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue(mapper.valueToTree<JsonNode>(body))
-            .exchangeToMono { response ->
-                if (response.statusCode().is2xxSuccessful) response.releaseBody().thenReturn(true)
-                else response.bodyToMono(String::class.java).flatMap {
-                    Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
-                }
-            }.block(OPENSEARCH_TIMEOUT)
-        check(confirmed == true) { "OpenSearch did not confirm $operation" }
+        }
     }
 
-    private fun putWithoutBodyJson(uri: String, operation: String): JsonNode = requireNotNull(
-        client.put().uri(uri).exchangeToMono { response ->
-            if (response.statusCode().is2xxSuccessful) response.bodyToMono(JsonNode::class.java)
-            else response.bodyToMono(String::class.java).flatMap {
-                Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
-            }
-        }.block(OPENSEARCH_TIMEOUT),
-    )
+    private fun getJson(uri: String, operation: String): JsonNode {
+        val res = executeGeneric("GET", uri)
+        if (res.status in 200..299) {
+            return res.body.map { mapper.readTree(it.bodyAsString()) }
+                .orElseThrow { IllegalStateException("OpenSearch $operation returned empty response") }
+        } else {
+            val err = res.body.map { it.bodyAsString() }.orElse("")
+            throw IllegalStateException("OpenSearch $operation failed: $err")
+        }
+    }
 
-    private fun postJson(uri: String, body: Map<String, Any>, operation: String): JsonNode = requireNotNull(
-        client.post().uri(uri)
-            .contentType(MediaType.APPLICATION_JSON)
-            .bodyValue(mapper.valueToTree<JsonNode>(body))
-            .exchangeToMono { response ->
-                if (response.statusCode().is2xxSuccessful) response.bodyToMono(JsonNode::class.java)
-                else response.bodyToMono(String::class.java).flatMap {
-                    Mono.error(IllegalStateException("OpenSearch $operation failed: $it"))
-                }
-        }.block(OPENSEARCH_MIGRATION_TIMEOUT),
-    )
+    private fun putJson(uri: String, body: Map<String, Any>, operation: String) {
+        val res = executeGeneric("PUT", uri, mapper.writeValueAsString(body))
+        check(res.status in 200..299) {
+            val err = res.body.map { it.bodyAsString() }.orElse("")
+            "OpenSearch $operation failed: $err"
+        }
+    }
+
+    private fun putWithoutBodyJson(uri: String, operation: String): JsonNode {
+        val res = executeGeneric("PUT", uri)
+        if (res.status in 200..299) {
+            return res.body.map { mapper.readTree(it.bodyAsString()) }
+                .orElseGet { mapper.createObjectNode() }
+        } else {
+            val err = res.body.map { it.bodyAsString() }.orElse("")
+            throw IllegalStateException("OpenSearch $operation failed: $err")
+        }
+    }
+
+    private fun postJson(uri: String, body: Map<String, Any>, operation: String): JsonNode {
+        val res = executeGeneric("POST", uri, mapper.writeValueAsString(body))
+        if (res.status in 200..299) {
+            return res.body.map { mapper.readTree(it.bodyAsString()) }
+                .orElseThrow { IllegalStateException("OpenSearch $operation returned empty response") }
+        } else {
+            val err = res.body.map { it.bodyAsString() }.orElse("")
+            throw IllegalStateException("OpenSearch $operation failed: $err")
+        }
+    }
 
     private data class IndexMapping(
         val concreteIndex: String,
         val properties: JsonNode,
     )
 
-    private companion object {
+    companion object {
         const val MAX_RESPONSE_BYTES = 16 * 1024 * 1024
         const val EXACT_DOCUMENT_ID_FIELD = "source_document_id"
         const val EMBEDDING_FIELD = "embedding"
@@ -1101,6 +1107,75 @@ class OpenSearchIndexer(
             "primary_owners" to mapOf("type" to "keyword"),
             "secondary_owners" to mapOf("type" to "keyword"),
         )
+
+        fun createOpenSearchClient(
+            openSearchProperties: OpenSearchVectorStoreProperties,
+            verifyCerts: Boolean = false,
+        ): OpenSearchClient {
+            val rawUrl = openSearchProperties.uris?.firstOrNull()
+            require(!rawUrl.isNullOrBlank()) { "spring.ai.vectorstore.opensearch.uris must not be empty or blank" }
+            val uri = java.net.URI.create(rawUrl.trim())
+            val scheme = requireNotNull(uri.scheme?.takeIf { it.isNotBlank() }) { "Invalid OpenSearch URI: scheme missing in $rawUrl" }
+            val hostName = requireNotNull(uri.host?.takeIf { it.isNotBlank() }) { "Invalid OpenSearch URI: host missing in $rawUrl" }
+            val port = if (uri.port != -1) uri.port else if (scheme.equals("https", ignoreCase = true)) 443 else 9200
+            val host = org.apache.hc.core5.http.HttpHost(scheme, hostName, port)
+            val connectTimeout = org.apache.hc.core5.util.Timeout.ofMilliseconds(
+                (openSearchProperties.connectionTimeout ?: java.time.Duration.ofSeconds(30)).toMillis(),
+            )
+            val readTimeout = org.apache.hc.core5.util.Timeout.ofMilliseconds(
+                (openSearchProperties.readTimeout ?: java.time.Duration.ofSeconds(60)).toMillis(),
+            )
+            val transportBuilder = org.opensearch.client.transport.httpclient5.ApacheHttpClient5TransportBuilder.builder(host)
+                .setMapper(org.opensearch.client.json.jackson.JacksonJsonpMapper())
+                .setRequestConfigCallback { requestConfig ->
+                    requestConfig
+                        .setConnectTimeout(connectTimeout)
+                        .setResponseTimeout(readTimeout)
+                }
+                .setConnectionConfigCallback { connectionConfig ->
+                    connectionConfig
+                        .setConnectTimeout(connectTimeout)
+                        .setSocketTimeout(readTimeout)
+                }
+                .setHttpClientConfigCallback { asyncClientBuilder ->
+                    val asyncConnectionManager = org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder.create()
+                        .setMaxConnTotal(100)
+                        .setMaxConnPerRoute(50)
+
+                    if (!verifyCerts) {
+                        val sslContext = org.apache.hc.core5.ssl.SSLContextBuilder.create()
+                            .loadTrustMaterial(org.apache.hc.client5.http.ssl.TrustAllStrategy.INSTANCE)
+                            .build()
+                        val tlsStrategy = org.apache.hc.client5.http.ssl.ClientTlsStrategyBuilder.create()
+                            .setSslContext(sslContext)
+                            .setHostnameVerifier(org.apache.hc.client5.http.ssl.NoopHostnameVerifier.INSTANCE)
+                            .build()
+                        asyncConnectionManager.setTlsStrategy(tlsStrategy)
+                    }
+
+                    asyncClientBuilder
+                        .setConnectionManager(asyncConnectionManager.build())
+                        .evictIdleConnections(org.apache.hc.core5.util.TimeValue.ofSeconds(30))
+
+                    val user = openSearchProperties.username
+                    val pass = openSearchProperties.password
+                    if (!user.isNullOrBlank() && !pass.isNullOrBlank()) {
+                        val credsProvider = org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider()
+                        credsProvider.setCredentials(
+                            org.apache.hc.client5.http.auth.AuthScope(host),
+                            org.apache.hc.client5.http.auth.UsernamePasswordCredentials(
+                                user,
+                                pass.toCharArray(),
+                            ),
+                        )
+                        asyncClientBuilder.setDefaultCredentialsProvider(credsProvider)
+                    }
+
+                    asyncClientBuilder
+                }
+
+            return OpenSearchClient(transportBuilder.build())
+        }
     }
 
     private fun vectorFieldDefinition(): Map<String, Any> = mapOf(
