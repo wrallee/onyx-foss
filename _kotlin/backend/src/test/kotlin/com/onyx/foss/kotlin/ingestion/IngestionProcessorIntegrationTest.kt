@@ -772,14 +772,15 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
             orphanedChunk.set(true)
             Unit
         }.`when`(indexer).upsert(
-            run.pairId,
-            "one",
-            0,
-            "one",
-            "one content",
-            null,
-            emptyMap(),
-            listOf(0.1),
+            pairId = run.pairId,
+            sourceDocumentId = "one",
+            chunkId = 0,
+            title = "one",
+            content = "one content",
+            link = null,
+            metadata = emptyMap(),
+            embedding = listOf(0.1),
+            sourceType = ConnectorSource.FILE,
         )
         doAnswer {
             indexDeleteStarted.countDown()

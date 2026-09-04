@@ -926,6 +926,7 @@ class PermissionSyncIntegrationTest : H2IntegrationTest() {
                           "cc_pair_id":{"type":"long"},
                           "source_document_id":{"type":"keyword"},
                           "chunk_id":{"type":"integer"},
+                          "source_type":{"type":"keyword"},
                           "external_user_emails":{"type":"keyword"},
                           "external_user_group_ids":{"type":"keyword"},
                           "is_public":{"type":"boolean"},
