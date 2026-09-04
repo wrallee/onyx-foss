@@ -12,6 +12,7 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import org.mockito.Mockito.mock
+import org.mockito.Mockito.verify
 import org.mockito.Mockito.verifyNoInteractions
 import org.mockito.Mockito.`when`
 
@@ -81,6 +82,65 @@ class SearchServiceTest {
         assertThat(response.results[1].retrievalScore).isEqualTo(0.25)
         assertThat(response.results[2].sourceDocumentId).isEqualTo("doc-doc-b")
         assertThat(response.results[2].retrievalScore).isEqualTo(0.0)
+    }
+
+    @Test
+    fun `forwards source types and time cutoff to the indexer`() {
+        val cutoff = java.time.Instant.parse("2026-01-01T00:00:00Z")
+        `when`(documentSets.findAllByNameIn(emptyList())).thenReturn(emptyList())
+        `when`(modelServer.embedQuery("query")).thenReturn(listOf(0.1, 0.2, 0.3))
+        `when`(
+            indexer.searchCandidates(
+                "query",
+                listOf(0.1, 0.2, 0.3),
+                emptyList(),
+                50,
+                listOf("jira", "github"),
+                cutoff,
+            ),
+        ).thenReturn(SearchCandidateResults(emptyList(), emptyList()))
+
+        service.search(
+            "query",
+            emptyList(),
+            10,
+            SearchType.HYBRID,
+            sourceTypes = listOf("jira", "github"),
+            timeCutoff = cutoff,
+        )
+
+        verify(indexer).searchCandidates(
+            "query",
+            listOf(0.1, 0.2, 0.3),
+            emptyList(),
+            50,
+            listOf("jira", "github"),
+            cutoff,
+        )
+    }
+
+    @Test
+    fun `getDocumentContext fetches chunks around the center clamped at zero`() {
+        `when`(indexer.chunksInRange("doc-1", 0, 3)).thenReturn(
+            listOf(
+                candidate("above", score = 1.0).copy(sourceDocumentId = "doc-1", chunkId = 0, content = "c0"),
+                candidate("center", score = 1.0).copy(sourceDocumentId = "doc-1", chunkId = 1, content = "c1"),
+                candidate("below", score = 1.0).copy(sourceDocumentId = "doc-1", chunkId = 3, content = "c3"),
+            ),
+        )
+
+        val response = service.getDocumentContext("doc-1", chunkId = 1, chunksAbove = 2, chunksBelow = 2)
+
+        assertThat(response.sourceDocumentId).isEqualTo("doc-1")
+        assertThat(response.chunks.map { it.chunkId to it.content })
+            .containsExactly(0 to "c0", 1 to "c1", 3 to "c3")
+    }
+
+    @Test
+    fun `getDocumentContext clamps chunk window to the configured maximum`() {
+        service.getDocumentContext("doc-1", chunkId = 20, chunksAbove = 100, chunksBelow = 100)
+
+        verify(indexer).chunksInRange("doc-1", 10, 30)
     }
 
     @Test

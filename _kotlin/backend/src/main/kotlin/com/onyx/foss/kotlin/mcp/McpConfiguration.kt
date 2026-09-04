@@ -61,6 +61,9 @@ class McpConfiguration {
         .toolCall(searchTool.fusionDefinition()) { _, request ->
             searchTool.callFusion(request.arguments())
         }
+        .toolCall(searchTool.contextDefinition()) { _, request ->
+            searchTool.callGetDocumentContext(request.arguments())
+        }
         .build()
 
     companion object {
