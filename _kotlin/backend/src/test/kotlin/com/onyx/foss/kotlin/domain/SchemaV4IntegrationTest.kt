@@ -56,5 +56,5 @@ class SchemaV4IntegrationTest : H2IntegrationTest() {
         """.trimIndent(),
         String::class.java,
         table,
-    )
+    ).filterNotNull()
 }

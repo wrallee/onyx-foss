@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.api.DocumentSetRequest
 import com.onyx.foss.kotlin.domain.ConnectorCredentialPairEntity
 import com.onyx.foss.kotlin.domain.ConnectorCredentialPairRepository
@@ -98,7 +98,7 @@ class DocumentSetSyncOutboxIntegrationTest : H2IntegrationTest() {
         assertThat(sets.existsById(setId)).isTrue()
         val pending = outbox.findAll().single()
         assertThat(pending.status).isEqualTo(DocumentSetSyncStatus.PENDING)
-        assertThat(pending.ccPairIds?.map { it.asLong() }).containsExactly(pairId)
+        assertThat(pending.ccPairIds?.toList()?.map { it.asLong() }).containsExactly(pairId)
         assertThat(server.requestCount).isEqualTo(requestsBefore)
     }
 
@@ -415,13 +415,11 @@ class DocumentSetSyncOutboxIntegrationTest : H2IntegrationTest() {
 
     private fun sourceIds(request: okhttp3.mockwebserver.RecordedRequest): List<String> = mapper
         .readTree(request.body.clone().readUtf8())
-        .path("query").path("bool").path("filter").get(1).path("terms").path("source_document_id")
-        .map { it.asText() }
+        .path("query").path("bool").path("filter").get(1).path("terms").path("source_document_id").toList().map{ it.asText() }
 
     private fun documentSetNames(request: okhttp3.mockwebserver.RecordedRequest): List<String> = mapper
         .readTree(request.body.clone().readUtf8())
-        .path("script").path("params").path("document_sets")
-        .map { it.asText() }
+        .path("script").path("params").path("document_sets").toList().map{ it.asText() }
 
     companion object {
         private val server = MockWebServer().apply { start() }

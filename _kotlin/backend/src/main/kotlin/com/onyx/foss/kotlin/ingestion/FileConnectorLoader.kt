@@ -1,7 +1,7 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.domain.ConnectorSource
 import com.onyx.foss.kotlin.service.FileStorageService
 import org.apache.tika.metadata.Metadata
@@ -78,7 +78,7 @@ class FileConnectorLoader(
         val metadata = mapper.readTree(Files.readString(files.filePath(assetId)))
         when {
             metadata.isArray -> metadata.mapNotNull { entry -> entry.path("filename").asText().takeIf(String::isNotBlank)?.let { it to entry } }.toMap()
-            metadata.isObject -> metadata.fields().asSequence().associate { it.key to it.value }
+            metadata.isObject -> metadata.properties().asSequence().associate { it.key to it.value }
             else -> emptyMap()
         }
     } catch (_: Exception) {
@@ -86,10 +86,10 @@ class FileConnectorLoader(
     }
 
     private fun JsonNode?.asMap(): Map<String, JsonNode> =
-        if (this?.isObject == true) fields().asSequence().associate { it.key to it.value } else emptyMap()
+        if (this?.isObject == true) properties().associate { it.key to it.value } else emptyMap()
 
     private fun JsonNode?.stringList(): List<String> =
-        if (this?.isArray == true) mapNotNull { it.asText().takeIf(String::isNotBlank) } else emptyList()
+        if (this?.isArray == true) toList().mapNotNull { it.asText().takeIf(String::isNotBlank) } else emptyList()
 
     private fun String.fileName(): String = substringAfterLast('/').substringAfterLast('\\')
 

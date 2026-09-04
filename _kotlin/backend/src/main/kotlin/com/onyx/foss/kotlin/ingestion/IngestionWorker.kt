@@ -1,7 +1,7 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
 import com.onyx.foss.kotlin.config.buildModelServerClient
 import com.onyx.foss.kotlin.domain.AttemptStatus
@@ -571,7 +571,7 @@ class ModelServerClient(
                     .onRetryExhaustedThrow { _, signal -> signal.failure() }
             )
             .block() ?: error("Model server returned no embedding response")
-        return response.path("embeddings").map { vector -> vector.map { it.asDouble() } }
+        return response.path("embeddings").toList().map { vector -> vector.toList().map { it.asDouble() } }
     }
 }
 
@@ -644,7 +644,7 @@ class OpenSearchIndexer(
             .retrieve()
             .bodyToMono(JsonNode::class.java)
             .block(OPENSEARCH_TIMEOUT) ?: error("OpenSearch returned no search response")
-        return response.path("hits").path("hits").map { hit ->
+        return response.path("hits").path("hits").toList().map{ hit ->
             val source = hit.path("_source")
             SearchCandidate(
                 id = hit.path("_id").asText(),
@@ -1022,7 +1022,7 @@ class OpenSearchIndexer(
     private fun mapping(indexUrl: String, operation: String): IndexMapping {
         val response = getJson("$indexUrl/_mapping", operation)
         check(response.size() == 1) { "OpenSearch index must resolve to one concrete index" }
-        val entry = response.fields().next()
+        val entry = response.properties().first()
         return IndexMapping(entry.key, entry.value.path("mappings").path("properties"))
     }
 

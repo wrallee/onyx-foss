@@ -1,11 +1,11 @@
 package com.onyx.foss.kotlin.mcp
 
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.service.SearchResponse
 import com.onyx.foss.kotlin.service.SearchService
 import io.modelcontextprotocol.client.McpClient
 import io.modelcontextprotocol.client.transport.HttpClientStreamableHttpTransport
-import io.modelcontextprotocol.json.jackson2.JacksonMcpJsonMapper
+import io.modelcontextprotocol.json.jackson3.JacksonMcpJsonMapper
 import io.modelcontextprotocol.spec.McpSchema
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
@@ -33,7 +33,7 @@ class McpEndpointIntegrationTest {
     private var port: Int = 0
 
     @Autowired
-    private lateinit var mapper: ObjectMapper
+    private lateinit var mapper: tools.jackson.databind.json.JsonMapper
 
     @MockitoBean
     private lateinit var search: SearchService

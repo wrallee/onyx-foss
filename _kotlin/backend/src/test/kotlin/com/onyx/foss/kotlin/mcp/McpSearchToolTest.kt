@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.mcp
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.service.SearchResponse
 import com.onyx.foss.kotlin.service.SearchService
 import com.onyx.foss.kotlin.service.SearchType

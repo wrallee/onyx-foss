@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.service
 
-import com.fasterxml.jackson.databind.JsonNode
+import tools.jackson.databind.JsonNode
 import com.onyx.foss.kotlin.config.OnyxProperties
 import com.onyx.foss.kotlin.domain.DocumentSetRepository
 import com.onyx.foss.kotlin.ingestion.ModelServerClient

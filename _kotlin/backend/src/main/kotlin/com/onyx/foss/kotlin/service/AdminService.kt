@@ -1,8 +1,8 @@
 package com.onyx.foss.kotlin.service
 
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.node.ObjectNode
+import tools.jackson.databind.ObjectMapper
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.node.ObjectNode
 import com.onyx.foss.kotlin.api.ApiException
 import com.onyx.foss.kotlin.api.CCPropertyUpdateRequest
 import com.onyx.foss.kotlin.api.ConnectorRequest
@@ -558,9 +558,9 @@ class AdminService(
 
     private fun mergeMaskedCredential(current: JsonNode, update: JsonNode): JsonNode {
         if (!current.isObject || !update.isObject) return update
-        val merged = update.deepCopy<ObjectNode>()
-        update.fields().forEach { (name, value) ->
-            if (value.isTextual && value.asText() == "********") merged.set<JsonNode>(name, current.path(name))
+        val merged = update.deepCopy() as ObjectNode
+        update.properties().forEach { (name, value) ->
+            if (value.isTextual && value.asText() == "********") merged.set(name, current.path(name))
         }
         return merged
     }

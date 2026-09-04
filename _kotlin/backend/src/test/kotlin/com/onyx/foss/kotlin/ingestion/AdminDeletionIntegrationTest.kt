@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.api.ApiException
 import com.onyx.foss.kotlin.api.CCPropertyUpdateRequest
 import com.onyx.foss.kotlin.api.ConnectorRequest

@@ -1,8 +1,8 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.node.ObjectNode
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.node.ObjectNode
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -170,8 +170,8 @@ class ConfluenceConnectorLoaderTest {
 
     @Test
     fun unresolvedPageRestrictionDoesNotInheritPublicSpace() = MockWebServer().use { server ->
-        val restrictedPage = mapper.readTree(page("111")).deepCopy<ObjectNode>().also { page ->
-            page.set<JsonNode>(
+        val restrictedPage = (mapper.readTree(page("111")).deepCopy() as ObjectNode).also { page ->
+            page.set(
                 "restrictions",
                 mapper.readTree(
                     """{"read":{"restrictions":{"user":{"results":[{"username":"missing"}]},"group":{"results":[]}}}}""",
@@ -920,7 +920,7 @@ class ConfluenceConnectorLoaderTest {
 
     @Test
     fun loadFromCheckpointWithPageProcessingError() = MockWebServer().use { server ->
-        val bad = mapper.readTree(page("2")).deepCopy<com.fasterxml.jackson.databind.node.ObjectNode>().also { it.remove("version") }
+        val bad = (mapper.readTree(page("2")).deepCopy() as ObjectNode).also { it.remove("version") }
         server.enqueue(
             json(
                 mapper.writeValueAsString(
@@ -957,7 +957,7 @@ class ConfluenceConnectorLoaderTest {
 
     @Test
     fun missingSlimPermissionEmitsPrivateDocumentFailure() = MockWebServer().use { server ->
-        val unresolved = mapper.readTree(page("111")).deepCopy<ObjectNode>().also {
+        val unresolved = (mapper.readTree(page("111")).deepCopy() as ObjectNode).also {
             (it.path("space") as ObjectNode).put("key", "MISSING")
         }
         server.dispatcher = object : Dispatcher() {
@@ -1470,7 +1470,7 @@ class ConfluenceConnectorLoaderTest {
             3,
         ).single()
 
-        assertEquals(listOf(101, 103), item.path("children").path("results").map { it.path("id").asInt() })
+        assertEquals(listOf(101, 103), item.path("children").path("results").toList().map{ it.path("id").asInt() })
     }
 
     @Test
@@ -1676,8 +1676,8 @@ class ConfluenceConnectorLoaderTest {
     )
 
     private fun restrictedPages(field: String, value: String): List<JsonNode> = listOf("1", "2").map { id ->
-        mapper.readTree(page(id)).deepCopy<ObjectNode>().also { page ->
-            page.set<JsonNode>(
+        (mapper.readTree(page(id)).deepCopy() as ObjectNode).also { page ->
+            page.set(
                 "restrictions",
                 mapper.readTree(
                     """{"read":{"restrictions":{"user":{"results":[{"$field":"$value"}]},"group":{"results":[]}}}}""",

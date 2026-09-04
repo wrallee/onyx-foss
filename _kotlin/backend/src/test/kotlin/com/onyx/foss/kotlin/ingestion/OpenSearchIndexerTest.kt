@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
 import io.netty.handler.ssl.SslContextBuilder
 import io.netty.handler.ssl.util.SelfSignedCertificate
@@ -62,10 +62,10 @@ class OpenSearchIndexerTest {
             val vector = mapper.readTree(server.takeRequest().body.readUtf8())
             assertThat(keyword.path("size").asInt()).isEqualTo(30)
             assertThat(keyword.path("query").path("bool").path("filter").path("terms")
-                .path("document_sets").map { it.asText() })
+                .path("document_sets").toList().map{ it.asText() })
                 .containsExactly("Engineering", "Operations")
             assertThat(vector.path("query").path("knn").path("embedding").path("filter")
-                .path("terms").path("document_sets").map { it.asText() })
+                .path("terms").path("document_sets").toList().map{ it.asText() })
                 .containsExactly("Engineering", "Operations")
             assertThat(results.keyword.single().id).isEqualTo("keyword")
             assertThat(results.vector.single().id).isEqualTo("vector")
@@ -197,7 +197,7 @@ class OpenSearchIndexerTest {
             assertThat(request.path).isEqualTo("/documents/_delete_by_query?refresh=true")
             assertThat(body.path("query").path("bool").path("filter").first().path("term").path("cc_pair_id").asLong())
                 .isEqualTo(7)
-            assertThat(body.path("query").path("bool").path("filter").get(1).path("terms").path("source_document_id").map { it.asText() })
+            assertThat(body.path("query").path("bool").path("filter").path(1).path("terms").path("source_document_id").toList().map{ it.asText() })
                 .containsExactlyInAnyOrder("one", "two")
         }
     }
@@ -227,11 +227,11 @@ class OpenSearchIndexerTest {
             assertThat(request.path).isEqualTo("/documents/_update_by_query?refresh=true&conflicts=proceed")
             assertThat(body.path("query").path("bool").path("filter").first().path("term").path("cc_pair_id").asLong())
                 .isEqualTo(7)
-            assertThat(body.path("query").path("bool").path("filter").get(1).path("terms").path("source_document_id").map { it.asText() })
+            assertThat(body.path("query").path("bool").path("filter").path(1).path("terms").path("source_document_id").toList().map{ it.asText() })
                 .containsExactly("one")
             val storedAccess = body.path("script").path("params").path("access_by_document").path("one")
-            assertThat(storedAccess.path("external_user_emails").map { it.asText() }).containsExactly("reader@example.com")
-            assertThat(storedAccess.path("external_user_group_ids").map { it.asText() }).containsExactly("team-1")
+            assertThat(storedAccess.path("external_user_emails").toList().map{ it.asText() }).containsExactly("reader@example.com")
+            assertThat(storedAccess.path("external_user_group_ids").toList().map{ it.asText() }).containsExactly("team-1")
             assertThat(storedAccess.path("is_public").asBoolean()).isFalse()
         }
     }
@@ -264,9 +264,9 @@ class OpenSearchIndexerTest {
             assertThat(request.path).isEqualTo("/documents/_update_by_query?refresh=true&conflicts=proceed")
             assertThat(body.path("query").path("bool").path("filter").first().path("term").path("cc_pair_id").asLong())
                 .isEqualTo(7)
-            assertThat(body.path("query").path("bool").path("filter").get(1).path("terms").path("source_document_id").map { it.asText() })
+            assertThat(body.path("query").path("bool").path("filter").path(1).path("terms").path("source_document_id").toList().map{ it.asText() })
                 .containsExactlyInAnyOrder("one", "two")
-            assertThat(body.path("script").path("params").path("document_sets").map { it.asText() })
+            assertThat(body.path("script").path("params").path("document_sets").toList().map{ it.asText() })
                 .containsExactly("first", "second")
         }
     }

@@ -1,8 +1,8 @@
 package com.onyx.foss.kotlin.security
 
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.databind.node.ObjectNode
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.ObjectMapper
+import tools.jackson.databind.node.ObjectNode
 import com.onyx.foss.kotlin.config.OnyxProperties
 import org.springframework.core.env.Environment
 import org.springframework.stereotype.Component
@@ -42,12 +42,12 @@ class CredentialCipher(
     }
 
     fun masked(value: JsonNode): JsonNode = when {
-        value.isObject -> (value.deepCopy<ObjectNode>()).also { node ->
-            node.fields().forEachRemaining { (name, child) -> node.set<JsonNode>(name, masked(child)) }
+        value.isObject -> (value.deepCopy() as ObjectNode).also { node ->
+            node.properties().forEach { (name, child) -> node.set(name, masked(child)) }
         }
-        value.isArray -> value.deepCopy<JsonNode>()
+        value.isArray -> value.deepCopy()
         value.isNull -> value
-        else -> objectMapper.nodeFactory.textNode("********")
+        else -> objectMapper.nodeFactory.stringNode("********")
     }
 
     private fun resolveKey(): ByteArray {

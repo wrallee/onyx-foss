@@ -1,6 +1,6 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
@@ -37,7 +37,7 @@ class ModelServerClientTest {
             val request = server.takeRequest()
             val body = jacksonObjectMapper().readTree(request.body.readUtf8())
             assertThat(request.path).isEqualTo("/encoder/bi-encoder-embed")
-            assertThat(body.path("texts").map { it.asText() }).containsExactly("search terms")
+            assertThat(body.path("texts").toList().map{ it.asText() }).containsExactly("search terms")
             assertThat(body.path("text_type").asText()).isEqualTo("query")
         }
     }

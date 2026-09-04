@@ -1,7 +1,7 @@
 package com.onyx.foss.kotlin.ingestion
 
-import com.fasterxml.jackson.databind.JsonNode
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
 import com.onyx.foss.kotlin.domain.AttemptStatus
 import com.onyx.foss.kotlin.domain.ConnectorCredentialPairEntity
@@ -37,7 +37,7 @@ import org.mockito.Mockito.verify
 import org.mockito.Mockito.verifyNoInteractions
 import org.mockito.Mockito.`when`
 import org.springframework.beans.factory.annotation.Autowired
-import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc
+import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc
 import org.springframework.jdbc.core.JdbcTemplate
 import org.springframework.test.context.bean.override.mockito.MockitoBean
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean
@@ -108,8 +108,8 @@ class PermissionSyncIntegrationTest : H2IntegrationTest() {
         val first = getJson("/manage/admin/cc-pair/$pairId/permission-sync-attempts?page_num=0&page_size=2")
         val second = getJson("/manage/admin/cc-pair/$pairId/permission-sync-attempts?page_num=1&page_size=2")
 
-        assertThat(first.path("items").map { it.path("id").asLong() }).containsExactly(ids[2], ids[1])
-        assertThat(second.path("items").map { it.path("id").asLong() }).containsExactly(ids[0])
+        assertThat(first.path("items").toList().map{ it.path("id").asLong() }).containsExactly(ids[2], ids[1])
+        assertThat(second.path("items").toList().map{ it.path("id").asLong() }).containsExactly(ids[0])
         assertThat(first.path("total_items").asInt()).isEqualTo(3)
         assertThat(second.path("total_items").asInt()).isEqualTo(3)
     }
@@ -131,7 +131,7 @@ class PermissionSyncIntegrationTest : H2IntegrationTest() {
 
         val items = getJson("/manage/admin/cc-pair/$pairId/permission-sync-attempts").path("items")
 
-        assertThat(items.map { it.path("status").asText() })
+        assertThat(items.toList().map { it.path("status").asText() })
             .containsExactly("completed_with_errors", "failed")
         assertThat(items.get(1).path("error_message").asText()).isEqualTo("fatal lookup")
         assertThat(items.get(1).path("full_exception_trace").asText()).isEqualTo("trace")

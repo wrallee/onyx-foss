@@ -1,7 +1,7 @@
 package com.onyx.foss.kotlin.mcp
 
-import com.fasterxml.jackson.core.type.TypeReference
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.core.type.TypeReference
+import tools.jackson.databind.ObjectMapper
 import com.onyx.foss.kotlin.service.SearchResponse
 import com.onyx.foss.kotlin.service.SearchResult
 import com.onyx.foss.kotlin.service.SearchService

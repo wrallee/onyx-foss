@@ -1,9 +1,9 @@
 package com.onyx.foss.kotlin.mcp
 
-import com.fasterxml.jackson.databind.ObjectMapper
+import tools.jackson.databind.json.JsonMapper
 import io.modelcontextprotocol.common.McpTransportContext
 import io.modelcontextprotocol.json.McpJsonMapper
-import io.modelcontextprotocol.json.jackson2.JacksonMcpJsonMapper
+import io.modelcontextprotocol.json.jackson3.JacksonMcpJsonMapper
 import io.modelcontextprotocol.server.McpServer
 import io.modelcontextprotocol.server.McpSyncServer
 import io.modelcontextprotocol.server.transport.HttpServletStreamableServerTransportProvider
@@ -16,7 +16,7 @@ import org.springframework.context.annotation.Configuration
 @Configuration
 class McpConfiguration {
     @Bean
-    fun mcpJsonMapper(mapper: ObjectMapper): McpJsonMapper = JacksonMcpJsonMapper(mapper)
+    fun mcpJsonMapper(mapper: JsonMapper): McpJsonMapper = JacksonMcpJsonMapper(mapper)
 
     @Bean
     fun mcpTransport(jsonMapper: McpJsonMapper): HttpServletStreamableServerTransportProvider =
