@@ -50,8 +50,8 @@ class AdminDeletionIntegrationTest : H2IntegrationTest() {
     @BeforeEach
     fun resetDatabase() {
         truncateTables(
-            "document_set_sync_outbox", "document_set_cc_pairs", "document_sets", "permission_sync_staging",
-            "permission_sync_attempts", "ingestion_errors", "ingestion_jobs", "ingestion_attempts",
+            "document_set_sync_outbox", "document_set_cc_pairs", "document_sets",
+            "ingestion_errors", "ingestion_jobs", "ingestion_attempts",
             "ingestion_checkpoints", "indexed_documents", "connector_credential_pairs", "connectors", "credentials",
         )
     }

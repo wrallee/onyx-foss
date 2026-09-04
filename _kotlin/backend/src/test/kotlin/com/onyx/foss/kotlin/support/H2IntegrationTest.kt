@@ -41,7 +41,6 @@ abstract class H2IntegrationTest {
 
     private companion object {
         val ALWAYS_RESET_TABLES = listOf(
-            "permission_sync_staging",
             "ingestion_enumerated_documents",
             "file_assets",
         )

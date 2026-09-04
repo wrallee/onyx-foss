@@ -36,7 +36,6 @@ import com.onyx.foss.kotlin.domain.IngestionJobEntity
 import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.domain.JobState
 import com.onyx.foss.kotlin.domain.PairStatus
-import com.onyx.foss.kotlin.domain.PermissionSyncAttemptRepository
 import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
 import com.onyx.foss.kotlin.ingestion.PairExternalWriteFence
 import com.onyx.foss.kotlin.security.CredentialCipher
@@ -56,7 +55,6 @@ class AdminService(
     private val setPairs: DocumentSetPairRepository,
     private val documentSetSyncOutbox: DocumentSetSyncOutboxRepository,
     private val attempts: IngestionAttemptRepository,
-    private val permissionAttempts: PermissionSyncAttemptRepository,
     private val jobs: IngestionJobRepository,
     private val documents: IndexedDocumentRepository,
     private val indexer: OpenSearchIndexer,
@@ -151,7 +149,7 @@ class AdminService(
                 connectorId = id(connector),
                 credentialId = id(credential),
                 name = request.name.trim(),
-                accessType = request.accessType,
+                accessType = "public",
             ),
         )
         enqueuePair(id(pair), false)
@@ -277,7 +275,7 @@ class AdminService(
             locked
         } ?: ConnectorCredentialPairEntity(connectorId = connectorId, credentialId = credentialId)
         pair.name = request.name.trim()
-        pair.accessType = request.accessType
+        pair.accessType = "public"
         pair.autoSyncOptions = request.autoSyncOptions
         pair.processingMode = request.processingMode
         pair.status = if (existingPair == null) PairStatus.SCHEDULED else PairStatus.ACTIVE
@@ -290,11 +288,6 @@ class AdminService(
         val pair = pair(pairId)
         val latest = attempts.findFirstByCcPairIdOrderByIdDesc(pairId)
         val lastSuccessful = lastSuccessfulAttempt(pairId)
-        val latestPermission = permissionAttempts.findFirstByCcPairIdOrderByIdDesc(pairId)
-        val lastFullPermission = permissionAttempts.findFirstByCcPairIdAndStatusInOrderByTimeFinishedDescIdDesc(
-            pairId,
-            listOf(AttemptStatus.SUCCESS, AttemptStatus.COMPLETED_WITH_ERRORS),
-        )
         return mapOf(
             "id" to pairId,
             "name" to pair.name,
@@ -306,7 +299,7 @@ class AdminService(
             "number_of_index_attempts" to attempts.findAllByCcPairIdOrderByIdDesc(pairId).size,
             "last_index_attempt_status" to latest?.status?.value,
             "latest_deletion_attempt" to null,
-            "access_type" to pair.accessType,
+            "access_type" to "public",
             "is_editable_for_current_user" to true,
             "permissions" to mapOf("edit" to true, "delete" to true, "manage" to true),
             "deletion_failure_message" to null,
@@ -315,13 +308,13 @@ class AdminService(
             "creator_email" to null,
             "last_indexed" to lastSuccessful?.timeStarted,
             "last_pruned" to pair.lastPrunedAt,
-            "last_full_permission_sync" to lastFullPermission?.timeFinished,
+            "last_full_permission_sync" to null,
             "overall_indexing_speed" to null,
             "latest_checkpoint_description" to null,
-            "last_permission_sync_attempt_status" to latestPermission?.status?.value,
-            "permission_syncing" to (latestPermission?.status in setOf(AttemptStatus.NOT_STARTED, AttemptStatus.IN_PROGRESS)),
-            "last_permission_sync_attempt_finished" to latestPermission?.timeFinished,
-            "last_permission_sync_attempt_error_message" to latestPermission?.errorMessage,
+            "last_permission_sync_attempt_status" to null,
+            "permission_syncing" to false,
+            "last_permission_sync_attempt_finished" to null,
+            "last_permission_sync_attempt_error_message" to null,
             "supports_targeted_reindex" to false,
         )
     }

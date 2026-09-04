@@ -17,8 +17,6 @@ import com.onyx.foss.kotlin.domain.IngestionJobRepository
 import com.onyx.foss.kotlin.domain.IndexedDocumentEntity
 import com.onyx.foss.kotlin.domain.IndexedDocumentRepository
 import com.onyx.foss.kotlin.domain.JobState
-import com.onyx.foss.kotlin.domain.PermissionSyncAttemptEntity
-import com.onyx.foss.kotlin.domain.PermissionSyncAttemptRepository
 import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
 import com.onyx.foss.kotlin.service.AdminService
 import com.onyx.foss.kotlin.service.FileStorageService
@@ -60,7 +58,6 @@ class AdminApiIntegrationTest : H2IntegrationTest() {
     @Autowired private lateinit var attempts: IngestionAttemptRepository
     @Autowired private lateinit var errors: IngestionErrorRepository
     @Autowired private lateinit var documents: IndexedDocumentRepository
-    @Autowired private lateinit var permissionAttempts: PermissionSyncAttemptRepository
     @Autowired private lateinit var jdbc: JdbcTemplate
     @Autowired private lateinit var storedFiles: FileStorageService
     @MockitoBean private lateinit var indexer: OpenSearchIndexer
@@ -68,7 +65,7 @@ class AdminApiIntegrationTest : H2IntegrationTest() {
     @BeforeEach
     fun resetDatabase() {
         truncateTables(
-            "permission_sync_staging", "permission_sync_attempts", "document_set_sync_outbox", "ingestion_errors",
+            "document_set_sync_outbox", "ingestion_errors",
             "ingestion_jobs", "ingestion_attempts", "ingestion_checkpoints", "indexed_documents",
             "document_set_cc_pairs", "document_sets", "connector_credential_pairs", "connectors", "credentials",
         )
@@ -467,47 +464,22 @@ class AdminApiIntegrationTest : H2IntegrationTest() {
     }
 
     @Test
-    fun pairDetailDerivesPruneAndPermissionStatusFromDurableRows() {
+    fun pairDetailDerivesPruneStatusFromDurableRows() {
         val pairId = createPairWithoutQueuedAttempt()
         val prunedAt = Instant.parse("2026-08-01T00:00:00Z")
-        val successfulAt = Instant.parse("2026-08-02T00:00:00Z")
-        val failedAt = Instant.parse("2026-08-03T00:00:00Z")
         pairs.findById(pairId).orElseThrow().also {
             it.lastPrunedAt = prunedAt
             pairs.saveAndFlush(it)
         }
-        permissionAttempts.save(
-            PermissionSyncAttemptEntity(
-                ccPairId = pairId,
-                status = AttemptStatus.SUCCESS,
-                timeFinished = successfulAt,
-            ),
-        )
-        permissionAttempts.save(
-            PermissionSyncAttemptEntity(
-                ccPairId = pairId,
-                status = AttemptStatus.FAILED,
-                errorMessage = "permission lookup failed",
-                timeFinished = failedAt,
-            ),
-        )
 
         val terminal = request(get("/manage/admin/cc-pair/$pairId")).body
 
         assertThat(Instant.parse(terminal.path("last_pruned").asText())).isEqualTo(prunedAt)
-        assertThat(Instant.parse(terminal.path("last_full_permission_sync").asText())).isEqualTo(successfulAt)
-        assertThat(terminal.path("last_permission_sync_attempt_status").asText()).isEqualTo("failed")
+        assertThat(terminal.path("last_full_permission_sync").isNull).isTrue()
+        assertThat(terminal.path("last_permission_sync_attempt_status").isNull).isTrue()
         assertThat(terminal.path("permission_syncing").asBoolean()).isFalse()
-        assertThat(Instant.parse(terminal.path("last_permission_sync_attempt_finished").asText())).isEqualTo(failedAt)
-        assertThat(terminal.path("last_permission_sync_attempt_error_message").asText())
-            .isEqualTo("permission lookup failed")
-
-        permissionAttempts.save(PermissionSyncAttemptEntity(ccPairId = pairId))
-
-        val pending = request(get("/manage/admin/cc-pair/$pairId")).body
-        assertThat(pending.path("last_permission_sync_attempt_status").asText()).isEqualTo("not_started")
-        assertThat(pending.path("permission_syncing").asBoolean()).isTrue()
-        assertThat(Instant.parse(pending.path("last_full_permission_sync").asText())).isEqualTo(successfulAt)
+        assertThat(terminal.path("last_permission_sync_attempt_finished").isNull).isTrue()
+        assertThat(terminal.path("last_permission_sync_attempt_error_message").isNull).isTrue()
     }
 
     @Test

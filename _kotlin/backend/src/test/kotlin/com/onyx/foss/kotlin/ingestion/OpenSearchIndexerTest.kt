@@ -316,40 +316,6 @@ class OpenSearchIndexerTest {
     }
 
     @Test
-    fun updatesAclFieldsForOnlyTheSelectedDocuments() {
-        MockWebServer().use { server ->
-            enqueueKeywordMapping(server)
-            server.enqueue(
-                MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
-                    .setBody(successfulUpdateResponse()),
-            )
-            server.start()
-            val properties = OnyxProperties(
-                opensearch = OnyxProperties.OpenSearch(
-                    baseUrl = server.url("/").toString().trimEnd('/'),
-                    index = "documents",
-                ),
-            )
-            val indexer = OpenSearchIndexer(properties, WebClient.builder(), mapper, externalWrites)
-            val access = ExternalAccess(setOf("reader@example.com"), setOf("team-1"), isPublic = false)
-
-            indexer.updateAccess(7, mapOf("one" to access))
-
-            val request = takeOperationRequest(server)
-            val body = mapper.readTree(request.body.readUtf8())
-            assertThat(request.path).isEqualTo("/documents/_update_by_query?refresh=true&conflicts=proceed")
-            assertThat(body.path("query").path("bool").path("filter").first().path("term").path("cc_pair_id").asLong())
-                .isEqualTo(7)
-            assertThat(body.path("query").path("bool").path("filter").path(1).path("terms").path("source_document_id").toList().map{ it.asText() })
-                .containsExactly("one")
-            val storedAccess = body.path("script").path("params").path("access_by_document").path("one")
-            assertThat(storedAccess.path("external_user_emails").toList().map{ it.asText() }).containsExactly("reader@example.com")
-            assertThat(storedAccess.path("external_user_group_ids").toList().map{ it.asText() }).containsExactly("team-1")
-            assertThat(storedAccess.path("is_public").asBoolean()).isFalse()
-        }
-    }
-
-    @Test
     fun updatesDocumentSetsForOnlyOneConnectorPair() {
         MockWebServer().use { server ->
             enqueueKeywordMapping(server)
@@ -415,7 +381,7 @@ class OpenSearchIndexerTest {
             assertThat(body.has("is_public")).isTrue()
             assertThat(body.path("external_user_emails")).isEmpty()
             assertThat(body.path("external_user_group_ids")).isEmpty()
-            assertThat(body.path("is_public").asBoolean()).isFalse()
+            assertThat(body.path("is_public").asBoolean()).isTrue()
         }
     }
 
@@ -514,42 +480,6 @@ class OpenSearchIndexerTest {
             assertThat(recordedRequests(server)).contains("POST /documents/_delete_by_query?refresh=true")
         }
     }
-
-    @Test
-    fun rejectsTimedOutFailedAndIncompleteAclUpdates() {
-        listOf(
-            """{"timed_out":true,"total":1,"updated":1,"noops":0,"version_conflicts":0,"failures":[]}""",
-            """{"timed_out":false,"total":1,"updated":1,"noops":0,"version_conflicts":0,"failures":[{"cause":"failed"}]}""",
-            """{"timed_out":false,"total":0,"updated":0,"noops":0,"version_conflicts":0,"failures":[]}""",
-            """{"timed_out":false,"total":1,"updated":0,"noops":0,"version_conflicts":0,"failures":[]}""",
-        ).forEach { response ->
-            MockWebServer().use { server ->
-                enqueueKeywordMapping(server)
-                server.enqueue(
-                    MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json").setBody(response),
-                )
-                server.start()
-                val indexer = OpenSearchIndexer(
-                    OnyxProperties(
-                        opensearch = OnyxProperties.OpenSearch(
-                            baseUrl = server.url("/").toString().trimEnd('/'),
-                            index = "documents",
-                        ),
-                    ),
-                    WebClient.builder(),
-                    mapper,
-                    externalWrites,
-                )
-
-                org.junit.jupiter.api.assertThrows<IllegalStateException> {
-                    indexer.updateAccess(7, mapOf("one" to ExternalAccess(isPublic = false)))
-                }
-            }
-        }
-    }
-
-    private fun successfulUpdateResponse(): String =
-        """{"timed_out":false,"total":1,"updated":1,"noops":0,"version_conflicts":0,"failures":[]}"""
 
     private fun searchResponse(id: String, score: Double): String =
         """{"hits":{"hits":[{"_id":"$id","_score":$score,"_source":{"source_document_id":"doc-$id","chunk_id":0,"title":"Title","content":"Content","link":"https://example.test/$id","metadata":{"type":"guide"}}}]}}"""

@@ -9,20 +9,6 @@ This file records deferred checks. It does not schedule work.
 
 ## Open
 
-### WL-20260831-001 — SAML·LDAP 사용자 권한 연동
-- status: open
-- priority: P2
-- owner: both
-- due_at: unscheduled
-- created_at: 2026-08-31T23:39:08+09:00
-- source: Kotlin backend parity design conversation
-- trigger: Full permission sync is in scope, but user identity and group mapping are deferred.
-- action: MIT FOSS 코드와 공개 표준만 사용해 SAML·LDAP 사용자 및 그룹 연동을 독립 구현한다.
-- done_when: EE 코드 없이 사용자 그룹과 문서 ACL 동기화가 검증되고 출처 기록이 남는다.
-- last_checked_at:
-- result:
-- next_step_on_fail: EE 코드 참조를 중단하고 FOSS 전용 clean-room 설계를 다시 검토한다.
-
 ### WL-20260901-001 — 첨부파일과 이미지 벡터화 확인
 - status: open
 - priority: P1

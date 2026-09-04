@@ -98,7 +98,6 @@ class JiraConnectorLoaderTest {
             config(server, "\"project_key\":\"ENG\""),
             tokenCredentials(),
             start = Instant.parse("2025-06-01T00:00:00Z"),
-            includePermissions = true,
         ).single()
 
         assertEquals(
@@ -114,7 +113,6 @@ class JiraConnectorLoaderTest {
         loader().retrieveAllSlimDocuments(
             config(server, "\"project_key\":\"ENG\""),
             tokenCredentials(),
-            includePermissions = true,
         ).single()
 
         assertEquals("project = \"ENG\"", server.takeRequest().requestUrl!!.queryParameter("jql"))
@@ -390,58 +388,6 @@ class JiraConnectorLoaderTest {
     }
 
     @Test
-    fun permissionsPrefixGroupsForIndexingAndKeepThemRawForPermissionSync() = MockWebServer().use { server ->
-        repeat(2) {
-            server.json(serverPage(total = 1, issue("ENG-1")))
-            server.json(
-                """{"permissions":[
-                    {"permission":"BROWSE_PROJECTS","holder":{"type":"group","parameter":"jira-users"}},
-                    {"permission":"BROWSE_PROJECTS","holder":{"type":"user","user":{"emailAddress":"reader@example.com"}}}
-                ]}""",
-            )
-        }
-        val config = config(server, "\"project_key\":\"ENG\",\"include_permissions\":true")
-
-        val indexed = loader().load(config, tokenCredentials(), null).single().documents.single().externalAccess
-        val permissionSync = loader().load(config, tokenCredentials(), null, permissionSync = true)
-            .single().documents.single().externalAccess
-
-        assertEquals(setOf("jira_jira-users"), assertNotNull(indexed).externalUserGroupIds)
-        assertEquals(setOf("jira-users"), assertNotNull(permissionSync).externalUserGroupIds)
-        assertEquals(setOf("reader@example.com"), indexed.externalUserEmails)
-        assertFalse(indexed.isPublic)
-    }
-
-    @Test
-    fun projectRolePermissionsResolveGroupAndUserActors() = MockWebServer().use { server ->
-        server.json(serverPage(total = 1, issue("ENG-1")))
-        server.json(
-            """{"permissions":[
-                {"permission":"BROWSE_PROJECTS","holder":{"type":"projectRole","parameter":"10002"}}
-            ]}""",
-        )
-        server.json(
-            """{"actors":[
-                {"type":"atlassian-group-role-actor","name":"jira-developers"},
-                {"type":"atlassian-user-role-actor","actorUser":{"emailAddress":"developer@example.com"}}
-            ]}""",
-        )
-
-        val access = loader().load(
-            config(server, "\"project_key\":\"ENG\",\"include_permissions\":true"),
-            tokenCredentials(),
-            null,
-            permissionSync = true,
-        ).single().documents.single().externalAccess
-
-        assertEquals(setOf("jira-developers"), assertNotNull(access).externalUserGroupIds)
-        assertEquals(setOf("developer@example.com"), access.externalUserEmails)
-        assertTrue(server.takeRequest().requestUrl!!.encodedPath.endsWith("/search"))
-        server.takeRequest()
-        assertEquals("/rest/api/2/project/ENG/role/10002", server.takeRequest().requestUrl!!.encodedPath)
-    }
-
-    @Test
     fun validationSucceedsWithProject() = MockWebServer().use { server ->
         server.json("""{"key":"ENG"}""")
 
@@ -529,7 +475,7 @@ class JiraConnectorLoaderTest {
         val document = loader().retrieveAllSlimDocuments(
             config(
                 server,
-                "\"project_key\":\"ENG\",\"include_permissions\":true," +
+                "\"project_key\":\"ENG\"," +
                     "\"labels_to_skip\":[\"secret\"],\"max_ticket_size_bytes\":1",
             ),
             tokenCredentials(),
@@ -537,7 +483,7 @@ class JiraConnectorLoaderTest {
 
         assertEquals(server.url("/").toString().trimEnd('/') + "/browse/ENG-1", document.id)
         assertEquals("", document.content)
-        assertEquals(null, document.externalAccess)
+        assertEquals(ExternalAccess(isPublic = true), document.externalAccess)
         assertEquals(1, server.requestCount)
     }
 

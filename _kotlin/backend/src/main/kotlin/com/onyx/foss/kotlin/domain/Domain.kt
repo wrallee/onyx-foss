@@ -359,63 +359,6 @@ class IngestionErrorEntity(
 )
 
 @Entity
-@Table(name = "permission_sync_attempts")
-class PermissionSyncAttemptEntity(
-    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
-    var id: Long? = null,
-    @Column(name = "cc_pair_id", nullable = false)
-    var ccPairId: Long = 0,
-    @Enumerated(EnumType.STRING)
-    var status: AttemptStatus = AttemptStatus.NOT_STARTED,
-    @Column(name = "active_marker")
-    var activeMarker: Short? = if (status == AttemptStatus.NOT_STARTED || status == AttemptStatus.IN_PROGRESS) 1 else null,
-    @Column(name = "error_msg")
-    var errorMessage: String? = null,
-    @Column(name = "full_exception_trace")
-    var fullExceptionTrace: String? = null,
-    @Column(name = "total_docs_synced", nullable = false)
-    var totalDocsSynced: Int = 0,
-    @Column(name = "docs_with_permission_errors", nullable = false)
-    var docsWithPermissionErrors: Int = 0,
-    @Column(name = "time_started")
-    var timeStarted: Instant? = null,
-    @Column(name = "time_finished")
-    var timeFinished: Instant? = null,
-    @Column(name = "claim_token")
-    var claimToken: UUID? = null,
-    @Column(name = "lease_expires_at")
-    var leaseExpiresAt: Instant? = null,
-    @Column(name = "follow_up_requested", nullable = false)
-    var followUpRequested: Boolean = false,
-    @CreationTimestamp @Column(name = "created_at", updatable = false)
-    var createdAt: Instant? = null,
-    @UpdateTimestamp @Column(name = "updated_at")
-    var updatedAt: Instant? = null,
-)
-
-@Entity
-@Table(name = "permission_sync_staging")
-@IdClass(PermissionSyncStageId::class)
-class PermissionSyncStageEntity(
-    @Id
-    @Column(name = "attempt_id")
-    var attemptId: Long = 0,
-    @Id
-    @Column(name = "source_document_id")
-    var sourceDocumentId: String = "",
-    @JdbcTypeCode(SqlTypes.JSON)
-    @Column(name = "external_access", nullable = false, columnDefinition = "varchar")
-    var externalAccess: JsonNode? = null,
-    @Column(name = "has_error", nullable = false)
-    var hasError: Boolean = false,
-)
-
-data class PermissionSyncStageId(
-    var attemptId: Long = 0,
-    var sourceDocumentId: String = "",
-) : Serializable
-
-@Entity
 @Table(name = "ingestion_enumerated_documents")
 @IdClass(IngestionEnumeratedDocumentId::class)
 class IngestionEnumeratedDocumentEntity(

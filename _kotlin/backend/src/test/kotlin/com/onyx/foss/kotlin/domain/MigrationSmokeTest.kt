@@ -21,6 +21,7 @@ class MigrationSmokeTest : H2IntegrationTest() {
             String::class.java,
         )
         assertThat(tables).contains("ingestion_jobs", "indexed_documents")
+        assertThat(tables).doesNotContain("permission_sync_attempts", "permission_sync_staging")
         assertThat(
             jdbc.queryForObject(
                 "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'ingestion_attempts' AND column_name = 'prune_only')",
@@ -30,7 +31,7 @@ class MigrationSmokeTest : H2IntegrationTest() {
     }
 
     @Test
-    fun `existing V7 data migrates through V15 and duplicate active jobs are cleaned`() {
+    fun `existing V7 data migrates through V16 and duplicate active jobs are cleaned`() {
         val schema = "migration_${UUID.randomUUID().toString().replace("-", "")}"
         jdbc.execute("CREATE SCHEMA $schema")
         try {
@@ -128,11 +129,12 @@ class MigrationSmokeTest : H2IntegrationTest() {
                 ),
             ).isEqualTo("[][]")
             assertThat(
-                legacy.queryForObject(
-                    "SELECT follow_up_requested FROM permission_sync_attempts",
-                    Boolean::class.java,
+                legacy.queryForList(
+                    "SELECT table_name FROM information_schema.tables WHERE LOWER(table_schema) = LOWER(?) AND LOWER(table_name) IN ('permission_sync_attempts', 'permission_sync_staging')",
+                    String::class.java,
+                    schema,
                 ),
-            ).isFalse()
+            ).isEmpty()
             assertThat(
                 legacy.queryForObject(
                     "SELECT document_set_ids IS NULL FROM document_set_sync_outbox",

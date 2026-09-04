@@ -43,14 +43,12 @@ class JiraConnectorLoader(
         config: JsonNode?,
         credentials: JsonNode,
         checkpointNode: JsonNode?,
-        permissionSync: Boolean = false,
         start: Instant? = null,
         end: Instant? = null,
     ): Sequence<ConnectorBatch> = loadInternal(
         config,
         credentials,
         checkpointNode,
-        permissionSync,
         start,
         end,
         slim = false,
@@ -60,7 +58,6 @@ class JiraConnectorLoader(
         config: JsonNode?,
         credentials: JsonNode,
         checkpointNode: JsonNode?,
-        permissionSync: Boolean,
         start: Instant?,
         end: Instant?,
         slim: Boolean,
@@ -78,7 +75,6 @@ class JiraConnectorLoader(
             headers = connection.headers,
             jql = jql(config, start, end),
             pageSize = config?.path("batch_size")?.asInt(DEFAULT_PAGE_SIZE)?.coerceIn(1, 100) ?: DEFAULT_PAGE_SIZE,
-            permissionSync = permissionSync,
             slim = slim,
         )
         return if (connection.apiVersion == 3) loadCloud(context, checkpoint) else loadServer(context, checkpoint)
@@ -108,20 +104,14 @@ class JiraConnectorLoader(
         credentials: JsonNode,
         start: Instant? = null,
         end: Instant? = null,
-        includePermissions: Boolean = false,
-    ): Sequence<ConnectorBatch> {
-        val effectiveConfig = ((config?.deepCopy() as? ObjectNode) ?: mapper.createObjectNode())
-            .put("include_permissions", includePermissions)
-        return loadInternal(
-            effectiveConfig,
-            credentials,
-            checkpointNode = null,
-            permissionSync = includePermissions,
-            start = start,
-            end = end,
-            slim = true,
-        )
-    }
+    ): Sequence<ConnectorBatch> = loadInternal(
+        config,
+        credentials,
+        checkpointNode = null,
+        start = start,
+        end = end,
+        slim = true,
+    )
 
     private fun loadServer(context: Context, initial: JiraCheckpoint): Sequence<ConnectorBatch> = sequence {
         var offset = initial.offset ?: 0
@@ -262,7 +252,6 @@ class JiraConnectorLoader(
         val documents = mutableListOf<SourceDocument>()
         val failures = mutableListOf<ConnectorFailure>()
         var enumerationComplete = true
-        val permissionCache = mutableMapOf<String, ExternalAccess>()
         issues.forEach { issue ->
             val key = issue.path("key").asText().ifBlank { issue.path("id").asText().ifBlank { "unknown" } }
             try {
@@ -271,13 +260,7 @@ class JiraConnectorLoader(
                     enumerationComplete = false
                     return@forEach
                 }
-                val projectKey = document.metadata["project"]?.toString()
-                val access = if (context.config?.path("include_permissions")?.asBoolean(false) == true && projectKey != null) {
-                    permissionCache.getOrPut(projectKey) { projectAccess(context, projectKey) }
-                } else {
-                    null
-                }
-                documents += document.copy(externalAccess = access)
+                documents += document.copy(externalAccess = ExternalAccess(isPublic = true))
             } catch (error: Exception) {
                 val link = context.jiraBase + "/browse/" + segment(key)
                 failures += ConnectorFailure(
@@ -297,7 +280,6 @@ class JiraConnectorLoader(
     ): ProcessResult {
         val documents = mutableListOf<SourceDocument>()
         val failures = mutableListOf<ConnectorFailure>()
-        val permissionCache = mutableMapOf<String, ExternalAccess>()
         issues.forEach { issue ->
             val key = issue.path("key").asText().ifBlank { issue.path("id").asText().ifBlank { "unknown" } }
             try {
@@ -312,11 +294,6 @@ class JiraConnectorLoader(
                 if (parentIsEpic && parentKey != null) seenHierarchyNodeIds += parentKey
                 if (fields.path("issuetype").path("name").asText().equals("epic", true)) seenHierarchyNodeIds += key
                 val link = context.jiraBase + "/browse/" + segment(key)
-                val access = if (context.config?.path("include_permissions")?.asBoolean(false) == true && projectKey.isNotBlank()) {
-                    permissionCache.getOrPut(projectKey) { projectAccess(context, projectKey) }
-                } else {
-                    null
-                }
                 documents += SourceDocument(
                     id = link,
                     title = link,
@@ -327,7 +304,7 @@ class JiraConnectorLoader(
                         "project" to projectKey,
                         "parent_hierarchy_raw_node_id" to if (parentIsEpic) parentKey else projectKey,
                     ),
-                    externalAccess = access,
+                    externalAccess = ExternalAccess(isPublic = true),
                     source = ConnectorSource.JIRA,
                 )
             } catch (error: Exception) {
@@ -414,52 +391,6 @@ class JiraConnectorLoader(
                     ?: person.path("emailAddress").asText().takeIf(String::isNotBlank)
             }.distinct(),
         )
-    }
-
-    private fun projectAccess(context: Context, projectKey: String): ExternalAccess {
-        val response = http.get(
-            context.apiBase,
-            "/rest/api/${context.apiVersion}/project/${segment(projectKey)}/permissionscheme" +
-                "?expand=permissions,user,group,projectRole,applicationRole",
-            context.headers,
-        )
-        val emails = mutableSetOf<String>()
-        val groups = mutableSetOf<String>()
-        var isPublic = false
-        response.path("permissions").filter { it.path("permission").asText() == "BROWSE_PROJECTS" }.forEach { permission ->
-            val holder = permission.path("holder")
-            when (holder.path("type").asText().lowercase()) {
-                "applicationrole", "anyone" -> isPublic = true
-                "group" -> holder.path("parameter").asText().ifBlank { holder.path("group").path("name").asText() }
-                    .takeIf(String::isNotBlank)?.let(groups::add)
-                "user" -> holder.path("user").path("emailAddress").asText()
-                    .ifBlank { holder.path("parameter").asText().takeIf { it.contains('@') }.orEmpty() }
-                    .takeIf(String::isNotBlank)?.let(emails::add)
-                "projectrole" -> {
-                    val roleId = holder.path("parameter").asText()
-                    if (roleId.isNotBlank()) {
-                        val role = http.get(
-                            context.apiBase,
-                            "/rest/api/${context.apiVersion}/project/${segment(projectKey)}/role/${segment(roleId)}",
-                            context.headers,
-                        )
-                        role.path("actors").forEach { actor ->
-                            when {
-                                actor.path("type").asText().contains("group", true) ->
-                                    actor.path("name").asText().ifBlank { actor.path("actorGroup").path("name").asText() }
-                                        .takeIf(String::isNotBlank)?.let(groups::add)
-                                actor.path("type").asText().contains("user", true) ->
-                                    actor.path("actorUser").path("emailAddress").asText()
-                                        .ifBlank { actor.path("user").path("emailAddress").asText() }
-                                        .takeIf(String::isNotBlank)?.let(emails::add)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        val outputGroups = if (context.permissionSync) groups else groups.mapTo(mutableSetOf()) { "jira_${it.lowercase()}" }
-        return ExternalAccess(emails, outputGroups, isPublic)
     }
 
     private fun getSearch(context: Context, path: String): JsonNode = try {
@@ -617,7 +548,6 @@ class JiraConnectorLoader(
         val headers: Map<String, String>,
         val jql: String,
         val pageSize: Int,
-        val permissionSync: Boolean,
         val slim: Boolean,
     )
 

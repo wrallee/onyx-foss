@@ -84,7 +84,6 @@ class OpenSearchIndexerIntegrationTest {
         )
         indexer.upsert(7, fileId, 0, "File", "file content", null, emptyMap(), vector(0.2))
 
-        indexer.updateAccess(7, mapOf(urlId to ExternalAccess(setOf("reader@example.com"), isPublic = false)))
         indexer.updateDocumentSets(7, setOf(urlId, fileId), listOf("Engineering"))
         indexer.deleteDocuments(7, setOf(fileId))
 
@@ -96,8 +95,8 @@ class OpenSearchIndexerIntegrationTest {
         assertThat(mapping.path(index).path("mappings").path("properties").path("primary_owners").path("type").asText())
             .isEqualTo("keyword")
         val urlDocument = exactDocuments(urlId).single()
-        assertThat(urlDocument.path("external_user_emails").toList().map(JsonNode::asText)).containsExactly("reader@example.com")
-        assertThat(urlDocument.path("is_public").asBoolean()).isFalse()
+        assertThat(urlDocument.path("external_user_emails").toList().map(JsonNode::asText)).isEmpty()
+        assertThat(urlDocument.path("is_public").asBoolean()).isTrue()
         assertThat(urlDocument.path("document_sets").toList().map(JsonNode::asText)).containsExactly("Engineering")
         assertThat(urlDocument.path("doc_updated_at").asText()).isEqualTo(updatedAt.toString())
         assertThat(urlDocument.path("primary_owners").toList().map(JsonNode::asText)).containsExactly("owner@example.com")
@@ -147,14 +146,12 @@ class OpenSearchIndexerIntegrationTest {
         assertThat(mappingProperties().path("source_document_id").path("type").asText()).isEqualTo("text")
 
         val indexer = indexer()
-        indexer.updateAccess(7, mapOf(urlId to ExternalAccess(setOf("reader@example.com"), isPublic = false)))
         indexer.updateDocumentSets(7, setOf(urlId, fileId), listOf("Engineering"))
         indexer.deleteDocuments(7, setOf(fileId))
 
         assertThat(mappingProperties().path("source_document_id").path("type").asText()).isEqualTo("keyword")
         val urlDocument = exactDocuments(urlId).single()
         assertThat(urlDocument.path("content").asText()).isEqualTo("url content")
-        assertThat(urlDocument.path("external_user_emails").toList().map(JsonNode::asText)).containsExactly("reader@example.com")
         assertThat(urlDocument.path("document_sets").toList().map(JsonNode::asText)).containsExactly("Engineering")
         assertThat(exactDocuments(fileId)).isEmpty()
     }
@@ -175,9 +172,10 @@ class OpenSearchIndexerIntegrationTest {
             val executor = Executors.newFixedThreadPool(2)
             try {
                 val migration = executor.submit {
-                    migratingReplica.updateAccess(
+                    migratingReplica.updateDocumentSets(
                         7,
-                        mapOf(legacyId to ExternalAccess(setOf("reader@example.com"), isPublic = false)),
+                        setOf(legacyId),
+                        listOf("Engineering"),
                     )
                 }
                 assertThat(firstReindex.await(10, TimeUnit.SECONDS)).isTrue()
@@ -207,8 +205,8 @@ class OpenSearchIndexerIntegrationTest {
             }
         }
 
-        assertThat(exactDocuments(legacyId).single().path("external_user_emails").toList().map(JsonNode::asText))
-            .containsExactly("reader@example.com")
+        assertThat(exactDocuments(legacyId).single().path("document_sets").toList().map(JsonNode::asText))
+            .containsExactly("Engineering")
         assertThat(exactDocuments(concurrentId).single().path("content").asText()).isEqualTo("concurrent content")
     }
 
