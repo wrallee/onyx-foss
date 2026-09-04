@@ -2,6 +2,7 @@ package com.onyx.foss.kotlin.ingestion
 
 import tools.jackson.module.kotlin.jacksonObjectMapper
 import com.onyx.foss.kotlin.config.OnyxProperties
+import com.onyx.foss.kotlin.domain.ConnectorSource
 import io.netty.handler.ssl.SslContextBuilder
 import io.netty.handler.ssl.util.SelfSignedCertificate
 import okhttp3.mockwebserver.Dispatcher
@@ -61,14 +62,97 @@ class OpenSearchIndexerTest {
             val keyword = mapper.readTree(server.takeRequest().body.readUtf8())
             val vector = mapper.readTree(server.takeRequest().body.readUtf8())
             assertThat(keyword.path("size").asInt()).isEqualTo(30)
-            assertThat(keyword.path("query").path("bool").path("filter").path("terms")
+            assertThat(keyword.path("query").path("bool").path("filter").first().path("terms")
                 .path("document_sets").toList().map{ it.asText() })
                 .containsExactly("Engineering", "Operations")
-            assertThat(vector.path("query").path("knn").path("embedding").path("filter")
+            assertThat(vector.path("query").path("knn").path("embedding").path("filter").first()
                 .path("terms").path("document_sets").toList().map{ it.asText() })
                 .containsExactly("Engineering", "Operations")
             assertThat(results.keyword.single().id).isEqualTo("keyword")
             assertThat(results.vector.single().id).isEqualTo("vector")
+        }
+    }
+
+    @Test
+    fun `candidate search applies source type and updated-after filters`() {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.enqueue(jsonResponse(exactMappingResponse()))
+            server.enqueue(jsonResponse(searchResponse("keyword", 2.0)))
+            server.enqueue(jsonResponse(searchResponse("vector", 1.5)))
+            server.start()
+            val indexer = OpenSearchIndexer(
+                OnyxProperties(
+                    opensearch = OnyxProperties.OpenSearch(
+                        baseUrl = server.url("/").toString().trimEnd('/'),
+                        index = "documents",
+                    ),
+                ),
+                WebClient.builder(),
+                mapper,
+                externalWrites,
+            )
+
+            indexer.searchCandidates(
+                query = "deployment guide",
+                queryEmbedding = List(768) { 0.1 },
+                documentSets = emptyList(),
+                count = 30,
+                sourceTypes = listOf("jira", "github"),
+                updatedAfter = java.time.Instant.parse("2026-01-01T00:00:00Z"),
+            )
+
+            server.takeRequest()
+            server.takeRequest()
+            val keyword = mapper.readTree(server.takeRequest().body.readUtf8())
+            val filters = keyword.path("query").path("bool").path("filter").toList()
+            assertThat(filters.map { it.path("terms").path("source_type") }.filter { !it.isMissingNode }
+                .single().toList().map { it.asText() }).containsExactly("jira", "github")
+            assertThat(filters.map { it.path("range").path("doc_updated_at").path("gte") }
+                .filter { !it.isMissingNode }.single().asText()).isEqualTo("2026-01-01T00:00:00Z")
+        }
+    }
+
+    @Test
+    fun `chunksInRange fetches ordered chunks for a document`() {
+        MockWebServer().use { server ->
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.enqueue(jsonResponse(exactMappingResponse()))
+            server.enqueue(
+                jsonResponse(
+                    """{"hits":{"hits":[
+                        {"_id":"a","_score":1.0,"_source":{"source_document_id":"doc-1","chunk_id":1,"title":"T","content":"above","link":null,"metadata":{}}},
+                        {"_id":"b","_score":1.0,"_source":{"source_document_id":"doc-1","chunk_id":2,"title":"T","content":"center","link":null,"metadata":{}}},
+                        {"_id":"c","_score":1.0,"_source":{"source_document_id":"doc-1","chunk_id":3,"title":"T","content":"below","link":null,"metadata":{}}}
+                    ]}}""",
+                ),
+            )
+            server.start()
+            val indexer = OpenSearchIndexer(
+                OnyxProperties(
+                    opensearch = OnyxProperties.OpenSearch(
+                        baseUrl = server.url("/").toString().trimEnd('/'),
+                        index = "documents",
+                    ),
+                ),
+                WebClient.builder(),
+                mapper,
+                externalWrites,
+            )
+
+            val chunks = indexer.chunksInRange("doc-1", minChunkId = 1, maxChunkId = 3)
+
+            server.takeRequest()
+            server.takeRequest()
+            val request = mapper.readTree(server.takeRequest().body.readUtf8())
+            assertThat(request.path("size").asInt()).isEqualTo(3)
+            val filters = request.path("query").path("bool").path("filter").toList()
+            assertThat(filters.map { it.path("term").path("source_document_id") }.filter { !it.isMissingNode }
+                .single().asText()).isEqualTo("doc-1")
+            val range = filters.map { it.path("range").path("chunk_id") }.filter { !it.isMissingNode }.single()
+            assertThat(range.path("gte").asInt()).isEqualTo(1)
+            assertThat(range.path("lte").asInt()).isEqualTo(3)
+            assertThat(chunks.map { it.content }).containsExactly("above", "center", "below")
         }
     }
 
@@ -104,6 +188,35 @@ class OpenSearchIndexerTest {
             assertThat(embedding.path("dimension").asInt()).isEqualTo(768)
             assertThat(embedding.path("method").path("engine").asText()).isEqualTo("lucene")
             assertThat(embedding.path("method").path("space_type").asText()).isEqualTo("cosinesimil")
+        }
+    }
+
+    @Test
+    fun `upsert stores the connector source type on each chunk`() {
+        MockWebServer().use { server ->
+            enqueueKeywordMapping(server)
+            server.enqueue(MockResponse().setResponseCode(200))
+            server.start()
+            val indexer = OpenSearchIndexer(
+                OnyxProperties(
+                    opensearch = OnyxProperties.OpenSearch(
+                        baseUrl = server.url("/").toString().trimEnd('/'),
+                        index = "documents",
+                    ),
+                ),
+                WebClient.builder(),
+                mapper,
+                externalWrites,
+            )
+
+            indexer.upsert(
+                7, "one", 0, "One", "content", null, emptyMap(), listOf(0.1),
+                sourceType = ConnectorSource.JIRA,
+            )
+
+            val request = takeOperationRequest(server)
+            val body = mapper.readTree(request.body.readUtf8())
+            assertThat(body.path("source_type").asText()).isEqualTo("jira")
         }
     }
 
@@ -489,6 +602,7 @@ class OpenSearchIndexerTest {
                         "cc_pair_id" to mapOf("type" to "long"),
                         "source_document_id" to mapOf("type" to "keyword"),
                         "chunk_id" to mapOf("type" to "integer"),
+                        "source_type" to mapOf("type" to "keyword"),
                         "external_user_emails" to mapOf("type" to "keyword"),
                         "external_user_group_ids" to mapOf("type" to "keyword"),
                         "is_public" to mapOf("type" to "boolean"),

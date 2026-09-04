@@ -1,6 +1,7 @@
 package com.onyx.foss.kotlin.mcp
 
 import tools.jackson.module.kotlin.jacksonObjectMapper
+import com.onyx.foss.kotlin.service.DocumentContextResponse
 import com.onyx.foss.kotlin.service.SearchResponse
 import com.onyx.foss.kotlin.service.SearchService
 import com.onyx.foss.kotlin.service.SearchType
@@ -86,6 +87,118 @@ class McpSearchToolTest {
         )
 
         verify(search).search("deployment guide", listOf("CustomSet"), 10, SearchType.HYBRID)
+        assertThat(result.isError() == true).isFalse()
+    }
+
+    @Test
+    fun `search tool forwards source types and time cutoff`() {
+        val response = SearchResponse(results = emptyList())
+        val cutoff = java.time.Instant.parse("2026-01-01T00:00:00Z")
+        `when`(
+            search.search(
+                "deployment guide",
+                emptyList(),
+                10,
+                SearchType.HYBRID,
+                listOf("jira", "github"),
+                cutoff,
+            ),
+        ).thenReturn(response)
+
+        val result = tool.callSearch(
+            mapOf(
+                "query" to "deployment guide",
+                "source_types" to listOf("jira", "github"),
+                "time_cutoff" to "2026-01-01T00:00:00Z",
+            ),
+        )
+
+        verify(search).search(
+            "deployment guide",
+            emptyList(),
+            10,
+            SearchType.HYBRID,
+            listOf("jira", "github"),
+            cutoff,
+        )
+        assertThat(result.isError() == true).isFalse()
+    }
+
+    @Test
+    fun `search tool skips unknown source types instead of failing`() {
+        val response = SearchResponse(results = emptyList())
+        `when`(
+            search.search("deployment guide", emptyList(), 10, SearchType.HYBRID, listOf("jira"), null),
+        ).thenReturn(response)
+
+        val result = tool.callSearch(
+            mapOf(
+                "query" to "deployment guide",
+                "source_types" to listOf("jira", "not-a-real-source"),
+            ),
+        )
+
+        verify(search).search("deployment guide", emptyList(), 10, SearchType.HYBRID, listOf("jira"), null)
+        assertThat(result.isError() == true).isFalse()
+    }
+
+    @Test
+    fun `search tool ignores an unparseable time cutoff instead of failing`() {
+        val response = SearchResponse(results = emptyList())
+        `when`(
+            search.search("deployment guide", emptyList(), 10, SearchType.HYBRID, emptyList(), null),
+        ).thenReturn(response)
+
+        val result = tool.callSearch(
+            mapOf(
+                "query" to "deployment guide",
+                "time_cutoff" to "not-a-date",
+            ),
+        )
+
+        verify(search).search("deployment guide", emptyList(), 10, SearchType.HYBRID, emptyList(), null)
+        assertThat(result.isError() == true).isFalse()
+    }
+
+    @Test
+    fun `context tool forwards document, chunk and window arguments`() {
+        val response = DocumentContextResponse("doc-1", emptyList())
+        `when`(search.getDocumentContext("doc-1", 5, 1, 3)).thenReturn(response)
+
+        val result = tool.callGetDocumentContext(
+            mapOf(
+                "source_document_id" to "doc-1",
+                "chunk_id" to 5,
+                "chunks_above" to 1,
+                "chunks_below" to 3,
+            ),
+        )
+
+        verify(search).getDocumentContext("doc-1", 5, 1, 3)
+        assertThat(result.isError() == true).isFalse()
+        assertThat(tool.contextDefinition().name()).isEqualTo("get_document_context")
+    }
+
+    @Test
+    fun `context tool uses default window when not specified`() {
+        val response = DocumentContextResponse("doc-1", emptyList())
+        `when`(
+            search.getDocumentContext(
+                "doc-1",
+                5,
+                SearchService.DEFAULT_CONTEXT_CHUNKS,
+                SearchService.DEFAULT_CONTEXT_CHUNKS,
+            ),
+        ).thenReturn(response)
+
+        val result = tool.callGetDocumentContext(mapOf("source_document_id" to "doc-1", "chunk_id" to 5))
+
+        verify(search).getDocumentContext(
+            "doc-1",
+            5,
+            SearchService.DEFAULT_CONTEXT_CHUNKS,
+            SearchService.DEFAULT_CONTEXT_CHUNKS,
+        )
         assertThat(result.isError() == true).isFalse()
     }
 

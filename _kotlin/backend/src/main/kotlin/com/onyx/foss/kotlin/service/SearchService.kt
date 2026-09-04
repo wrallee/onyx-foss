@@ -7,6 +7,7 @@ import com.onyx.foss.kotlin.ingestion.ModelServerClient
 import com.onyx.foss.kotlin.ingestion.OpenSearchIndexer
 import com.onyx.foss.kotlin.ingestion.SearchCandidate
 import org.springframework.stereotype.Service
+import java.time.Instant
 
 @Service
 class SearchService(
@@ -21,6 +22,8 @@ class SearchService(
         documentSets: List<String> = emptyList(),
         limit: Int = 10,
         searchType: SearchType = SearchType.HYBRID,
+        sourceTypes: List<String> = emptyList(),
+        timeCutoff: Instant? = null,
     ): SearchResponse {
         require(query.isNotBlank()) { "query must not be blank" }
         require(limit in 1..MAX_RESULTS) { "limit must be between 1 and $MAX_RESULTS" }
@@ -38,6 +41,8 @@ class SearchService(
             modelServer.embedQuery(query),
             selectedSets,
             config.searchCandidates,
+            sourceTypes,
+            timeCutoff,
         )
         val fused = when (searchType) {
             SearchType.HYBRID -> fuse(candidates.keyword, candidates.vector)
@@ -131,11 +136,32 @@ class SearchService(
         }
     }
 
+    @JvmOverloads
+    fun getDocumentContext(
+        sourceDocumentId: String,
+        chunkId: Int,
+        chunksAbove: Int = DEFAULT_CONTEXT_CHUNKS,
+        chunksBelow: Int = DEFAULT_CONTEXT_CHUNKS,
+    ): DocumentContextResponse {
+        require(sourceDocumentId.isNotBlank()) { "source_document_id must not be blank" }
+        require(chunkId >= 0) { "chunk_id must not be negative" }
+        val above = chunksAbove.coerceIn(0, MAX_CONTEXT_CHUNKS)
+        val below = chunksBelow.coerceIn(0, MAX_CONTEXT_CHUNKS)
+        val minChunkId = (chunkId - above).coerceAtLeast(0)
+        val maxChunkId = chunkId + below
+        val chunks = indexer.chunksInRange(sourceDocumentId, minChunkId, maxChunkId)
+            .sortedBy { it.chunkId }
+            .map { DocumentContextChunk(it.chunkId, it.content) }
+        return DocumentContextResponse(sourceDocumentId, chunks)
+    }
+
     companion object {
         const val MAX_RESULTS = 20
         const val KEYWORD_WEIGHT = 0.5
         const val VECTOR_WEIGHT = 0.5
         const val DEFAULT_RRF_K = 50
+        const val DEFAULT_CONTEXT_CHUNKS = 2
+        const val MAX_CONTEXT_CHUNKS = 10
     }
 }
 
@@ -155,6 +181,16 @@ enum class SearchType {
 
 data class SearchResponse(
     val results: List<SearchResult>,
+)
+
+data class DocumentContextChunk(
+    val chunkId: Int,
+    val content: String,
+)
+
+data class DocumentContextResponse(
+    val sourceDocumentId: String,
+    val chunks: List<DocumentContextChunk>,
 )
 
 data class SearchResult(

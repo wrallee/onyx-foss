@@ -349,6 +349,7 @@ class IngestionProcessor(
                                 updatedAt = document.updatedAt,
                                 primaryOwners = document.primaryOwners,
                                 secondaryOwners = document.secondaryOwners,
+                                sourceType = connector.source,
                             )
                         }
                         renew(claim)
@@ -608,6 +609,8 @@ class OpenSearchIndexer(
         queryEmbedding: List<Double>,
         documentSets: List<String>,
         count: Int,
+        sourceTypes: List<String> = emptyList(),
+        updatedAfter: Instant? = null,
     ): SearchCandidateResults {
         require(query.isNotBlank()) { "query must not be blank" }
         require(queryEmbedding.size == properties.modelServer.embeddingDimension) {
@@ -615,8 +618,16 @@ class OpenSearchIndexer(
         }
         require(count > 0) { "count must be positive" }
         ensureIndex()
-        val filter = documentSets.distinct().takeIf(List<String>::isNotEmpty)?.let {
-            mapOf("terms" to mapOf("document_sets" to it))
+        val filters = buildList<Map<String, Any>> {
+            documentSets.distinct().takeIf(List<String>::isNotEmpty)?.let {
+                add(mapOf("terms" to mapOf("document_sets" to it)))
+            }
+            sourceTypes.distinct().takeIf(List<String>::isNotEmpty)?.let {
+                add(mapOf("terms" to mapOf("source_type" to it)))
+            }
+            updatedAfter?.let {
+                add(mapOf("range" to mapOf("doc_updated_at" to mapOf("gte" to it.toString()))))
+            }
         }
         val keywordQuery = linkedMapOf<String, Any>(
             "must" to mapOf(
@@ -625,14 +636,33 @@ class OpenSearchIndexer(
                     "fields" to listOf("title^2", "content"),
                 ),
             ),
-        ).apply { filter?.let { put("filter", it) } }
+        ).apply { if (filters.isNotEmpty()) put("filter", filters) }
         val vectorQuery = linkedMapOf<String, Any>(
             "vector" to queryEmbedding,
             "k" to count,
-        ).apply { filter?.let { put("filter", it) } }
+        ).apply { if (filters.isNotEmpty()) put("filter", filters) }
         return SearchCandidateResults(
             keyword = search(mapOf("size" to count, "query" to mapOf("bool" to keywordQuery))),
             vector = search(mapOf("size" to count, "query" to mapOf("knn" to mapOf(EMBEDDING_FIELD to vectorQuery)))),
+        )
+    }
+
+    fun chunksInRange(sourceDocumentId: String, minChunkId: Int, maxChunkId: Int): List<SearchCandidate> {
+        require(minChunkId <= maxChunkId) { "minChunkId must be <= maxChunkId" }
+        ensureIndex()
+        return search(
+            mapOf(
+                "size" to (maxChunkId - minChunkId + 1),
+                "sort" to listOf(mapOf("chunk_id" to "asc")),
+                "query" to mapOf(
+                    "bool" to mapOf(
+                        "filter" to listOf(
+                            mapOf("term" to mapOf("source_document_id" to sourceDocumentId)),
+                            mapOf("range" to mapOf("chunk_id" to mapOf("gte" to minChunkId, "lte" to maxChunkId))),
+                        ),
+                    ),
+                ),
+            ),
         )
     }
 
@@ -813,6 +843,7 @@ class OpenSearchIndexer(
         updatedAt: Instant? = null,
         primaryOwners: List<String> = emptyList(),
         secondaryOwners: List<String> = emptyList(),
+        sourceType: ConnectorSource? = null,
     ) {
         val documentId = Base64.getUrlEncoder().withoutPadding().encodeToString(
             (pairId.toString() + ":" + sourceDocumentId + ":" + chunkId).toByteArray(StandardCharsets.UTF_8),
@@ -826,6 +857,7 @@ class OpenSearchIndexer(
             "link" to link,
             "metadata" to metadata,
             "embedding" to embedding,
+            "source_type" to sourceType?.value,
             "document_sets" to documentSets,
             "doc_updated_at" to updatedAt,
             "primary_owners" to primaryOwners,
@@ -1093,6 +1125,7 @@ class OpenSearchIndexer(
             "cc_pair_id" to mapOf("type" to "long"),
             EXACT_DOCUMENT_ID_FIELD to mapOf("type" to "keyword"),
             "chunk_id" to mapOf("type" to "integer"),
+            "source_type" to mapOf("type" to "keyword"),
             "external_user_emails" to mapOf("type" to "keyword"),
             "external_user_group_ids" to mapOf("type" to "keyword"),
             "is_public" to mapOf("type" to "boolean"),

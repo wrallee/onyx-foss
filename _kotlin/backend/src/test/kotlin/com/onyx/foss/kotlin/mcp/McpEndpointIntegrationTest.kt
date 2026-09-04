@@ -54,6 +54,7 @@ class McpEndpointIntegrationTest {
                 "search",
                 "search_indexed_documents",
                 "weighted_reciprocal_rank_fusion",
+                "get_document_context",
             )
             val result = client.callTool(
                 McpSchema.CallToolRequest.builder("search_indexed_documents")
