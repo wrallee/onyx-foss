@@ -1,3 +1,6 @@
+For Superpowers workflows, save implementation plans under
+`docs/superpowers/plans/`, not `plans/`.
+
 # Container Workload Safety
 
 Do not start the complete Compose stack without checking available resources and required services.
