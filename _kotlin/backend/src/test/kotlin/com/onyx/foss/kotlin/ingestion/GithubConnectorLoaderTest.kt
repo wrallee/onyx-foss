@@ -32,13 +32,6 @@ class GithubConnectorLoaderTest {
             repositoryIndex = 2,
             repositoryPage = 3,
             repositories = listOf(repository("one"), repository("two")),
-            permissionStage = GithubPermissionStage.USERS,
-            permissionCollaboratorPage = 2,
-            permissionUserLogins = listOf("alice"),
-            permissionUserOffset = 1,
-            permissionTeamPage = 3,
-            permissionEmails = setOf("alice@example.com"),
-            permissionTeamIds = setOf("42"),
             pullRequestPage = 4,
             pullRequestCursor = "/pulls?after=pr",
             pullRequestsRetrieved = 12,
@@ -171,26 +164,6 @@ class GithubConnectorLoaderTest {
 
         assertFailsWith<GithubConnectorValidationException> {
             loader().load(config(server), credentials(), invalid).first()
-        }
-        Unit
-    }
-
-    @Test
-    fun permissionCheckpointStopsBeforeMoreThanFiveThousandEntries() = MockWebServer().use { server ->
-        server.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse = json("""[{"id":5001}]""")
-        }
-        val active = checkpoint(stage = GithubStage.PERMISSIONS).copy(
-            permissionStage = GithubPermissionStage.TEAMS,
-            permissionEmails = (1..5_000).mapTo(mutableSetOf()) { "user$it@example.com" },
-        )
-
-        assertFailsWith<GithubConnectorValidationException> {
-            loader().load(
-                config(server, "\"include_permissions\":true"),
-                credentials(),
-                mapper.valueToTree(active),
-            ).first()
         }
         Unit
     }
@@ -334,11 +307,11 @@ class GithubConnectorLoaderTest {
             .load(config(server), credentials(), null).toList()
 
         assertEquals(3_600_000L, sleeps.sum())
-        assertTrue(sleeps.all { it < PERMISSION_SYNC_LEASE.toMillis() })
+        assertTrue(sleeps.all { it <= 15_000L })
     }
 
     @Test
-    fun permissionRateLimitWaitRenewsBeforeTheLeaseCanExpire() = MockWebServer().use { server ->
+    fun slimRateLimitWaitSendsHeartbeats() = MockWebServer().use { server ->
         var pullsCalls = 0
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse = when {
@@ -362,7 +335,7 @@ class GithubConnectorLoaderTest {
             ).toList()
 
         assertEquals(70_000L, sleeps.sum())
-        assertTrue(sleeps.all { it < PERMISSION_SYNC_LEASE.toMillis() })
+        assertTrue(sleeps.all { it <= 15_000L })
         assertTrue(heartbeats >= sleeps.size)
     }
 
@@ -734,7 +707,6 @@ class GithubConnectorLoaderTest {
 
         assertEquals(0, terminal.path("repositories").size())
         assertEquals(0, terminal.path("filePaths").size())
-        assertEquals(0, terminal.path("permissionEmails").size())
     }
 
     @Test
@@ -940,64 +912,6 @@ class GithubConnectorLoaderTest {
     }
 
     @Test
-    fun retrieveAllSlimDocsPermSyncPopulatesExternalAccess() = MockWebServer().use { server ->
-        server.dispatcher = permissionRoutes()
-
-        val document = loader().retrieveAllSlimDocuments(
-            config(server),
-            credentials(),
-            includePermissions = true,
-        ).flatMap { it.documents }.single()
-
-        val access = assertNotNull(document.externalAccess)
-        assertFalse(access.isPublic)
-        assertEquals(setOf("alice@example.com"), access.externalUserEmails)
-        assertEquals(setOf("42"), access.externalUserGroupIds)
-    }
-
-    @Test
-    fun permissionPaginationYieldsEachPageAndResumesAfterFailure() = MockWebServer().use { server ->
-        var failSecondPage = true
-        val firstPage = (1..100).map { mapOf("login" to "user$it", "email" to "user$it@example.com") }
-        server.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse {
-                val url = request.requestUrl!!
-                return when {
-                    url.encodedPath == "/repos/test-org/test-repo" -> json(repoJson(private = true))
-                    url.encodedPath.endsWith("/collaborators") && url.queryParameter("page") == "1" ->
-                        json(mapper.writeValueAsString(firstPage))
-                    url.encodedPath.endsWith("/collaborators") && failSecondPage -> json("{}", 500)
-                    url.encodedPath.endsWith("/collaborators") -> json("[]")
-                    url.encodedPath.endsWith("/teams") -> json("[]")
-                    url.encodedPath.endsWith("/pulls") -> json("[${pull(1)}]")
-                    else -> json("[]")
-                }
-            }
-        }
-        val iterator = loader().load(
-            config(server, "\"include_permissions\":true"),
-            credentials(),
-            null,
-        ).iterator()
-
-        assertEquals("PERMISSIONS", checkpointOf(iterator.next()).stage.name)
-        val firstPermissionPage = iterator.next()
-        assertEquals(2, firstPermissionPage.checkpoint.value.path("permissionCollaboratorPage").asInt())
-        assertEquals(100, firstPermissionPage.checkpoint.value.path("permissionEmails").size())
-        assertFailsWith<WebClientResponseException.InternalServerError> { iterator.next() }
-
-        failSecondPage = false
-        val resumed = loader().load(
-            config(server, "\"include_permissions\":true"),
-            credentials(),
-            firstPermissionPage.checkpoint.value,
-        ).first()
-
-        assertEquals(100, resumed.checkpoint.value.path("permissionEmails").size())
-        assertEquals("TEAMS", resumed.checkpoint.value.path("permissionStage").asText())
-    }
-
-    @Test
     fun retrieveAllSlimDocsSkipsPrIssues() = MockWebServer().use { server ->
         server.dispatcher = routes(
             pulls = emptyList(),
@@ -1034,19 +948,6 @@ class GithubConnectorLoaderTest {
     }
 
     @Test
-    fun githubConnectorImplementsSlimConnectorWithPermSync() = MockWebServer().use { server ->
-        server.dispatcher = routes(pulls = listOf(pull(1)))
-
-        val access = loader().retrieveAllSlimDocuments(
-            config(server),
-            credentials(),
-            includePermissions = true,
-        ).flatMap { it.documents }.single().externalAccess
-
-        assertTrue(assertNotNull(access).isPublic)
-    }
-
-    @Test
     fun retrieveAllSlimDocsReturnsPrUrls() = MockWebServer().use { server ->
         server.dispatcher = routes(pulls = listOf(pull(1), pull(2), pull(3)))
 
@@ -1064,13 +965,13 @@ class GithubConnectorLoaderTest {
     }
 
     @Test
-    fun retrieveAllSlimDocsHasNoExternalAccess() = MockWebServer().use { server ->
+    fun retrieveAllSlimDocsHasPublicExternalAccess() = MockWebServer().use { server ->
         server.dispatcher = routes(pulls = listOf(pull(1)))
 
         val document = loader().retrieveAllSlimDocuments(config(server), credentials())
             .flatMap { it.documents }.single()
 
-        assertNull(document.externalAccess)
+        assertEquals(ExternalAccess(isPublic = true), document.externalAccess)
     }
 
     private fun loader(
@@ -1198,20 +1099,6 @@ class GithubConnectorLoaderTest {
                         )
                     }
                 }
-                else -> json("[]")
-            }
-        }
-    }
-
-    private fun permissionRoutes(): Dispatcher = object : Dispatcher() {
-        override fun dispatch(request: RecordedRequest): MockResponse {
-            val url = request.requestUrl!!
-            return when {
-                url.encodedPath == "/repos/test-org/test-repo" -> json(repoJson(private = true))
-                url.encodedPath.endsWith("/collaborators") -> json("""[{"login":"alice"}]""")
-                url.encodedPath.endsWith("/teams") -> json("""[{"id":42,"slug":"docs"}]""")
-                url.encodedPath == "/users/alice" -> json("""{"login":"alice","email":"alice@example.com"}""")
-                url.encodedPath.endsWith("/pulls") -> json("[${pull(1)}]")
                 else -> json("[]")
             }
         }

@@ -140,7 +140,7 @@ npm run build
 ```
 
 The File, Jira, Confluence, and GitHub loaders support bounded batches,
-checkpoints, poll windows, pruning, document failures, and permission sync.
+checkpoints, poll windows, pruning, and document failures.
 Document Set changes update existing OpenSearch chunks.
 
 Image-specific vector embedding is not complete. It remains WATCHLIST work.

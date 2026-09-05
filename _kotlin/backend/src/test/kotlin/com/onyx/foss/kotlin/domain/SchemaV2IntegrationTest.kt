@@ -16,7 +16,7 @@ class SchemaV2IntegrationTest : H2IntegrationTest() {
         assertTrue(hasColumn("ingestion_errors", "entity_id"))
         assertTrue(hasColumn("ingestion_errors", "failed_time_range_start"))
         assertTrue(hasColumn("ingestion_errors", "failed_time_range_end"))
-        assertTrue(hasTable("permission_sync_attempts"))
+        kotlin.test.assertFalse(hasTable("permission_sync_attempts"))
     }
 
     private fun hasColumn(table: String, column: String): Boolean =

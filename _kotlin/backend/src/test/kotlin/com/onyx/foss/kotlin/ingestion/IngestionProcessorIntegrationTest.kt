@@ -80,7 +80,6 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
     @MockitoBean private lateinit var remoteLoaders: RemoteConnectorLoaders
     @MockitoBean private lateinit var embedder: ModelServerClient
     @MockitoBean private lateinit var indexer: OpenSearchIndexer
-    @MockitoBean private lateinit var permissionSync: PermissionSyncWorker
 
     @BeforeEach
     fun resetDatabase() {
@@ -111,7 +110,6 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
         assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.SUCCESS)
         assertThat(jobs.findById(run.jobId).orElseThrow().state).isEqualTo(JobState.SUCCEEDED)
         assertThat(pairs.findById(run.pairId).orElseThrow().status).isEqualTo(PairStatus.ACTIVE)
-        verify(permissionSync).enqueue(run.pairId)
     }
 
     @Test
@@ -186,7 +184,6 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
         assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.CANCELED)
         assertThat(jobs.findById(run.jobId).orElseThrow().state).isEqualTo(JobState.SUCCEEDED)
         assertThat(pairs.findById(run.pairId).orElseThrow().status).isEqualTo(PairStatus.PAUSED)
-        verifyNoInteractions(permissionSync)
     }
 
     @Test
@@ -263,7 +260,6 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
         assertThat(documents.findByCcPairIdAndSourceDocumentId(run.pairId, "missing")).isNotNull()
         assertThat(pairs.findById(run.pairId).orElseThrow().lastPrunedAt).isNotNull()
         assertThat(pairs.findById(run.pairId).orElseThrow().inRepeatedErrorState).isFalse()
-        verify(permissionSync).enqueue(run.pairId)
     }
 
     @Test
@@ -279,7 +275,6 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
         assertThat(attempt.errorMessage).isEqualTo("fatal retrieval failure")
         assertThat(jobs.findById(run.jobId).orElseThrow().state).isEqualTo(JobState.FAILED)
         assertThat(error.failureMessage).isEqualTo("fatal retrieval failure")
-        verifyNoInteractions(permissionSync)
     }
 
     @Test
@@ -478,7 +473,6 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
         assertThat(documents.findByCcPairIdAndSourceDocumentId(run.pairId, "one")).isNull()
         assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.FAILED)
         assertThat(jobs.findById(run.jobId).orElseThrow().state).isEqualTo(JobState.FAILED)
-        verifyNoInteractions(permissionSync)
     }
 
     @Test
@@ -500,7 +494,7 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
         assertThat(documents.findByCcPairIdAndSourceDocumentId(run.pairId, "one")).isNull()
         assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.FAILED)
         assertThat(attempts.findById(run.attemptId).orElseThrow().errorMessage).contains("embedding")
-        verifyNoInteractions(indexer, permissionSync)
+        verifyNoInteractions(indexer)
     }
 
     @Test
@@ -590,22 +584,6 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
             listOf(fileUpdatedAt, listOf("file-owner@example.com"), listOf("file-reviewer@example.com")),
             listOf(remoteUpdatedAt, listOf("remote-owner@example.com"), listOf("remote-reviewer@example.com")),
         )
-    }
-
-    @Test
-    fun enqueuesDurablePermissionWorkBeforeIngestionBecomesSuccessful() {
-        val run = createRun()
-        load(sequenceOf(batch(1, false, document("one"))))
-        doAnswer {
-            assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.IN_PROGRESS)
-            null
-        }.`when`(permissionSync).enqueue(run.pairId)
-
-        processor.process(run.jobId)
-
-        verify(permissionSync).enqueue(run.pairId)
-        verify(permissionSync, never()).process(run.pairId)
-        assertThat(attempts.findById(run.attemptId).orElseThrow().status).isEqualTo(AttemptStatus.SUCCESS)
     }
 
     @Test
@@ -772,14 +750,15 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
             orphanedChunk.set(true)
             Unit
         }.`when`(indexer).upsert(
-            run.pairId,
-            "one",
-            0,
-            "one",
-            "one content",
-            null,
-            emptyMap(),
-            listOf(0.1),
+            pairId = run.pairId,
+            sourceDocumentId = "one",
+            chunkId = 0,
+            title = "one",
+            content = "one content",
+            link = null,
+            metadata = emptyMap(),
+            embedding = listOf(0.1),
+            sourceType = ConnectorSource.FILE,
         )
         doAnswer {
             indexDeleteStarted.countDown()
@@ -984,7 +963,6 @@ class IngestionProcessorIntegrationTest : H2IntegrationTest() {
         )
         verifyNoMoreInteractions(remoteLoaders)
         verifyNoInteractions(embedder)
-        verifyNoInteractions(permissionSync)
         assertThat(jobs.count()).isEqualTo(1)
     }
 

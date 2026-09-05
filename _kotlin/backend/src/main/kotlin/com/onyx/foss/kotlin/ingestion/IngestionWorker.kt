@@ -245,7 +245,6 @@ class IngestionProcessor(
     private val embedder: ModelServerClient,
     private val indexer: OpenSearchIndexer,
     private val pruning: PruningService,
-    private val permissionSync: PermissionSyncWorker,
     private val mapper: ObjectMapper,
     private val claims: JobClaimService,
     private val externalWrites: PairExternalWriteFence,
@@ -417,7 +416,6 @@ class IngestionProcessor(
                 errors.saveAll(resolvedEntityErrors)
             }
             renew(claim)
-            if (!attempt.pruneOnly) permissionSync.enqueue(requireNotNull(pair.id))
             claims.complete(
                 claim = claim,
                 status = if (hasFailures) AttemptStatus.COMPLETED_WITH_ERRORS else AttemptStatus.SUCCESS,
@@ -722,37 +720,6 @@ class OpenSearchIndexer(
         )
     }
 
-    fun updateAccess(pairId: Long, accessByDocument: Map<String, ExternalAccess>) {
-        if (accessByDocument.isEmpty()) return
-        val access = accessByDocument.mapValues { (_, value) ->
-            mapOf(
-                "external_user_emails" to value.externalUserEmails,
-                "external_user_group_ids" to value.externalUserGroupIds,
-                "is_public" to value.isPublic,
-            )
-        }
-        val body = mapOf(
-            "script" to mapOf(
-                "source" to """
-                    def access = params.access_by_document[ctx._source.source_document_id];
-                    ctx._source.external_user_emails = access.external_user_emails;
-                    ctx._source.external_user_group_ids = access.external_user_group_ids;
-                    ctx._source.is_public = access.is_public;
-                """.trimIndent(),
-                "params" to mapOf("access_by_document" to access),
-            ),
-            "query" to mapOf(
-                "bool" to mapOf(
-                    "filter" to listOf(
-                        mapOf("term" to mapOf("cc_pair_id" to pairId)),
-                        mapOf("terms" to mapOf("source_document_id" to accessByDocument.keys)),
-                    ),
-                ),
-            ),
-        )
-        updateByQuery(body, "ACL update", accessByDocument.size)
-    }
-
     fun updateDocumentSets(pairId: Long, sourceDocumentIds: Set<String>, documentSetNames: List<String>) {
         if (sourceDocumentIds.isEmpty()) return
         val body = mapOf(
@@ -864,7 +831,7 @@ class OpenSearchIndexer(
             "secondary_owners" to secondaryOwners,
             "external_user_emails" to emptyList<String>(),
             "external_user_group_ids" to emptyList<String>(),
-            "is_public" to false,
+            "is_public" to true,
         )
         val response = withMigrationRetry {
             client

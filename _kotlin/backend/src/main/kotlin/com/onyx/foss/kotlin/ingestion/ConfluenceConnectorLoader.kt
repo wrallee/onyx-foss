@@ -37,28 +37,12 @@ data class ConfluenceCheckpoint(
     val nextPageUrl: String? = null,
 )
 
-data class ConfluenceUser(
-    val userId: String,
-    val username: String?,
-    val displayName: String,
-    val email: String?,
-    val type: String,
-)
-
-class Confcloud77618Exception(url: String, body: String) : RuntimeException(
-    "CONFCLOUD-77618: ancestor-restrictions expand 404 from $url: ${body.take(500)}",
-)
-
-class ConfluenceRestSpacePermissionsNotAvailableException(message: String) : RuntimeException(message)
-
 @Service
 class ConfluenceConnectorLoader(
     private val http: RemoteJsonClient,
     private val mapper: ObjectMapper,
 ) {
     internal var sleepMillis: (Long) -> Unit = Thread::sleep
-
-    private val serverVersionCache = Collections.synchronizedMap(mutableMapOf<String, Pair<Int, Int>?>())
 
     fun load(
         config: JsonNode?,
@@ -70,9 +54,7 @@ class ConfluenceConnectorLoader(
         val context = context(config, credentials)
         val saved = checkpointNode?.let { mapper.treeToValue(it, ConfluenceCheckpoint::class.java) }
         val checkpoint = saved?.takeIf(ConfluenceCheckpoint::hasMore) ?: ConfluenceCheckpoint()
-        val includePermissions = config.boolean("include_permissions", false)
-        val spaceAccess = if (includePermissions) allSpacePermissions(context, prefixGroups = true) else emptyMap()
-        return loadPages(context, checkpoint, start, end, includePermissions, spaceAccess)
+        return loadPages(context, checkpoint, start, end)
     }
 
     fun validate(config: JsonNode?, credentials: JsonNode) {
@@ -114,7 +96,6 @@ class ConfluenceConnectorLoader(
         config: JsonNode?,
         credentials: JsonNode,
         failures: List<ConnectorFailure>,
-        includePermissions: Boolean = false,
     ): Sequence<ConnectorBatch> {
         val documentFailures = failures.mapNotNull { failure ->
             (failure.target as? FailureTarget.Document)?.let { it to extractPageId(it.id) }
@@ -133,10 +114,8 @@ class ConfluenceConnectorLoader(
         }
 
         val context = context(config, credentials)
-        val spaceAccess = if (includePermissions) allSpacePermissions(context, prefixGroups = true) else emptyMap()
         val cql = "type=page and id IN (${targets.keys.joinToString(",") { "'$it'" }})"
-        val expand = pageExpand(includePermissions)
-        val pages = paginate(context, buildCqlPath(cql, expand), DEFAULT_PAGE_SIZE)
+        val pages = paginate(context, buildCqlPath(cql, PAGE_EXPAND), DEFAULT_PAGE_SIZE)
         val documents = mutableListOf<SourceDocument>()
         val outputFailures = parseFailures.toMutableList()
         val seen = mutableSetOf<String>()
@@ -148,8 +127,6 @@ class ConfluenceConnectorLoader(
                 page,
                 start = null,
                 end = null,
-                includePermissions = includePermissions,
-                spaceAccess = spaceAccess,
             )
             documents += result.documents
             outputFailures += result.failures.map { failure ->
@@ -176,25 +153,9 @@ class ConfluenceConnectorLoader(
         credentials: JsonNode,
         start: Instant? = null,
         end: Instant? = null,
-        includePermissions: Boolean = false,
     ): Sequence<ConnectorBatch> {
         val context = context(config, credentials)
-        return if (!includePermissions) {
-            retrieveSlim(context, start, end, includePermissions = false, perPageRestrictions = false)
-        } else {
-            sequence {
-                try {
-                    for (batch in retrieveSlim(context, start, end, includePermissions = true, perPageRestrictions = false)) {
-                        yield(batch)
-                    }
-                    return@sequence
-                } catch (_: Confcloud77618Exception) {
-                    for (batch in retrieveSlim(context, start, end, includePermissions = true, perPageRestrictions = true)) {
-                        yield(batch)
-                    }
-                }
-            }
-        }
+        return retrieveSlim(context, start, end)
     }
 
     internal fun constructPageCql(config: JsonNode?, start: Instant?, end: Instant?): String {
@@ -244,20 +205,15 @@ class ConfluenceConnectorLoader(
         return handler.result()
     }
 
-    internal fun isConfcloud77618(status: Int, body: String): Boolean =
-        status == 404 && CONFCLOUD_77618_SIGNATURES.any(body::contains)
-
     private fun loadPages(
         context: Context,
         initialCheckpoint: ConfluenceCheckpoint,
         start: Instant?,
         end: Instant?,
-        includePermissions: Boolean,
-        spaceAccess: Map<String, ExternalAccess>,
     ): Sequence<ConnectorBatch> = sequence {
         var path = initialCheckpoint.nextPageUrl ?: buildCqlPath(
             constructPageCql(context.config, start, end),
-            pageExpand(includePermissions),
+            PAGE_EXPAND,
         )
         var limit = context.config?.path("batch_size")?.asInt(DEFAULT_PAGE_SIZE)?.coerceAtLeast(1) ?: DEFAULT_PAGE_SIZE
         while (true) {
@@ -266,7 +222,7 @@ class ConfluenceConnectorLoader(
             val documents = mutableListOf<SourceDocument>()
             val failures = mutableListOf<ConnectorFailure>()
             page.results.forEach { item ->
-                val result = processPage(context, item, start, end, includePermissions, spaceAccess)
+                val result = processPage(context, item, start, end)
                 documents += result.documents
                 failures += result.failures
             }
@@ -337,9 +293,6 @@ class ConfluenceConnectorLoader(
                     path = path.replace(PROBLEMATIC_BODY_EXPAND, REPLACEMENT_BODY_EXPAND)
                     continue
                 }
-                if (path.contains(ANCESTOR_RESTRICTIONS_EXPAND) && isConfcloud77618(status, error.responseBodyAsString)) {
-                    throw Confcloud77618Exception(path, error.responseBodyAsString)
-                }
                 if (status in SERVER_ERROR_CODES) {
                     if (currentLimit > MINIMUM_PAGE_SIZE) {
                         currentLimit = maxOf(currentLimit / 2, MINIMUM_PAGE_SIZE)
@@ -409,12 +362,11 @@ class ConfluenceConnectorLoader(
         page: JsonNode,
         start: Instant?,
         end: Instant?,
-        includePermissions: Boolean,
-        spaceAccess: Map<String, ExternalAccess>,
     ): ProcessResult {
         val pageId = page.path("id").asText().ifBlank { "unknown" }
         val pageUrl = page.path("_links").path("webui").asText().takeIf(String::isNotBlank)
             ?.let { buildContentUrl(context, it) }
+        val access = ExternalAccess(isPublic = true)
         val pageDocument = try {
             require(pageId != "unknown") { "Confluence page id is missing" }
             val title = page.path("title").asText().ifBlank { pageId }
@@ -437,15 +389,6 @@ class ConfluenceConnectorLoader(
                         ?.takeIf(String::isNotBlank) ?: spaceKey.takeIf(String::isNotBlank)
                     ),
             )
-            val access = if (includePermissions) {
-                runCatching {
-                    resolveInlineRestrictions(context, page, groupPrefix = CONFLUENCE_GROUP_PREFIX)
-                        ?: spaceAccess[spaceKey]
-                        ?: PRIVATE_ACCESS
-                }.getOrDefault(PRIVATE_ACCESS)
-            } else {
-                null
-            }
             SourceDocument(
                 id = pageUrl,
                 title = title,
@@ -477,7 +420,7 @@ class ConfluenceConnectorLoader(
 
         val documents = mutableListOf(pageDocument)
         val failures = mutableListOf<ConnectorFailure>()
-        val attachments = fetchAttachments(context, page, start, end, pageDocument.externalAccess)
+        val attachments = fetchAttachments(context, page, start, end, access)
         documents += attachments.documents
         failures += attachments.failures
         return ProcessResult(documents, failures)
@@ -628,21 +571,8 @@ class ConfluenceConnectorLoader(
         context: Context,
         start: Instant?,
         end: Instant?,
-        includePermissions: Boolean,
-        perPageRestrictions: Boolean,
     ): Sequence<ConnectorBatch> = sequence {
-        val expand = when {
-            !includePermissions -> PRUNING_EXPAND
-            perPageRestrictions -> PER_PAGE_RESTRICTIONS_EXPAND
-            else -> RESTRICTIONS_EXPAND
-        }
-        val unresolvedSpaces = mutableSetOf<String>()
-        val spaceAccess = if (includePermissions) {
-            allSpacePermissions(context, prefixGroups = false, unresolvedSpaces = unresolvedSpaces)
-        } else {
-            emptyMap()
-        }
-        val ancestorCache = mutableMapOf<String, JsonNode?>()
+        val expand = PRUNING_EXPAND
         var path: String? = buildCqlPath(constructPageCql(context.config, start, end), expand)
         var limit = SLIM_PAGE_SIZE
         while (path != null) {
@@ -655,21 +585,7 @@ class ConfluenceConnectorLoader(
                 val pageId = page.path("id").asText()
                 val pageUrl = buildContentUrl(context, page.path("_links").path("webui").asText())
                 val spaceKey = page.path("space").path("key").asText()
-                val permission = if (includePermissions) {
-                    resolveSlimPermission(
-                        context,
-                        page,
-                        pageUrl,
-                        spaceKey,
-                        spaceAccess,
-                        unresolvedSpaces,
-                        ancestorCache,
-                        perPageRestrictions,
-                    )
-                } else {
-                    PermissionResolution(null)
-                }
-                if (permission.failure != null) failures += permission.failure
+                val access = ExternalAccess(isPublic = true)
                 documents += SourceDocument(
                     id = pageUrl,
                     title = page.path("title").asText(pageId),
@@ -684,7 +600,7 @@ class ConfluenceConnectorLoader(
                                 ?.takeIf(String::isNotBlank) ?: spaceKey.takeIf(String::isNotBlank)
                             ),
                     ),
-                    externalAccess = permission.access,
+                    externalAccess = access,
                     source = ConnectorSource.CONFLUENCE,
                 )
                 if (context.config.boolean("include_attachments", true)) {
@@ -704,7 +620,7 @@ class ConfluenceConnectorLoader(
                                     "parent_hierarchy_raw_node_id" to pageUrl,
                                     "mime_type" to attachment.path("metadata").path("mediaType").asText(),
                                 ),
-                                externalAccess = permission.access,
+                                externalAccess = access,
                                 source = ConnectorSource.CONFLUENCE,
                             )
                         }
@@ -723,49 +639,6 @@ class ConfluenceConnectorLoader(
         }
     }
 
-    private fun resolveSlimPermission(
-        context: Context,
-        page: JsonNode,
-        pageUrl: String,
-        spaceKey: String,
-        spaceAccess: Map<String, ExternalAccess>,
-        unresolvedSpaces: Set<String>,
-        ancestorCache: MutableMap<String, JsonNode?>,
-        perPageRestrictions: Boolean,
-    ): PermissionResolution = try {
-        val pageAccess = if (perPageRestrictions) {
-            resolveRestrictions(
-                page.path("restrictions"),
-                page.path("ancestors").toList(),
-                ancestorCache,
-                fetch = { ancestorId -> fetchContentReadRestrictions(context, ancestorId) },
-                emailResolver = { user -> resolveRestrictionEmail(context, user) },
-            )
-        } else {
-            resolveInlineRestrictions(context, page)
-        }
-        val access = pageAccess ?: spaceAccess[spaceKey]
-        if (access == null || spaceKey in unresolvedSpaces || pageAccess == PRIVATE_ACCESS) {
-            unresolvedPermission(pageUrl, "Confluence could not determine document permissions")
-        } else {
-            PermissionResolution(access)
-        }
-    } catch (error: Exception) {
-        unresolvedPermission(
-            pageUrl,
-            "Confluence could not determine document permissions: ${error.message ?: error::class.simpleName}",
-        )
-    }
-
-    private fun unresolvedPermission(pageUrl: String, message: String): PermissionResolution = PermissionResolution(
-        PRIVATE_ACCESS,
-        ConnectorFailure(
-            FailureTarget.Document(pageUrl, pageUrl),
-            message,
-            "confluence_permission_unresolved",
-        ),
-    )
-
     private fun retrieveSlimAttachments(context: Context, pageId: String, start: Instant?, end: Instant?): List<JsonNode> {
         val path = buildCqlPath(constructAttachmentCql(context.config, pageId, start, end), PRUNING_EXPAND)
         repeat(SLIM_ATTACHMENT_ATTEMPTS) { attempt ->
@@ -783,73 +656,6 @@ class ConfluenceConnectorLoader(
             item.deepCopy().also { expandNested(context, it, limit) }
         }
 
-    internal fun retrieveUsers(config: JsonNode?, credentials: JsonNode): List<ConfluenceUser> {
-        val overrides = config?.path("confluence_user_profiles_override")?.takeIf(JsonNode::isArray)
-        if (overrides != null && !overrides.isEmpty) {
-            return overrides.toList().map { user ->
-                ConfluenceUser(
-                    user.path("user_id").asText(),
-                    user.path("username").asText().takeIf(String::isNotBlank),
-                    user.path("display_name").asText(),
-                    user.path("email").asText().takeIf(String::isNotBlank),
-                    user.path("type").asText("override"),
-                )
-            }
-        }
-        val context = context(config, credentials)
-        return if (context.isCloud) {
-            paginate(context, "/rest/api/search/user?cql=${query("type=user")}", DEFAULT_PAGE_SIZE, forceOffsetPagination = true)
-                .mapNotNull { result ->
-                    val user = result.path("user")
-                    user.path("accountId").asText().takeIf(String::isNotBlank)?.let { id ->
-                        ConfluenceUser(
-                            id,
-                            null,
-                            user.path("displayName").asText(id),
-                            user.path("email").asText().takeIf(String::isNotBlank),
-                            user.path("accountType").asText("atlassian"),
-                        )
-                    }
-                }
-        } else {
-            paginate(context, "/rest/api/user/list", DEFAULT_PAGE_SIZE).mapNotNull { user ->
-                user.path("userKey").asText().takeIf(String::isNotBlank)?.let { id ->
-                    ConfluenceUser(
-                        id,
-                        user.path("username").asText().takeIf(String::isNotBlank),
-                        user.path("displayName").asText(id),
-                        user.path("email").asText().takeIf(String::isNotBlank),
-                        user.path("type").asText("user"),
-                    )
-                }
-            }
-        }
-    }
-
-    private fun resolveUsernameEmail(context: Context, username: String): String? {
-        val cache = context.userCaches.usernameEmails
-        if (cache.containsKey(username)) return cache[username]
-        val email = try {
-            get(context, "/rest/api/user?username=${query(username)}").path("email").asText().takeIf(String::isNotBlank)
-        } catch (_: Exception) {
-            null
-        }
-        cache[username] = email
-        return email
-    }
-
-    private fun resolveUserKeyEmail(context: Context, userKey: String): String? {
-        val cache = context.userCaches.userKeyEmails
-        if (cache.containsKey(userKey)) return cache[userKey]
-        val email = try {
-            get(context, "/rest/api/user?key=${query(userKey)}").path("email").asText().takeIf(String::isNotBlank)
-        } catch (_: Exception) {
-            null
-        }
-        cache[userKey] = email
-        return email
-    }
-
     private fun resolveDisplayName(context: Context, userId: String): String {
         val cache = context.userCaches.displayNames
         if (cache.containsKey(userId)) return cache[userId] ?: UNKNOWN_USER
@@ -864,269 +670,6 @@ class ConfluenceConnectorLoader(
         return displayName ?: UNKNOWN_USER
     }
 
-    internal fun fetchContentReadRestrictions(config: JsonNode?, credentials: JsonNode, contentId: String): JsonNode? =
-        fetchContentReadRestrictions(context(config, credentials), contentId)
-
-    private fun fetchContentReadRestrictions(context: Context, contentId: String): JsonNode? = try {
-        get(context, "/rest/api/content/${segment(contentId)}/restriction/byOperation")
-    } catch (error: WebClientResponseException) {
-        if (error.statusCode.value() in setOf(403, 404)) null else throw error
-    }
-
-    internal fun resolveRestrictions(
-        pageRestrictions: JsonNode,
-        ancestors: List<JsonNode>,
-        cache: MutableMap<String, JsonNode?>,
-        emailResolver: (JsonNode) -> String? = { user -> user.path("email").asText().takeIf(String::isNotBlank) },
-        groupPrefix: String = "",
-        fetch: (String) -> JsonNode?,
-    ): ExternalAccess? {
-        parseRestrictions(pageRestrictions, emailResolver, groupPrefix)?.let { return it }
-        ancestors.asReversed().forEach { ancestor ->
-            val id = ancestor.path("id").asText().takeIf(String::isNotBlank) ?: return@forEach
-            val restrictions = if (cache.containsKey(id)) cache[id] else fetch(id).also { cache[id] = it }
-            parseRestrictions(restrictions, emailResolver, groupPrefix)?.let { return it }
-        }
-        return null
-    }
-
-    private fun resolveInlineRestrictions(context: Context, page: JsonNode, groupPrefix: String = ""): ExternalAccess? {
-        val resolver = { user: JsonNode -> resolveRestrictionEmail(context, user) }
-        parseRestrictions(page.path("restrictions"), resolver, groupPrefix)?.let { return it }
-        page.path("ancestors").toList().asReversed().forEach { ancestor ->
-            parseRestrictions(ancestor.path("restrictions"), resolver, groupPrefix)?.let { return it }
-        }
-        return null
-    }
-
-    private fun parseRestrictions(
-        restrictionPayload: JsonNode?,
-        emailResolver: (JsonNode) -> String?,
-        groupPrefix: String,
-    ): ExternalAccess? {
-        if (restrictionPayload == null || restrictionPayload.isMissingNode || restrictionPayload.isNull) return null
-        val read = restrictionPayload.path("read")
-        val restrictions = when {
-            read.path("restrictions").isObject -> read.path("restrictions")
-            restrictionPayload.path("restrictions").isObject -> restrictionPayload.path("restrictions")
-            else -> restrictionPayload
-        }
-        val userRestrictions = restrictions.path("user").path("results").toList()
-        val groupRestrictions = restrictions.path("group").path("results").toList()
-        if (userRestrictions.isEmpty() && groupRestrictions.isEmpty()) return null
-        val resolvedUsers = userRestrictions.map(emailResolver)
-        val resolvedGroups = groupRestrictions.map { group ->
-            group.path("name").asText().ifBlank { group.path("id").asText() }.takeIf(String::isNotBlank)
-                ?.let { groupPrefix + it }
-        }
-        if (resolvedUsers.any { it == null } || resolvedGroups.any { it == null }) return PRIVATE_ACCESS
-        return ExternalAccess(resolvedUsers.filterNotNull().toSet(), resolvedGroups.filterNotNull().toSet(), isPublic = false)
-    }
-
-    private fun resolveRestrictionEmail(context: Context, user: JsonNode): String? {
-        user.path("email").asText().takeIf(String::isNotBlank)?.let { return it }
-        val overrides = context.config?.path("confluence_user_profiles_override")?.takeIf(JsonNode::isArray)
-        if (overrides != null) {
-            val identifiers = setOf(
-                user.path("accountId").asText(),
-                user.path("userKey").asText(),
-                user.path("key").asText(),
-                user.path("username").asText(),
-            ).filter(String::isNotBlank).toSet()
-            overrides.firstOrNull { override ->
-                override.path("user_id").asText() in identifiers || override.path("username").asText() in identifiers
-            }?.path("email")?.asText()?.takeIf(String::isNotBlank)?.let { return it }
-        }
-        user.path("userKey").asText().takeIf(String::isNotBlank)?.let { return resolveUserKeyEmail(context, it) }
-        user.path("key").asText().takeIf(String::isNotBlank)?.let { return resolveUserKeyEmail(context, it) }
-        user.path("username").asText().takeIf(String::isNotBlank)?.let { return resolveUsernameEmail(context, it) }
-        val identifier = user.path("accountId").asText().takeIf(String::isNotBlank) ?: return null
-        return try {
-            get(context, "/rest/api/user?accountId=${query(identifier)}").path("email").asText().takeIf(String::isNotBlank)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    internal fun retrieveSpaces(config: JsonNode?, credentials: JsonNode, limit: Int): List<JsonNode> =
-        retrieveSpaces(context(config, credentials), limit)
-
-    private fun retrieveSpaces(context: Context, limit: Int): List<JsonNode> {
-        val cloudV2 = context.isCloud && !context.config.boolean("scoped_token", false)
-        val initial = if (cloudV2) "/wiki/api/v2/spaces" else "/rest/api/space"
-        return try {
-            paginateSpaces(context, initial, limit, cloudV2)
-        } catch (error: WebClientResponseException.NotFound) {
-            if (cloudV2) paginateSpaces(context, "/rest/api/space", limit, false) else throw error
-        }
-    }
-
-    private fun paginateSpaces(context: Context, initialPath: String, limit: Int, cloudV2: Boolean): List<JsonNode> {
-        val output = mutableListOf<JsonNode>()
-        var start = 0
-        var path: String? = updateQuery(initialPath, "limit", limit.toString())
-        if (!cloudV2) path = updateQuery(requireNotNull(path), "start", "0")
-        while (path != null) {
-            val response = get(context, path)
-            val results = response.path("results").takeIf(JsonNode::isArray)?.toList().orEmpty()
-            if (results.isEmpty()) break
-            output += results
-            require(output.size <= MAX_PAGINATED_RESULTS) { "Confluence space pagination exceeded $MAX_PAGINATED_RESULTS results" }
-            val next = response.path("_links").path("next").asText().takeIf(String::isNotBlank) ?: break
-            path = if (cloudV2) {
-                next
-            } else {
-                start += results.size
-                updateQuery(initialPath, "limit", limit.toString()).let { updateQuery(it, "start", start.toString()) }
-            }
-        }
-        return output
-    }
-
-    internal fun supportsRestSpacePermissions(config: JsonNode?, credentials: JsonNode): Boolean =
-        supportsRestSpacePermissions(context(config, credentials))
-
-    private fun supportsRestSpacePermissions(context: Context): Boolean {
-        if (context.isCloud) return false
-        val key = context.apiBase
-        val version = synchronized(serverVersionCache) {
-            if (serverVersionCache.containsKey(key)) return@synchronized serverVersionCache[key]
-            val resolved = try {
-                get(context, "/rest/api/server-information").path("version").asText().parseVersion()
-            } catch (_: Exception) {
-                null
-            }
-            serverVersionCache[key] = resolved
-            resolved
-        }
-        return version != null && (version.first > 9 || version.first == 9 && version.second >= 1)
-    }
-
-    internal fun getAllSpacePermissionsServerRest(config: JsonNode?, credentials: JsonNode, spaceKey: String): List<JsonNode> =
-        getAllSpacePermissionsServerRest(context(config, credentials), spaceKey)
-
-    private fun getAllSpacePermissionsServerRest(context: Context, spaceKey: String): List<JsonNode> = try {
-        val response = get(context, "/rest/api/space/${segment(spaceKey)}/permissions")
-        if (response.isArray) response.toList() else emptyList()
-    } catch (error: WebClientResponseException) {
-        when (error.statusCode.value()) {
-            404 -> throw ConfluenceRestSpacePermissionsNotAvailableException(
-                "REST space-permissions endpoint is unavailable for '$spaceKey'; Confluence Data Center 9.1+ is required.",
-            )
-            500 -> throw IllegalArgumentException(
-                "CONFSERVER-99908: Confluence returned HTTP 500 for space '$spaceKey'. Grant the bot account admin permissions.",
-                error,
-            )
-            else -> throw error
-        }
-    }
-
-    internal fun getAllSpacePermissionsServerJsonRpc(config: JsonNode?, credentials: JsonNode, spaceKey: String): List<JsonNode> =
-        getAllSpacePermissionsServerJsonRpc(context(config, credentials), spaceKey)
-
-    private fun getAllSpacePermissionsServerJsonRpc(context: Context, spaceKey: String): List<JsonNode> {
-        val response = http.postText(
-            context.apiBase,
-            "/rpc/json-rpc/confluenceservice-v2",
-            context.headers,
-            mapOf("jsonrpc" to "2.0", "method" to "getSpacePermissionSets", "id" to 7, "params" to listOf(spaceKey)),
-        )
-        if (response.statusCode >= 400) throw IllegalArgumentException("Confluence JSON-RPC failed with HTTP ${response.statusCode}.")
-        val payload = try {
-            mapper.readTree(response.body)
-        } catch (_: Exception) {
-            throw IllegalArgumentException(
-                "Confluence JSON-RPC returned a non-JSON response for space '$spaceKey' " +
-                    "(HTTP ${response.statusCode}, Content-Type=${response.contentType ?: "<unset>"}). " +
-                    "Secure Administrator Sessions (WebSudo) can cause this response. " +
-                    "$WEBSUDO_KB_URL Response body: ${response.body.take(1_000)}",
-            )
-        }
-        return payload.path("result").takeIf(JsonNode::isArray)?.toList().orEmpty()
-    }
-
-    private fun allSpacePermissions(
-        context: Context,
-        prefixGroups: Boolean,
-        unresolvedSpaces: MutableSet<String>? = null,
-    ): Map<String, ExternalAccess> =
-        retrieveSpaces(context, SPACE_PAGE_SIZE).associate { space ->
-            val key = space.path("key").asText().ifBlank { space.path("id").asText() }
-            val access = try {
-                val rows = if (context.isCloud) {
-                    val response = get(context, "/rest/api/space/${segment(key)}?expand=permissions")
-                    response.path("permissions").let { permissions ->
-                        when {
-                            permissions.isArray -> permissions.toList()
-                            permissions.path("results").isArray -> permissions.path("results").toList()
-                            else -> emptyList()
-                        }
-                    }
-                } else if (supportsRestSpacePermissions(context)) {
-                    getAllSpacePermissionsServerRest(context, key)
-                } else {
-                    getAllSpacePermissionsServerJsonRpc(context, key)
-                }
-                val resolution = parseSpacePermissions(
-                    context,
-                    rows,
-                    if (prefixGroups) CONFLUENCE_GROUP_PREFIX else "",
-                )
-                if (resolution.hasUnresolvedSubjects) unresolvedSpaces?.add(key)
-                resolution.access
-            } catch (_: Exception) {
-                unresolvedSpaces?.add(key)
-                PRIVATE_ACCESS
-            }
-            key to access
-        }
-
-    private fun parseSpacePermissions(
-        context: Context,
-        rows: List<JsonNode>,
-        groupPrefix: String,
-    ): SpacePermissionResolution {
-        val emails = mutableSetOf<String>()
-        val groups = mutableSetOf<String>()
-        var isPublic = false
-        var hasUnresolvedSubjects = false
-        rows.forEach { row ->
-            val operation = row.path("operation")
-            val key = operation.path("operationKey").asText().ifBlank { operation.path("operation").asText() }
-            if (key.isNotBlank() && !key.equals("read", true) && !key.equals("view", true)) return@forEach
-            val subject = row.path("subject")
-            when (subject.path("type").asText().lowercase()) {
-                "anonymous", "anyone" -> isPublic = true
-                "group" -> {
-                    val group = subject.path("name").asText().ifBlank { subject.path("id").asText() }
-                        .takeIf(String::isNotBlank)
-                    if (group == null) hasUnresolvedSubjects = true else groups += groupPrefix + group
-                }
-                "user" -> {
-                    val email = subject.path("email").asText().ifBlank { subject.path("emailAddress").asText() }
-                        .takeIf(String::isNotBlank)
-                        ?: subject.path("userKey").asText().takeIf(String::isNotBlank)
-                            ?.let { resolveUserKeyEmail(context, it) }
-                    if (email == null) hasUnresolvedSubjects = true else emails += email
-                }
-            }
-            row.path("subjects").path("group").path("results").forEach { group ->
-                val name = group.path("name").asText().ifBlank { group.path("id").asText() }
-                    .takeIf(String::isNotBlank)
-                if (name == null) hasUnresolvedSubjects = true else groups += groupPrefix + name
-            }
-            row.path("subjects").path("user").path("results").forEach { user ->
-                val email = resolveRestrictionEmail(context, user)
-                if (email == null) hasUnresolvedSubjects = true else emails += email
-            }
-            if (row.path("anonymousAccess").asBoolean(false)) isPublic = true
-        }
-        return if (hasUnresolvedSubjects) {
-            SpacePermissionResolution(PRIVATE_ACCESS, hasUnresolvedSubjects = true)
-        } else {
-            SpacePermissionResolution(ExternalAccess(emails, groups, isPublic))
-        }
-    }
 
     private fun context(config: JsonNode?, credentials: JsonNode): Context {
         val wikiBase = config?.firstText("wiki_base", "confluence_base_url", "base_url")
@@ -1221,9 +764,6 @@ class ConfluenceConnectorLoader(
         val title = attachment.path("title").asText().lowercase()
         return ALLOWED_EXTENSIONS.any(title::endsWith)
     }
-
-    private fun pageExpand(includePermissions: Boolean): String =
-        if (includePermissions) "$PAGE_EXPAND,$RESTRICTIONS_EXPAND" else PAGE_EXPAND
 
     private fun buildCqlPath(cql: String, expand: String?): String =
         "/rest/api/content/search?cql=${query(cql)}" + if (expand == null) "" else "&expand=$expand"
@@ -1327,8 +867,6 @@ class ConfluenceConnectorLoader(
     private data class Origin(val scheme: String, val host: String, val port: Int)
 
     private class UserCaches {
-        val usernameEmails = mutableMapOf<String, String?>()
-        val userKeyEmails = mutableMapOf<String, String?>()
         val displayNames = mutableMapOf<String, String?>()
     }
 
@@ -1336,14 +874,6 @@ class ConfluenceConnectorLoader(
     private data class ProcessResult(
         val documents: List<SourceDocument> = emptyList(),
         val failures: List<ConnectorFailure> = emptyList(),
-    )
-    private data class PermissionResolution(
-        val access: ExternalAccess?,
-        val failure: ConnectorFailure? = null,
-    )
-    private data class SpacePermissionResolution(
-        val access: ExternalAccess,
-        val hasUnresolvedSubjects: Boolean = false,
     )
     private data class AttachmentResult(val document: SourceDocument? = null, val failure: ConnectorFailure? = null)
 
@@ -1439,28 +969,14 @@ class ConfluenceConnectorLoader(
         const val DEFAULT_ATTACHMENT_CHAR_LIMIT = 200_000
         const val RATE_LIMIT_MESSAGE = "Rate limit exceeded"
         const val UNKNOWN_USER = "Unknown Confluence User"
-        const val CONFLUENCE_GROUP_PREFIX = "confluence_"
         const val PROBLEMATIC_BODY_EXPAND = "body.storage.value"
         const val REPLACEMENT_BODY_EXPAND = "body.view.value"
-        const val ANCESTOR_RESTRICTIONS_EXPAND = "ancestors.restrictions.read.restrictions."
         const val COMMENT_EXPAND = "body.storage.value"
         const val PAGE_EXPAND = "body.storage.value,version,space,metadata.labels,history.lastUpdated,ancestors"
         const val ATTACHMENT_EXPAND = "version,space,metadata.labels,history"
-        const val RESTRICTIONS_EXPAND =
-            "space,restrictions.read.restrictions.user,restrictions.read.restrictions.group," +
-                "ancestors.restrictions.read.restrictions.user,ancestors.restrictions.read.restrictions.group,history"
-        const val PER_PAGE_RESTRICTIONS_EXPAND =
-            "space,restrictions.read.restrictions.user,restrictions.read.restrictions.group,ancestors,history"
         const val PRUNING_EXPAND = "space,ancestors,history"
-        const val WEBSUDO_KB_URL =
-            "https://support.atlassian.com/confluence/kb/json-rpc-api-request-returns-websudorequiredexception-on-confluence/"
 
-        val PRIVATE_ACCESS = ExternalAccess(isPublic = false)
         val SERVER_ERROR_CODES = setOf(500, 502, 503, 504)
-        val CONFCLOUD_77618_SIGNATURES = listOf(
-            "No content with id",
-            "Cannot find content. Outdated version/old_draft/trashed",
-        )
         val PAGE_ID_PATTERNS = listOf(Regex("/pages/(\\d+)(?:/|$)"), Regex("[?&]pageId=(\\d+)"))
         val IMAGE_MIME_TYPES = setOf("image/jpg", "image/jpeg", "image/png", "image/webp")
         val ALLOWED_EXTENSIONS = setOf(

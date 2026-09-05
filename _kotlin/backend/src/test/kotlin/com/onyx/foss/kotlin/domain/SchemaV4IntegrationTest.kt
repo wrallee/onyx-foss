@@ -10,13 +10,9 @@ class SchemaV4IntegrationTest : H2IntegrationTest() {
     @Autowired private lateinit var jdbc: JdbcTemplate
 
     @Test
-    fun v4AddsPermissionStagingAndAttemptCounters() {
-        assertThat(hasTable("permission_sync_staging")).isTrue()
-        assertThat(hasColumn("permission_sync_attempts", "full_exception_trace")).isTrue()
-        assertThat(hasColumn("permission_sync_attempts", "total_docs_synced")).isTrue()
-        assertThat(hasColumn("permission_sync_attempts", "docs_with_permission_errors")).isTrue()
-        assertThat(primaryKeyColumns("permission_sync_staging"))
-            .containsExactly("attempt_id", "source_document_id")
+    fun v16DropsPermissionStagingAndAttempts() {
+        assertThat(hasTable("permission_sync_staging")).isFalse()
+        assertThat(hasTable("permission_sync_attempts")).isFalse()
     }
 
     private fun hasColumn(table: String, column: String): Boolean = jdbc.queryForObject(
